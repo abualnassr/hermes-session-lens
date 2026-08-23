@@ -1,0 +1,14 @@
+manifest_version: 2
+api_version: 1
+name: session-lens
+label: Hermes Session Lens
+version: 0.1.0
+description: "Native, read-only session telemetry for Hermes Desktop: tokens, cost, tools, skills, failures, files, and delegations."
+author: "Hermes Session Lens contributors"
+kind: standalone
+license: MIT
+tags:
+  - desktop
+  - analytics
+  - observability
+  - sessions

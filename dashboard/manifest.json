@@ -1,0 +1,13 @@
+{
+  "name": "session-lens",
+  "label": "Hermes Session Lens",
+  "description": "Read-only session telemetry backend for the native Hermes Desktop plugin",
+  "icon": "ChartNoAxesCombined",
+  "version": "0.1.0",
+  "tab": {
+    "path": "/session-lens-dashboard",
+    "hidden": true
+  },
+  "api": "plugin_api.py"
+}
+
