@@ -1,6 +1,6 @@
 # Hermes Session Lens
 
-Hermes Session Lens is a native, read-only telemetry page for Hermes Desktop. It appears in the left sidebar and explains what each session consumed and did: tokens, recorded cost, models, tools, skills, failures, files, and delegated work.
+Hermes Session Lens is a native, read-only observability page for Hermes Desktop. It appears in the left sidebar and explains what each session consumed and did, then connects that evidence to runtime health, profiles, schedules, and Kanban execution.
 
 It is a unified Hermes plugin—one install contains the native Desktop page and its namespaced Python API. There is no iframe, separate dashboard, Node server, or telemetry upload.
 
@@ -14,7 +14,14 @@ It is a unified Hermes plugin—one install contains the native Desktop page and
 - Explicit skill invocation from recorded `skill_view` and `skill_manage` calls; available skills are not mislabelled as used.
 - Files-observed summary from tool path arguments and bounded command-path extraction.
 - Async delegation summaries.
-- Overview, Tools, Skills, and System views.
+- A chronological Trace tab for user, assistant, reasoning, tool-call, and tool-result evidence. System prompts are excluded and displayed content is redacted and bounded.
+- Conservative session outcomes that preserve Hermes' raw end reason.
+- Local agent-log telemetry for model latency, cache-hit ratio, and tool duration, cached until a source log changes.
+- Cross-profile session, token, cost, model, and outcome totals.
+- Gateway and platform health for the default and named profiles.
+- Schedule status, next/last run, delivery errors, and failure streaks without exposing schedule prompts.
+- Shared Kanban task and run status with bounded failure evidence.
+- Overview, Operations, Tools, Skills, and System views.
 - Ask Lens: builds a grounded analysis prompt locally, copies it, and opens a new Hermes chat.
 - Failure-first, recent, cost, token, and tool-call sorting; pagination grows to a 500-session safety limit.
 
@@ -38,8 +45,8 @@ The plugin uses Hermes' public Desktop SDK and `SessionDB(read_only=True)`. The 
    hermes plugins enable session-lens
    ```
 
-3. Restart the Hermes gateway so it mounts `dashboard/plugin_api.py`.
-4. If the sidebar entry has not appeared within a few seconds, open the command palette and run **Reload desktop plugins**.
+3. Restart Hermes Desktop so its embedded backend mounts `dashboard/plugin_api.py`.
+4. If only `desktop/plugin.js` changes during development, open the command palette and run **Reload desktop plugins**; backend changes still require a Desktop restart.
 
 The Desktop half is enabled by default once the trusted local package is present. It can be disabled live in **Settings → Plugins**.
 
@@ -55,13 +62,15 @@ Replace `OWNER` with the repository owner. Hermes shows the source and component
 
 ## Updates
 
-Hermes Agent updates do not remove this plugin because it lives under `$HERMES_HOME/plugins/session-lens`, outside the Hermes Agent source checkout. Update Session Lens separately by replacing that folder with a newer release, then restart the gateway.
+Hermes Agent updates do not remove this plugin because it lives under `$HERMES_HOME/plugins/session-lens`, outside the Hermes Agent source checkout. Update Session Lens separately by replacing that folder with a newer release, then restart Hermes Desktop.
 
 ## Privacy and safety
 
-- Every SQLite handle is opened with Hermes' read-only connection contract.
+- Session stores use Hermes' `SessionDB(read_only=True)` contract. Kanban stores use SQLite `mode=ro`; dormant profile stores may use SQLite immutable mode only when no WAL exists.
 - The API defines no archive, rename, delete, import, export, or other mutation route.
-- Tool-result snippets are secret-redacted and length-bounded before reaching the Desktop page.
+- Tool results, transcript events, schedule errors, gateway errors, and Kanban evidence are secret-redacted and length-bounded before reaching the Desktop page.
+- Schedule and system prompts are never returned by the API.
+- Runtime logs are parsed locally with per-file memory caching; no new cache file is written.
 - No session content or usage telemetry is sent over the internet.
 - Ask Lens copies a locally generated prompt; the user decides whether to paste and submit it in Hermes.
 
@@ -81,4 +90,3 @@ node --check desktop/plugin.js
 ## Credits and license
 
 Hermes Session Lens is MIT licensed. See [UPSTREAM.md](UPSTREAM.md) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for transparent behavior-level credit to TokenTelemetry, Hermes Session Analyzer, and Hermes Agent.
-

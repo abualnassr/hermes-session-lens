@@ -8,13 +8,16 @@ contains no mutation endpoint and never opens a writable SQLite connection.
 from __future__ import annotations
 
 import asyncio
+import datetime as dt
 import json
+import os
 import re
+import sqlite3
 import time
 from collections import Counter, defaultdict
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
 
 from fastapi import APIRouter, HTTPException, Query
 
@@ -28,11 +31,15 @@ except ImportError:  # pragma: no cover - makes isolated editor/test imports cle
 
 router = APIRouter()
 
-PLUGIN_VERSION = "0.1.0"
+PLUGIN_VERSION = "0.2.0"
 MAX_SESSION_PAGE = 500
 MAX_ANALYSIS_EVENTS = 5000
 MAX_SEARCH_MATCHES = 2000
 MAX_SNIPPET_CHARS = 560
+MAX_TRACE_PAGE = 200
+MAX_TRACE_CONTENT_CHARS = 6000
+MAX_LOG_FILES = 5
+MAX_LOG_FILE_BYTES = 6 * 1024 * 1024
 
 _ERROR_FINISH_REASONS = {"error", "agent_error", "content_filter"}
 _ERROR_EFFECTS = {"blocked", "denied", "error", "failed", "failure"}
@@ -77,12 +84,58 @@ _FILE_TOOL_HINTS = {
     "write_file",
 }
 
+_FAILED_END_REASONS = {
+    "agent_error",
+    "content_filter",
+    "error",
+    "failed",
+    "failure",
+    "max_runtime",
+    "timeout",
+}
+_CANCELLED_END_REASONS = {"cancelled", "canceled", "interrupted", "user_cancelled"}
+_COMPLETED_END_REASONS = {
+    "agent_close",
+    "cli_close",
+    "complete",
+    "completed",
+    "cron_complete",
+    "user_exit",
+    "webhook_complete",
+}
+
+_LOG_LINE_RE = re.compile(
+    r"^(?P<stamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2},\d{3})\s+\w+"
+    r"(?: \[(?P<session>[^\]]+)\])?\s+(?P<logger>[\w.]+):\s+(?P<message>.*)$"
+)
+_API_METRIC_RE = re.compile(
+    r"API call #(?P<call>\d+): model=(?P<model>\S+) provider=(?P<provider>\S+) "
+    r"in=(?P<input>\d+) out=(?P<output>\d+) total=(?P<total>\d+) "
+    r"latency=(?P<latency>[\d.]+)s"
+    r"(?: cache=(?P<cache_read>\d+)/(?P<prompt>\d+) \((?P<cache_pct>\d+)%\))?"
+)
+_TOOL_METRIC_RE = re.compile(
+    r"tool (?P<tool>[\w.:-]+) (?P<status>completed|failed|cancelled) "
+    r"\((?P<duration>[\d.]+)s(?:, (?P<chars>\d+) chars)?\)"
+)
+
+_log_file_cache: Dict[str, Tuple[Tuple[int, int], Dict[str, Any]]] = {}
+
+
+def _hermes_home() -> Path:
+    if get_hermes_home is not None:
+        return Path(get_hermes_home())
+    configured = os.environ.get("HERMES_HOME")
+    if configured:
+        return Path(configured)
+    return Path(os.environ.get("LOCALAPPDATA", Path.home())) / "hermes"
+
 
 @contextmanager
-def _database() -> Iterator[Any]:
+def _database(db_path: Optional[Path] = None) -> Iterator[Any]:
     if SessionDB is None:
         raise RuntimeError("Hermes SessionDB is unavailable in this process")
-    db = SessionDB(read_only=True)
+    db = SessionDB(db_path=db_path, read_only=True) if db_path else SessionDB(read_only=True)
     try:
         yield db
     finally:
@@ -117,6 +170,35 @@ def _clean_text(value: Any, limit: int = MAX_SNIPPET_CHARS) -> str:
     if len(text) > limit:
         return text[: max(0, limit - 1)].rstrip() + "…"
     return text
+
+
+def _clean_content(value: Any, limit: int = MAX_TRACE_CONTENT_CHARS) -> str:
+    text = "" if value is None else str(value)
+    text = _ANSI_RE.sub("", text)
+    text = _CONTROL_RE.sub(" ", text)
+    text = _SECRET_RE.sub(lambda match: f"{match.group(1)}{match.group(2)}[redacted]", text)
+    text = _BEARER_RE.sub("Bearer [redacted]", text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n{4,}", "\n\n\n", text).strip()
+    if len(text) > limit:
+        return text[: max(0, limit - 1)].rstrip() + "…"
+    return text
+
+
+def _session_outcome(row: Mapping[str, Any]) -> Dict[str, str]:
+    if row.get("ended_at") is None:
+        last_activity = _number(row.get("last_activity_at") or row.get("started_at"), 0)
+        if last_activity and time.time() - last_activity < 300:
+            return {"outcome": "running", "outcome_label": "Running"}
+        return {"outcome": "open", "outcome_label": "Open"}
+    reason = str(row.get("end_reason") or "").strip().lower()
+    if reason in _FAILED_END_REASONS or any(part in reason for part in ("error", "fail", "timeout")):
+        return {"outcome": "failed", "outcome_label": "Failed"}
+    if reason in _CANCELLED_END_REASONS or "cancel" in reason or "interrupt" in reason:
+        return {"outcome": "cancelled", "outcome_label": "Cancelled"}
+    if reason in _COMPLETED_END_REASONS or "complete" in reason:
+        return {"outcome": "completed", "outcome_label": "Completed"}
+    return {"outcome": "closed", "outcome_label": "Closed"}
 
 
 def _cost_view(row: Mapping[str, Any]) -> Dict[str, Any]:
@@ -200,6 +282,7 @@ def _session_payload(row: Mapping[str, Any]) -> Dict[str, Any]:
             ),
         }
     )
+    payload.update(_session_outcome(row))
     payload.update(_cost_view(row))
     return payload
 
@@ -412,7 +495,7 @@ def _analyze_events(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Any]:
                     if timestamp and (not entry["last_used_at"] or timestamp > entry["last_used_at"]):
                         entry["last_used_at"] = timestamp
 
-    for result in unbound_results:
+    for result in list(results_by_call.values()) + unbound_results:
         if result.get("id") in matched_result_ids:
             continue
         name = result.get("tool_name")
@@ -569,6 +652,7 @@ def _list_sessions_sync(
             cte
             + """
             SELECT s.id, s.source, s.display_name, s.model, s.started_at, s.ended_at,
+                   s.end_reason, s.parent_session_id,
                    s.message_count, s.tool_call_count, s.input_tokens, s.output_tokens,
                    s.cache_read_tokens, s.cache_write_tokens, s.reasoning_tokens,
                    s.cwd, s.git_branch, s.git_repo_root, s.billing_provider,
@@ -752,6 +836,297 @@ async def session_detail(session_id: str) -> Dict[str, Any]:
     return await asyncio.to_thread(_session_detail_sync, session_id)
 
 
+def _trace_sync(session_id: str, limit: int, offset: int) -> Dict[str, Any]:
+    with _database() as db:
+        sid = db.resolve_session_id(session_id)
+        if not sid:
+            raise HTTPException(status_code=404, detail="Session not found")
+        total = db._conn.execute(
+            """
+            SELECT COUNT(*) FROM messages
+            WHERE session_id=? AND coalesce(active,1)=1 AND role!='system'
+            """,
+            (sid,),
+        ).fetchone()[0]
+        rows = db._conn.execute(
+            """
+            SELECT id, role, content, tool_call_id, tool_calls, tool_name,
+                   effect_disposition, timestamp, token_count, finish_reason,
+                   reasoning_content, compacted, display_kind
+            FROM messages
+            WHERE session_id=? AND coalesce(active,1)=1 AND role!='system'
+            ORDER BY id ASC LIMIT ? OFFSET ?
+            """,
+            (sid, limit, offset),
+        ).fetchall()
+
+    events: List[Dict[str, Any]] = []
+    for raw in rows:
+        row = _row_dict(raw)
+        role = str(row.get("role") or "unknown").lower()
+        base = {
+            "message_id": row.get("id"),
+            "timestamp": row.get("timestamp"),
+            "finish_reason": row.get("finish_reason"),
+            "token_count": _integer(row.get("token_count")),
+            "compacted": bool(row.get("compacted")),
+            "display_kind": row.get("display_kind"),
+        }
+        reasoning = _clean_content(row.get("reasoning_content"))
+        if role == "assistant" and reasoning:
+            events.append({**base, "id": f"{row.get('id')}:reasoning", "kind": "reasoning", "content": reasoning})
+
+        raw_content = str(row.get("content") or "")
+        schedule_scaffolding = role == "user" and raw_content.lstrip().startswith(
+            "[IMPORTANT: You are running as a scheduled cron job."
+        )
+        content = "" if schedule_scaffolding else _clean_content(raw_content)
+        if content:
+            kind = "tool_result" if role == "tool" else role
+            event = {**base, "id": f"{row.get('id')}:{kind}", "kind": kind, "content": content}
+            if role == "tool":
+                failed = _is_failure(
+                    role=role,
+                    content=row.get("content"),
+                    finish_reason=row.get("finish_reason"),
+                    effect_disposition=row.get("effect_disposition"),
+                )
+                event.update(
+                    {
+                        "tool_name": row.get("tool_name") or "tool",
+                        "tool_call_id": row.get("tool_call_id"),
+                        "status": "failed" if failed else "completed",
+                    }
+                )
+            events.append(event)
+
+        for index, call in enumerate(_iter_tool_calls(row.get("tool_calls"))):
+            events.append(
+                {
+                    **base,
+                    "id": f"{row.get('id')}:tool:{index}",
+                    "kind": "tool_call",
+                    "tool_name": call["name"],
+                    "tool_call_id": call.get("call_id"),
+                    "content": _argument_summary(call["arguments"]),
+                }
+            )
+
+    return {
+        "session_id": sid,
+        "events": events,
+        "pagination": {
+            "total_messages": int(total),
+            "limit": limit,
+            "offset": offset,
+            "returned_messages": len(rows),
+            "has_more": offset + len(rows) < total,
+        },
+        "privacy": {
+            "system_prompts_included": False,
+            "schedule_prompts_included": False,
+            "content_redacted": True,
+            "content_limit_chars": MAX_TRACE_CONTENT_CHARS,
+        },
+        "generated_at": time.time(),
+    }
+
+
+@router.get("/sessions/{session_id}/trace")
+async def session_trace(
+    session_id: str,
+    limit: int = Query(100, ge=1, le=MAX_TRACE_PAGE),
+    offset: int = Query(0, ge=0),
+) -> Dict[str, Any]:
+    return await asyncio.to_thread(_trace_sync, session_id, limit, offset)
+
+
+def _timestamp_from_log(value: str) -> float:
+    try:
+        return dt.datetime.strptime(value, "%Y-%m-%d %H:%M:%S,%f").astimezone().timestamp()
+    except ValueError:
+        return 0.0
+
+
+def _parse_log_file(path: Path) -> Dict[str, Any]:
+    stat = path.stat()
+    signature = (stat.st_size, stat.st_mtime_ns)
+    key = str(path)
+    cached = _log_file_cache.get(key)
+    if cached and cached[0] == signature:
+        return cached[1]
+
+    api_events: List[Dict[str, Any]] = []
+    tool_events: List[Dict[str, Any]] = []
+    with path.open("rb") as handle:
+        if stat.st_size > MAX_LOG_FILE_BYTES:
+            handle.seek(stat.st_size - MAX_LOG_FILE_BYTES)
+            handle.readline()
+        text = handle.read(MAX_LOG_FILE_BYTES).decode("utf-8", errors="replace")
+    for line in text.splitlines():
+        envelope = _LOG_LINE_RE.match(line)
+        if not envelope:
+            continue
+        timestamp = _timestamp_from_log(envelope.group("stamp"))
+        message = envelope.group("message")
+        api_match = _API_METRIC_RE.search(message)
+        if api_match:
+            api_events.append(
+                {
+                    "timestamp": timestamp,
+                    "session_id": envelope.group("session"),
+                    "model": api_match.group("model"),
+                    "provider": api_match.group("provider"),
+                    "input_tokens": _integer(api_match.group("input")),
+                    "output_tokens": _integer(api_match.group("output")),
+                    "total_tokens": _integer(api_match.group("total")),
+                    "latency_seconds": _number(api_match.group("latency")),
+                    "cache_read_tokens": _integer(api_match.group("cache_read")),
+                    "prompt_tokens": _integer(api_match.group("prompt")),
+                }
+            )
+            continue
+        tool_match = _TOOL_METRIC_RE.search(message)
+        if tool_match:
+            tool_events.append(
+                {
+                    "timestamp": timestamp,
+                    "session_id": envelope.group("session"),
+                    "tool": tool_match.group("tool"),
+                    "status": tool_match.group("status"),
+                    "duration_seconds": _number(tool_match.group("duration")),
+                    "output_chars": _integer(tool_match.group("chars")),
+                }
+            )
+    parsed = {"api": api_events, "tools": tool_events}
+    _log_file_cache[key] = (signature, parsed)
+    return parsed
+
+
+def _percentile(values: Iterable[float], percentile: float) -> Optional[float]:
+    ordered = sorted(float(value) for value in values)
+    if not ordered:
+        return None
+    index = max(0, min(len(ordered) - 1, round((len(ordered) - 1) * percentile)))
+    return ordered[index]
+
+
+def _runtime_events() -> Dict[str, Any]:
+    log_dir = _hermes_home() / "logs"
+    if not log_dir.exists():
+        return {"api": [], "tools": [], "files": []}
+    candidates = sorted(
+        (path for path in log_dir.glob("agent.log*") if path.is_file()),
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )[:MAX_LOG_FILES]
+    api_events: List[Dict[str, Any]] = []
+    tool_events: List[Dict[str, Any]] = []
+    files = []
+    for path in reversed(candidates):
+        try:
+            parsed = _parse_log_file(path)
+        except OSError:
+            continue
+        api_events.extend(parsed["api"])
+        tool_events.extend(parsed["tools"])
+        files.append({"name": path.name, "size_bytes": path.stat().st_size, "updated_at": path.stat().st_mtime})
+    return {"api": api_events, "tools": tool_events, "files": files}
+
+
+def _metric_groups(rows: List[Dict[str, Any]], key: str) -> List[Dict[str, Any]]:
+    groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for row in rows:
+        groups[str(row.get(key) or "unknown")].append(row)
+    result = []
+    for name, material in groups.items():
+        latencies = [item["latency_seconds"] for item in material]
+        prompt_tokens = sum(_integer(item.get("prompt_tokens")) for item in material)
+        cache_read = sum(_integer(item.get("cache_read_tokens")) for item in material)
+        result.append(
+            {
+                key: name,
+                "api_calls": len(material),
+                "input_tokens": sum(_integer(item.get("input_tokens")) for item in material),
+                "output_tokens": sum(_integer(item.get("output_tokens")) for item in material),
+                "latency_avg_seconds": sum(latencies) / len(latencies),
+                "latency_p50_seconds": _percentile(latencies, 0.50),
+                "latency_p95_seconds": _percentile(latencies, 0.95),
+                "cache_read_tokens": cache_read,
+                "prompt_tokens": prompt_tokens,
+                "cache_hit_ratio": cache_read / prompt_tokens if prompt_tokens else None,
+            }
+        )
+    result.sort(key=lambda item: item["api_calls"], reverse=True)
+    return result
+
+
+def _telemetry_sync(days: int, session_id: str = "") -> Dict[str, Any]:
+    runtime = _runtime_events()
+    cutoff = time.time() - days * 86400 if days > 0 else 0
+    api_rows = [
+        row for row in runtime["api"]
+        if row["timestamp"] >= cutoff and (not session_id or row.get("session_id") == session_id)
+    ]
+    tool_rows = [
+        row for row in runtime["tools"]
+        if row["timestamp"] >= cutoff and (not session_id or row.get("session_id") == session_id)
+    ]
+    latencies = [row["latency_seconds"] for row in api_rows]
+    prompt_tokens = sum(_integer(row.get("prompt_tokens")) for row in api_rows)
+    cache_read = sum(_integer(row.get("cache_read_tokens")) for row in api_rows)
+    tool_groups: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for row in tool_rows:
+        tool_groups[row["tool"]].append(row)
+    tools = []
+    for name, material in tool_groups.items():
+        durations = [item["duration_seconds"] for item in material]
+        statuses = Counter(item["status"] for item in material)
+        tools.append(
+            {
+                "tool": name,
+                "runs": len(material),
+                "completed": statuses.get("completed", 0),
+                "failed": statuses.get("failed", 0),
+                "cancelled": statuses.get("cancelled", 0),
+                "duration_avg_seconds": sum(durations) / len(durations),
+                "duration_p95_seconds": _percentile(durations, 0.95),
+            }
+        )
+    tools.sort(key=lambda item: (item["failed"], item["runs"]), reverse=True)
+    return {
+        "period_days": days,
+        "session_id": session_id or None,
+        "summary": {
+            "api_calls": len(api_rows),
+            "tool_runs": len(tool_rows),
+            "latency_avg_seconds": sum(latencies) / len(latencies) if latencies else None,
+            "latency_p50_seconds": _percentile(latencies, 0.50),
+            "latency_p95_seconds": _percentile(latencies, 0.95),
+            "cache_read_tokens": cache_read,
+            "prompt_tokens": prompt_tokens,
+            "cache_hit_ratio": cache_read / prompt_tokens if prompt_tokens else None,
+        },
+        "models": _metric_groups(api_rows, "model"),
+        "providers": _metric_groups(api_rows, "provider"),
+        "tools": tools,
+        "coverage": {
+            "source": "local Hermes agent logs",
+            "files": runtime["files"],
+            "session_attribution": "only log lines carrying a Hermes session id",
+        },
+        "generated_at": time.time(),
+    }
+
+
+@router.get("/telemetry")
+async def telemetry(
+    days: int = Query(30, ge=0, le=3650),
+    session_id: str = Query("", max_length=240),
+) -> Dict[str, Any]:
+    return await asyncio.to_thread(_telemetry_sync, days, session_id.strip())
+
+
 def _overview_sync(days: int) -> Dict[str, Any]:
     cutoff = time.time() - days * 86400 if days > 0 else 0
     with _database() as db:
@@ -772,7 +1147,7 @@ def _overview_sync(days: int) -> Dict[str, Any]:
                        WHEN estimated_cost_usd IS NOT NULL AND estimated_cost_usd > 0 THEN estimated_cost_usd
                        ELSE 0 END),0) AS display_cost_usd,
                    coalesce(SUM(CASE WHEN actual_cost_usd > 0 THEN 1 ELSE 0 END),0) AS actual_cost_sessions,
-                   coalesce(SUM(CASE WHEN actual_cost_usd <= 0 AND estimated_cost_usd > 0 THEN 1 ELSE 0 END),0) AS estimated_cost_sessions,
+                   coalesce(SUM(CASE WHEN coalesce(actual_cost_usd,0) <= 0 AND estimated_cost_usd > 0 THEN 1 ELSE 0 END),0) AS estimated_cost_sessions,
                    coalesce(SUM(CASE WHEN lower(coalesce(cost_status,'')) IN ('included','subscription','free') THEN 1 ELSE 0 END),0) AS included_cost_sessions,
                    coalesce(SUM(CASE WHEN coalesce(actual_cost_usd,0) <= 0 AND coalesce(estimated_cost_usd,0) <= 0 AND lower(coalesce(cost_status,'')) NOT IN ('included','subscription','free') THEN 1 ELSE 0 END),0) AS unpriced_sessions,
                    (SELECT COUNT(*) FROM messages m
@@ -861,12 +1236,26 @@ def _overview_sync(days: int) -> Dict[str, Any]:
                 (cutoff,),
             ).fetchall()
         ]
+        outcome_counts: Counter[str] = Counter()
+        for row in db._conn.execute(
+            """
+            SELECT end_reason, ended_at, last_activity_at, started_at
+            FROM sessions
+            WHERE started_at >= ? AND coalesce(hidden,0)=0
+            """,
+            (cutoff,),
+        ).fetchall():
+            outcome_counts[_session_outcome(_row_dict(row))["outcome"]] += 1
         return {
             "period_days": days,
             "totals": totals,
             "daily": daily,
             "models": models,
             "sources": sources,
+            "outcomes": [
+                {"outcome": name, "sessions": count}
+                for name, count in sorted(outcome_counts.items(), key=lambda item: item[1], reverse=True)
+            ],
             "generated_at": time.time(),
         }
 
@@ -1035,9 +1424,348 @@ async def skills(days: int = Query(30, ge=0, le=3650)) -> Dict[str, Any]:
     return await asyncio.to_thread(_skills_sync, days)
 
 
+def _profile_db_paths(home: Path) -> List[Tuple[str, Path]]:
+    paths: List[Tuple[str, Path]] = []
+    root_db = home / "state.db"
+    if root_db.exists():
+        paths.append(("default", root_db))
+    profiles_root = home / "profiles"
+    if profiles_root.exists():
+        for profile_dir in sorted(path for path in profiles_root.iterdir() if path.is_dir()):
+            db_path = profile_dir / "state.db"
+            if db_path.exists():
+                paths.append((profile_dir.name, db_path))
+    return paths
+
+
+def _profile_summary(name: str, path: Path, cutoff: float) -> Dict[str, Any]:
+    def read(connection: sqlite3.Connection) -> Dict[str, Any]:
+        totals = _row_dict(
+            connection.execute(
+                """
+                SELECT COUNT(*) AS sessions,
+                       coalesce(SUM(message_count),0) AS messages,
+                       coalesce(SUM(tool_call_count),0) AS tool_calls,
+                       coalesce(SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens),0) AS total_tokens,
+                       coalesce(SUM(CASE
+                           WHEN actual_cost_usd > 0 THEN actual_cost_usd
+                           WHEN estimated_cost_usd > 0 THEN estimated_cost_usd
+                           ELSE 0 END),0) AS recorded_cost_usd,
+                       MAX(coalesce(last_activity_at, started_at)) AS last_activity_at
+                FROM sessions WHERE started_at>=? AND coalesce(hidden,0)=0
+                """,
+                (cutoff,),
+            ).fetchone()
+        )
+        outcomes: Counter[str] = Counter()
+        for row in connection.execute(
+            """
+            SELECT end_reason, ended_at, last_activity_at, started_at
+            FROM sessions WHERE started_at>=? AND coalesce(hidden,0)=0
+            """,
+            (cutoff,),
+        ).fetchall():
+            outcomes[_session_outcome(_row_dict(row))["outcome"]] += 1
+        models = [
+            {"model": row["model"] or "unknown", "sessions": _integer(row["sessions"])}
+            for row in connection.execute(
+                """
+                SELECT model, COUNT(*) AS sessions FROM sessions
+                WHERE started_at>=? AND coalesce(hidden,0)=0
+                GROUP BY model ORDER BY sessions DESC LIMIT 5
+                """,
+                (cutoff,),
+            ).fetchall()
+        ]
+        return {"totals": totals, "outcomes": outcomes, "models": models}
+
+    try:
+        with _database(path) as db:
+            material = read(db._conn)
+    except sqlite3.OperationalError:
+        # A dormant profile can retain WAL journal mode without writable
+        # sidecars. If there is no WAL to reconcile, SQLite immutable mode is
+        # a safe read-only fallback that neither creates nor updates files.
+        if Path(str(path) + "-wal").exists():
+            raise
+        connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro&immutable=1", uri=True)
+        connection.row_factory = sqlite3.Row
+        try:
+            material = read(connection)
+        finally:
+            connection.close()
+    totals = material["totals"]
+    outcomes = material["outcomes"]
+    models = material["models"]
+    stat = path.stat()
+    return {
+        "name": name,
+        "is_default": name == "default",
+        "sessions": _integer(totals.get("sessions")),
+        "messages": _integer(totals.get("messages")),
+        "tool_calls": _integer(totals.get("tool_calls")),
+        "total_tokens": _integer(totals.get("total_tokens")),
+        "recorded_cost_usd": _number(totals.get("recorded_cost_usd")),
+        "last_activity_at": totals.get("last_activity_at"),
+        "outcomes": dict(outcomes),
+        "models": models,
+        "database_size_bytes": stat.st_size,
+        "database_updated_at": stat.st_mtime,
+    }
+
+
+def _profiles_sync(days: int) -> Dict[str, Any]:
+    cutoff = time.time() - days * 86400 if days > 0 else 0
+    profiles = []
+    errors = []
+    for name, path in _profile_db_paths(_hermes_home()):
+        try:
+            profiles.append(_profile_summary(name, path, cutoff))
+        except Exception as error:
+            errors.append({"profile": name, "error": _clean_text(error, 240)})
+    profiles.sort(key=lambda item: _number(item.get("last_activity_at")), reverse=True)
+    return {
+        "period_days": days,
+        "profiles": profiles,
+        "totals": {
+            "profiles": len(profiles),
+            "sessions": sum(item["sessions"] for item in profiles),
+            "total_tokens": sum(item["total_tokens"] for item in profiles),
+            "recorded_cost_usd": sum(item["recorded_cost_usd"] for item in profiles),
+        },
+        "errors": errors,
+        "generated_at": time.time(),
+    }
+
+
+@router.get("/profiles")
+async def profiles(days: int = Query(30, ge=0, le=3650)) -> Dict[str, Any]:
+    return await asyncio.to_thread(_profiles_sync, days)
+
+
+def _read_json_file(path: Path, max_bytes: int = 2 * 1024 * 1024) -> Any:
+    if not path.exists() or path.stat().st_size > max_bytes:
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return None
+
+
+def _profile_file_paths(home: Path, relative: Path) -> List[Tuple[str, Path]]:
+    paths = [("default", home / relative)]
+    profiles_root = home / "profiles"
+    if profiles_root.exists():
+        paths.extend(
+            (profile_dir.name, profile_dir / relative)
+            for profile_dir in sorted(path for path in profiles_root.iterdir() if path.is_dir())
+        )
+    return [(name, path) for name, path in paths if path.exists()]
+
+
+def _gateway_sync() -> Dict[str, Any]:
+    gateways = []
+    for profile, path in _profile_file_paths(_hermes_home(), Path("gateway_state.json")):
+        state = _read_json_file(path)
+        if not isinstance(state, dict):
+            continue
+        platforms = []
+        raw_platforms = state.get("platforms")
+        if isinstance(raw_platforms, dict):
+            for name, value in raw_platforms.items():
+                value = value if isinstance(value, dict) else {"state": value}
+                platforms.append(
+                    {
+                        "name": str(name),
+                        "state": _clean_text(value.get("state"), 80),
+                        "needs_attention": bool(value.get("needs_attention")),
+                        "error_code": _clean_text(value.get("error_code"), 120) or None,
+                        "error_message": _clean_text(value.get("error_message"), 320) or None,
+                        "updated_at": value.get("updated_at"),
+                    }
+                )
+        gateways.append(
+            {
+                "profile": profile,
+                "state": _clean_text(state.get("gateway_state") or state.get("state"), 80) or "unknown",
+                "kind": _clean_text(state.get("kind"), 80) or None,
+                "pid": _integer(state.get("pid")) or None,
+                "start_time": state.get("start_time"),
+                "updated_at": state.get("updated_at") or path.stat().st_mtime,
+                "exit_reason": _clean_text(state.get("exit_reason"), 240) or None,
+                "restart_requested": bool(state.get("restart_requested")),
+                "active_agents": _integer(state.get("active_agents")),
+                "code_version": _clean_text(state.get("code_version"), 80) or None,
+                "platforms": platforms,
+            }
+        )
+    return {"gateways": gateways, "generated_at": time.time()}
+
+
+@router.get("/gateway")
+async def gateway() -> Dict[str, Any]:
+    return await asyncio.to_thread(_gateway_sync)
+
+
+def _schedules_sync() -> Dict[str, Any]:
+    schedules = []
+    for profile, path in _profile_file_paths(_hermes_home(), Path("cron") / "jobs.json"):
+        document = _read_json_file(path)
+        jobs = document.get("jobs") if isinstance(document, dict) else document
+        if not isinstance(jobs, list):
+            continue
+        for job in jobs:
+            if not isinstance(job, dict):
+                continue
+            schedule = job.get("schedule") if isinstance(job.get("schedule"), dict) else {}
+            state = job.get("state") if isinstance(job.get("state"), dict) else {}
+            skills = job.get("skills") if isinstance(job.get("skills"), list) else []
+            schedules.append(
+                {
+                    "profile": profile,
+                    "id": _clean_text(job.get("id"), 160),
+                    "name": _clean_text(job.get("name"), 180) or "Untitled schedule",
+                    "enabled": bool(job.get("enabled")),
+                    "schedule": _clean_text(job.get("schedule_display") or schedule.get("display") or schedule.get("expr") or schedule.get("run_at"), 180),
+                    "schedule_kind": _clean_text(schedule.get("kind"), 80),
+                    "model": _clean_text(job.get("model"), 160) or None,
+                    "provider": _clean_text(job.get("provider"), 120) or None,
+                    "skills": [_clean_text(item, 120) for item in skills[:20]],
+                    "no_agent": bool(job.get("no_agent")),
+                    "next_run_at": job.get("next_run_at") or state.get("next_run_at"),
+                    "last_run_at": job.get("last_run_at") or state.get("last_run_at"),
+                    "last_status": _clean_text(job.get("last_status") or state.get("last_status"), 80) or None,
+                    "last_error": _clean_text(job.get("last_error") or state.get("last_error"), 320) or None,
+                    "last_delivery_error": _clean_text(job.get("last_delivery_error") or state.get("last_delivery_error"), 320) or None,
+                    "failure_streak": _integer(job.get("failure_streak") or state.get("failure_streak")),
+                }
+            )
+    schedules.sort(key=lambda item: (not item["enabled"], _number(item.get("next_run_at"), float("inf")), item["name"]))
+    return {
+        "schedules": schedules,
+        "totals": {
+            "jobs": len(schedules),
+            "enabled": sum(1 for item in schedules if item["enabled"]),
+            "failing": sum(1 for item in schedules if item["failure_streak"] or item["last_error"]),
+        },
+        "privacy": {"prompts_included": False},
+        "generated_at": time.time(),
+    }
+
+
+@router.get("/schedules")
+async def schedules() -> Dict[str, Any]:
+    return await asyncio.to_thread(_schedules_sync)
+
+
+def _kanban_paths(home: Path) -> List[Tuple[str, Path]]:
+    paths: List[Tuple[str, Path]] = []
+    default = home / "kanban.db"
+    if default.exists():
+        paths.append(("default", default))
+    boards_root = home / "kanban" / "boards"
+    if boards_root.exists():
+        paths.extend((path.stem, path) for path in sorted(boards_root.glob("*.db")) if path.is_file())
+    return paths
+
+
+def _kanban_board(name: str, path: Path) -> Dict[str, Any]:
+    connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    connection.row_factory = sqlite3.Row
+    try:
+        table_names = {
+            row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'").fetchall()
+        }
+        status_counts = {}
+        tasks = []
+        runs = []
+        if "tasks" in table_names:
+            status_counts = {
+                str(row["status"] or "unknown"): _integer(row["count"])
+                for row in connection.execute("SELECT status, COUNT(*) AS count FROM tasks GROUP BY status").fetchall()
+            }
+            tasks = [
+                {
+                    "id": row["id"],
+                    "title": _clean_text(row["title"], 220),
+                    "assignee": _clean_text(row["assignee"], 120) or None,
+                    "status": _clean_text(row["status"], 80),
+                    "priority": _integer(row["priority"]),
+                    "created_at": row["created_at"],
+                    "started_at": row["started_at"],
+                    "completed_at": row["completed_at"],
+                    "consecutive_failures": _integer(row["consecutive_failures"]),
+                    "last_failure_error": _clean_text(row["last_failure_error"], 320) or None,
+                    "current_run_id": row["current_run_id"],
+                    "session_id": row["session_id"],
+                }
+                for row in connection.execute(
+                    """
+                    SELECT id,title,assignee,status,priority,created_at,started_at,completed_at,
+                           consecutive_failures,last_failure_error,current_run_id,session_id
+                    FROM tasks ORDER BY coalesce(completed_at,started_at,created_at) DESC LIMIT 300
+                    """
+                ).fetchall()
+            ]
+        if "task_runs" in table_names:
+            runs = [
+                {
+                    "id": row["id"],
+                    "task_id": row["task_id"],
+                    "profile": _clean_text(row["profile"], 120) or None,
+                    "status": _clean_text(row["status"], 80),
+                    "started_at": row["started_at"],
+                    "ended_at": row["ended_at"],
+                    "outcome": _clean_text(row["outcome"], 120) or None,
+                    "summary": _clean_text(row["summary"], 320) or None,
+                    "error": _clean_text(row["error"], 320) or None,
+                }
+                for row in connection.execute(
+                    """
+                    SELECT id,task_id,profile,status,started_at,ended_at,outcome,summary,error
+                    FROM task_runs ORDER BY coalesce(ended_at,started_at) DESC LIMIT 300
+                    """
+                ).fetchall()
+            ]
+        return {
+            "name": name,
+            "status_counts": status_counts,
+            "tasks": tasks,
+            "runs": runs,
+            "database_updated_at": path.stat().st_mtime,
+        }
+    finally:
+        connection.close()
+
+
+def _kanban_sync() -> Dict[str, Any]:
+    boards = []
+    errors = []
+    for name, path in _kanban_paths(_hermes_home()):
+        try:
+            boards.append(_kanban_board(name, path))
+        except (OSError, sqlite3.Error) as error:
+            errors.append({"board": name, "error": _clean_text(error, 240)})
+    return {
+        "boards": boards,
+        "totals": {
+            "boards": len(boards),
+            "tasks": sum(len(board["tasks"]) for board in boards),
+            "runs": sum(len(board["runs"]) for board in boards),
+        },
+        "errors": errors,
+        "generated_at": time.time(),
+    }
+
+
+@router.get("/kanban")
+async def kanban() -> Dict[str, Any]:
+    return await asyncio.to_thread(_kanban_sync)
+
+
 def _system_sync() -> Dict[str, Any]:
     with _database() as db:
-        path = Path(getattr(db, "db_path", get_hermes_home() / "state.db"))
+        path = Path(getattr(db, "db_path", _hermes_home() / "state.db"))
         schema_row = db._conn.execute("SELECT version FROM schema_version").fetchone()
         counts = db._conn.execute(
             """

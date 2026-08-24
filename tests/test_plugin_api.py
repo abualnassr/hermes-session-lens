@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import os
 import sqlite3
 import tempfile
 import unittest
@@ -20,11 +21,11 @@ SPEC.loader.exec_module(api)
 class FakeSessionDB:
     path: Path
 
-    def __init__(self, read_only: bool = False):
+    def __init__(self, db_path: Path | None = None, read_only: bool = False):
         assert read_only is True, "Session Lens must never request a writable DB"
-        self.db_path = self.path
+        self.db_path = Path(db_path) if db_path else self.path
         self.read_only = True
-        self._conn = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
+        self._conn = sqlite3.connect(self.db_path.resolve().as_uri() + "?mode=ro", uri=True)
         self._conn.row_factory = sqlite3.Row
 
     def close(self):
@@ -50,7 +51,10 @@ class FakeSessionDB:
 class SessionLensApiTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
-        self.db_path = Path(self.temp.name) / "state.db"
+        self.home = Path(self.temp.name)
+        self.db_path = self.home / "state.db"
+        self.original_home = os.environ.get("HERMES_HOME")
+        os.environ["HERMES_HOME"] = str(self.home)
         connection = sqlite3.connect(self.db_path)
         connection.executescript(
             """
@@ -64,6 +68,8 @@ class SessionLensApiTests(unittest.TestCase):
                 model TEXT,
                 started_at REAL,
                 ended_at REAL,
+                end_reason TEXT,
+                parent_session_id TEXT,
                 message_count INTEGER DEFAULT 0,
                 tool_call_count INTEGER DEFAULT 0,
                 input_tokens INTEGER DEFAULT 0,
@@ -103,6 +109,10 @@ class SessionLensApiTests(unittest.TestCase):
                 effect_disposition TEXT,
                 timestamp REAL,
                 finish_reason TEXT,
+                token_count INTEGER DEFAULT 0,
+                reasoning_content TEXT,
+                compacted INTEGER DEFAULT 0,
+                display_kind TEXT,
                 active INTEGER DEFAULT 1
             );
 
@@ -144,11 +154,11 @@ class SessionLensApiTests(unittest.TestCase):
         connection.execute(
             """
             INSERT INTO sessions (
-                id,source,model,started_at,ended_at,message_count,tool_call_count,
+                id,source,model,started_at,ended_at,end_reason,message_count,tool_call_count,
                 input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,
                 cwd,billing_provider,billing_mode,estimated_cost_usd,actual_cost_usd,
                 cost_status,cost_source,title,last_activity_at,api_call_count
-            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
             """,
             (
                 "session-1",
@@ -156,6 +166,7 @@ class SessionLensApiTests(unittest.TestCase):
                 "provider/model-a",
                 1_800_000_000,
                 1_800_000_120,
+                "cron_complete",
                 4,
                 2,
                 1000,
@@ -245,8 +256,86 @@ class SessionLensApiTests(unittest.TestCase):
             "INSERT INTO messages (session_id,role,content,timestamp,active) VALUES (?,?,?,?,1)",
             ("session-1", "user", "Please build a plugin", 1_800_000_001),
         )
+        connection.execute(
+            "INSERT INTO messages (session_id,role,content,timestamp,active) VALUES (?,?,?,?,1)",
+            (
+                "session-1",
+                "user",
+                "[IMPORTANT: You are running as a scheduled cron job. DELIVERY: private scaffolding] hidden prompt",
+                1_800_000_002,
+            ),
+        )
         connection.commit()
         connection.close()
+
+        logs = self.home / "logs"
+        logs.mkdir()
+        (logs / "agent.log").write_text(
+            "2027-01-15 08:00:00,000 INFO [session-1] agent.conversation_loop: "
+            "API call #1: model=provider/model-a provider=provider in=1000 out=250 total=1250 "
+            "latency=2.5s cache=500/1000 (50%)\n"
+            "2027-01-15 08:00:03,000 INFO [session-1] agent.tool_executor: "
+            "tool write_file failed (1.25s)\n",
+            encoding="utf-8",
+        )
+        (self.home / "gateway_state.json").write_text(
+            json.dumps(
+                {
+                    "gateway_state": "running",
+                    "pid": 123,
+                    "updated_at": 1_800_000_100,
+                    "platforms": {
+                        "telegram": {"state": "connected", "needs_attention": False}
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        cron = self.home / "cron"
+        cron.mkdir()
+        (cron / "jobs.json").write_text(
+            json.dumps(
+                {
+                    "jobs": [
+                        {
+                            "id": "job-1",
+                            "name": "Daily report",
+                            "prompt": "api_key=must-not-leak",
+                            "enabled": True,
+                            "schedule_display": "Daily at 09:00",
+                            "next_run_at": 1_800_010_000,
+                            "last_status": "ok",
+                        }
+                    ]
+                }
+            ),
+            encoding="utf-8",
+        )
+        kanban = sqlite3.connect(self.home / "kanban.db")
+        kanban.executescript(
+            """
+            CREATE TABLE tasks (
+                id TEXT, title TEXT, assignee TEXT, status TEXT, priority INTEGER,
+                created_at REAL, started_at REAL, completed_at REAL,
+                consecutive_failures INTEGER, last_failure_error TEXT,
+                current_run_id TEXT, session_id TEXT
+            );
+            CREATE TABLE task_runs (
+                id TEXT, task_id TEXT, profile TEXT, status TEXT, started_at REAL,
+                ended_at REAL, outcome TEXT, summary TEXT, error TEXT
+            );
+            INSERT INTO tasks VALUES (
+                'task-1','Inspect plugin','agent','done',1,1800000000,1800000001,
+                1800000050,0,NULL,'run-1','session-1'
+            );
+            INSERT INTO task_runs VALUES (
+                'run-1','task-1','default','completed',1800000001,1800000050,
+                'completed','Finished',NULL
+            );
+            """
+        )
+        kanban.commit()
+        kanban.close()
 
         FakeSessionDB.path = self.db_path
         self.original_session_db = api.SessionDB
@@ -254,6 +343,11 @@ class SessionLensApiTests(unittest.TestCase):
 
     def tearDown(self):
         api.SessionDB = self.original_session_db
+        api._log_file_cache.clear()
+        if self.original_home is None:
+            os.environ.pop("HERMES_HOME", None)
+        else:
+            os.environ["HERMES_HOME"] = self.original_home
         self.temp.cleanup()
 
     def test_list_uses_recorded_cost_and_failure_first(self):
@@ -309,6 +403,46 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertTrue(system["database"]["read_only"])
         self.assertEqual(system["privacy"]["mutation_endpoints"], 0)
         self.assertEqual(system["database"]["schema_version"], 26)
+
+    def test_trace_is_paginated_redacted_and_excludes_system_prompts(self):
+        trace = api._trace_sync("session-1", 100, 0)
+        kinds = {event["kind"] for event in trace["events"]}
+        self.assertIn("user", kinds)
+        self.assertIn("tool_call", kinds)
+        self.assertIn("tool_result", kinds)
+        self.assertFalse(trace["privacy"]["system_prompts_included"])
+        self.assertFalse(trace["privacy"]["schedule_prompts_included"])
+        combined = " ".join(event.get("content", "") for event in trace["events"])
+        self.assertNotIn("should-not-leak", combined)
+        self.assertNotIn("scheduled cron job", combined)
+        self.assertNotIn("hidden prompt", combined)
+
+    def test_runtime_telemetry_uses_local_log_metrics(self):
+        telemetry = api._telemetry_sync(0, "session-1")
+        self.assertEqual(telemetry["summary"]["api_calls"], 1)
+        self.assertEqual(telemetry["summary"]["tool_runs"], 1)
+        self.assertEqual(telemetry["summary"]["latency_p95_seconds"], 2.5)
+        self.assertEqual(telemetry["summary"]["cache_hit_ratio"], 0.5)
+        self.assertEqual(telemetry["tools"][0]["failed"], 1)
+
+    def test_outcomes_do_not_label_stale_unended_sessions_as_running(self):
+        stale = api._session_outcome({"ended_at": None, "last_activity_at": 1})
+        active = api._session_outcome({"ended_at": None, "last_activity_at": api.time.time()})
+        self.assertEqual(stale["outcome"], "open")
+        self.assertEqual(active["outcome"], "running")
+
+    def test_operations_sources_are_read_only_and_prompt_safe(self):
+        profiles = api._profiles_sync(0)
+        self.assertEqual(profiles["totals"]["profiles"], 1)
+        gateway = api._gateway_sync()
+        self.assertEqual(gateway["gateways"][0]["state"], "running")
+        schedules = api._schedules_sync()
+        self.assertEqual(schedules["totals"]["jobs"], 1)
+        self.assertNotIn("prompt", schedules["schedules"][0])
+        self.assertNotIn("must-not-leak", json.dumps(schedules))
+        kanban = api._kanban_sync()
+        self.assertEqual(kanban["totals"]["tasks"], 1)
+        self.assertEqual(kanban["boards"][0]["tasks"][0]["status"], "done")
 
 
 if __name__ == "__main__":

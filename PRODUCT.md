@@ -16,7 +16,7 @@ Hermes Desktop users who need to understand the activity, token consumption, cos
 
 ## Product Purpose
 
-Make session telemetry explainable at a glance and inspectable in depth. Success means a user can find a session, understand what it consumed and did, identify failures, and trace the recorded evidence from one native Hermes page.
+Make Hermes activity explainable at a glance and inspectable in depth. Success means a user can find a session, understand what it consumed and did, trace the recorded evidence, and inspect surrounding runtime and orchestration health from one native Hermes page.
 
 ## Positioning
 
@@ -24,19 +24,24 @@ Session Lens combines broad token and cost telemetry with failure-first, session
 
 ## Operating Context
 
-The plugin appears in Hermes Desktop's left sidebar as **Session Lens** and opens a full native route. It reads the current profile's local Hermes `state.db`, supports dark and light Hermes themes, and must remain usable across routine Hermes application updates.
+The plugin appears in Hermes Desktop's left sidebar as **Session Lens** and opens a full native route. It reads local Hermes state, runtime logs, gateway status, schedule metadata, and Kanban stores in read-only mode; it supports dark and light Hermes themes and must remain usable across routine Hermes application updates.
 
 ## Capabilities and Constraints
 
 - Native route `/session-lens` and `SIDEBAR_NAV_AREA` contribution; no iframe or standalone web server.
 - Session list and detail views for tokens, cost, model, provider, tools, skills, failures, files, and delegations.
-- Overview, Tools, Skills, and System aggregate views.
+- Overview, Operations, Tools, Skills, and System aggregate views.
+- Chronological, paginated session trace for active user, assistant, reasoning, tool-call, and tool-result rows; system prompts excluded.
+- Conservative session outcomes that preserve Hermes' recorded end reason.
+- Cached local-log telemetry for latency, cache efficiency, and tool duration.
+- Cross-profile accounting, gateway/platform health, prompt-safe schedules, and shared Kanban execution status.
 - Failure-first sorting, a dedicated failed-call inspector, Hermes FTS search with snippets, and cursor-style pagination up to 500 rows.
 - An Ask Lens workflow that produces a privacy-conscious, session-grounded prompt for analysis in Hermes.
 - Read-only database access. The plugin must not mutate, archive, delete, or rewrite sessions.
 - Cost precedence: recorded actual cost, then recorded estimate, then a clearly labelled included or unpriced state.
 - Skills must distinguish recorded invocation from merely available capabilities.
 - Local-first operation with no telemetry upload.
+- Operational readers load only when their view is opened and never poll faster than every 30 seconds.
 
 ## Brand Commitments
 
