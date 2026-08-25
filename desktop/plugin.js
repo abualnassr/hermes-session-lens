@@ -59,7 +59,8 @@ const pageTabs = [
   { id: 'operations', label: 'Operations', codicon: 'pulse' },
   { id: 'tools', label: 'Tools', codicon: 'tools' },
   { id: 'skills', label: 'Skills', codicon: 'sparkle' },
-  { id: 'system', label: 'System', codicon: 'server-environment' }
+  { id: 'system', label: 'System', codicon: 'server-environment' },
+  { id: 'ai-usage', label: 'AI Usage', codicon: 'dashboard' }
 ]
 
 function apiPath(path, params = {}) {
@@ -1675,6 +1676,245 @@ function OperationsView({ ctx, period }) {
   })
 }
 
+const usageProviderIcons = {
+  codex: 'terminal',
+  grok: 'sparkle',
+  nous: 'beaker',
+  openrouter: 'globe'
+}
+
+function usageStatus(provider) {
+  const status = provider?.status || 'unavailable'
+  if (status === 'ok') return { label: 'Connected', tone: 'accent', icon: 'pass' }
+  if (status === 'stale') return { label: 'Last known', tone: 'neutral', icon: 'history' }
+  if (status === 'not_configured') return { label: 'Not configured', tone: 'neutral', icon: 'circle-slash' }
+  if (status === 'expired') return { label: 'Login expired', tone: 'danger', icon: 'key' }
+  if (status === 'forbidden') return { label: 'Access denied', tone: 'danger', icon: 'lock' }
+  return { label: 'Unavailable', tone: 'danger', icon: 'warning' }
+}
+
+function formatUsageAmount(value, unit) {
+  if (value === null || value === undefined || !Number.isFinite(Number(value))) return null
+  const amount = Number(value)
+  if (String(unit || '').toUpperCase() === 'USD') {
+    return new Intl.NumberFormat(undefined, { style: 'currency', currency: 'USD', maximumFractionDigits: 2 }).format(amount)
+  }
+  if (unit === 'credits') return `${amount.toLocaleString(undefined, { maximumFractionDigits: 2 })} credits`
+  return amount.toLocaleString(undefined, { maximumFractionDigits: 2 })
+}
+
+function UsageWindow({ window }) {
+  const rawUsed = window.percentage_used
+  const rawRemaining = window.percentage_remaining
+  const hasPercent = rawUsed !== null && rawUsed !== undefined && Number.isFinite(Number(rawUsed))
+  const used = hasPercent ? Number(rawUsed) : 0
+  const hasRemainingPercent = rawRemaining !== null && rawRemaining !== undefined && Number.isFinite(Number(rawRemaining))
+  const remainingPercent = hasRemainingPercent ? Number(rawRemaining) : null
+  const danger = hasPercent && used >= 90
+  const remainingAmount = formatUsageAmount(window.remaining, window.unit)
+  const usedAmount = formatUsageAmount(window.used, window.unit)
+  const limitAmount = formatUsageAmount(window.limit, window.unit)
+  const value = remainingAmount || (remainingPercent !== null ? `${Math.round(remainingPercent)}% remaining` : 'Recorded balance')
+  const detailParts = []
+  if (usedAmount && limitAmount) detailParts.push(`${usedAmount} used of ${limitAmount}`)
+  if (window.detail) detailParts.push(window.detail)
+  if (window.reset_at) detailParts.push(`Resets ${formatDate(window.reset_at)}`)
+  return jsxs('div', {
+    style: { borderTop: border, display: 'grid', gap: '0.45rem', padding: '0.72rem 0' },
+    children: [
+      jsxs('div', {
+        style: { alignItems: 'baseline', display: 'flex', gap: '0.75rem', justifyContent: 'space-between' },
+        children: [
+          jsx('span', { style: { color: color.secondary, fontSize: '0.75rem', fontWeight: 600 }, children: window.label }),
+          jsx('span', {
+            style: { ...tabular, color: danger ? color.danger : color.primary, fontSize: '0.75rem', fontWeight: 650, textAlign: 'right' },
+            children: value
+          })
+        ]
+      }),
+      hasPercent
+        ? jsx('div', {
+            role: 'progressbar',
+            'aria-label': `${window.label} usage`,
+            'aria-valuemin': 0,
+            'aria-valuemax': 100,
+            'aria-valuenow': Math.round(used),
+            style: { background: color.surfaceRaised, borderRadius: '999px', height: '0.38rem', overflow: 'hidden' },
+            children: jsx('div', {
+              style: {
+                background: danger ? color.danger : color.accent,
+                borderRadius: '999px',
+                height: '100%',
+                width: `${Math.max(0, Math.min(100, used))}%`
+              }
+            })
+          })
+        : null,
+      detailParts.length
+        ? jsx('div', {
+            style: { color: color.quaternary, fontSize: '0.6875rem', lineHeight: 1.45 },
+            children: detailParts.join(' · ')
+          })
+        : null
+    ]
+  })
+}
+
+function UsageProvider({ provider }) {
+  const status = usageStatus(provider)
+  const messageDanger = ['expired', 'forbidden', 'unavailable'].includes(provider.status)
+  return jsxs('section', {
+    style: { border, borderRadius: '6px', minWidth: 0, padding: '0.85rem 1rem' },
+    children: [
+      jsxs('div', {
+        style: { alignItems: 'flex-start', display: 'flex', gap: '0.8rem', justifyContent: 'space-between' },
+        children: [
+          jsxs('div', {
+            style: { display: 'flex', gap: '0.6rem', minWidth: 0 },
+            children: [
+              jsx(Codicon, { name: usageProviderIcons[provider.provider] || 'dashboard', size: '0.9rem', style: { color: color.tertiary, marginTop: '0.18rem' } }),
+              jsxs('div', {
+                style: { minWidth: 0 },
+                children: [
+                  jsx('h3', {
+                    style: { color: color.primary, fontSize: '0.875rem', fontWeight: 650, lineHeight: 1.35, margin: 0 },
+                    children: provider.label
+                  }),
+                  jsx('div', {
+                    style: { color: color.quaternary, fontSize: '0.6875rem', lineHeight: 1.45, marginTop: '0.12rem' },
+                    children: [provider.plan, provider.auth_source].filter(Boolean).join(' · ')
+                  })
+                ]
+              })
+            ]
+          }),
+          jsxs('div', {
+            style: { alignItems: 'flex-end', display: 'flex', flexDirection: 'column', gap: '0.3rem' },
+            children: [
+              jsx(Pill, {
+                tone: status.tone,
+                children: jsxs(Fragment, { children: [jsx(Codicon, { name: status.icon, size: '0.65rem' }), status.label] })
+              }),
+              provider.experimental ? jsx(Pill, { children: 'Experimental source' }) : null
+            ]
+          })
+        ]
+      }),
+      provider.message
+        ? jsx('p', {
+            role: messageDanger ? 'alert' : undefined,
+            style: {
+              background: messageDanger ? color.dangerSoft : color.surface,
+              borderRadius: '5px',
+              color: messageDanger ? color.danger : color.secondary,
+              fontSize: '0.6875rem',
+              lineHeight: 1.5,
+              margin: '0.75rem 0 0',
+              padding: '0.5rem 0.6rem'
+            },
+            children: provider.status === 'stale'
+              ? `Latest refresh failed; showing the last successful reading. ${provider.message}`
+              : provider.message
+          })
+        : null,
+      provider.windows?.length
+        ? jsx('div', { style: { marginTop: '0.65rem' }, children: provider.windows.map(window => jsx(UsageWindow, { window }, `${provider.provider}-${window.id}`)) })
+        : jsx('div', {
+            style: { borderTop: border, color: color.quaternary, fontSize: '0.75rem', marginTop: '0.75rem', paddingTop: '0.75rem' },
+            children: provider.status === 'not_configured'
+              ? 'Sign in or configure this provider in Hermes to expose account usage.'
+              : 'No quota windows are available right now.'
+          }),
+      provider.details?.length
+        ? jsx('ul', {
+            style: { color: color.tertiary, display: 'grid', fontSize: '0.6875rem', gap: '0.25rem', lineHeight: 1.45, margin: '0.65rem 0 0', paddingLeft: '1rem' },
+            children: provider.details.map((detail, index) => jsx('li', { children: detail }, `${provider.provider}-detail-${index}`))
+          })
+        : null,
+      provider.fetched_at
+        ? jsx('div', {
+            style: { color: color.quaternary, fontSize: '0.625rem', marginTop: '0.65rem' },
+            children: `${provider.stale ? 'Last successful reading' : 'Provider checked'} ${formatDate(provider.fetched_at)}`
+          })
+        : null
+    ]
+  })
+}
+
+function AIUsageStatStrip({ data }) {
+  const summary = data?.summary || {}
+  return jsx('div', {
+    style: {
+      borderBottom: border,
+      borderTop: border,
+      display: 'grid',
+      gridTemplateColumns: 'repeat(4, minmax(8rem, 1fr))',
+      overflowX: 'auto'
+    },
+    children: [
+      jsx(Metric, {
+        label: 'Connected providers',
+        value: data ? `${formatCount(summary.connected)} / ${formatCount(summary.providers)}` : '—',
+        detail: data ? `${formatCount(summary.not_configured)} not configured` : null
+      }, 'connected'),
+      jsx(Metric, {
+        label: 'Needs attention',
+        value: data ? formatCount(summary.needs_attention) : '—',
+        detail: data ? `${formatCount(summary.stale)} last-known readings` : null,
+        danger: Number(summary.needs_attention) > 0
+      }, 'attention'),
+      jsx(Metric, {
+        label: 'Next reset',
+        value: summary.next_reset_at ? formatShortDate(summary.next_reset_at) : '—',
+        detail: summary.next_reset_at ? formatDate(summary.next_reset_at) : 'No timed window reported'
+      }, 'reset'),
+      jsx(Metric, {
+        label: 'Last refresh',
+        value: data?.generated_at ? formatShortDate(data.generated_at) : '—',
+        detail: data ? `${data.cached ? 'Cached' : 'Live'} · ${Math.round((data.cache_ttl_seconds || 300) / 60)} min cache` : null
+      }, 'refresh')
+    ]
+  })
+}
+
+function AIUsageView({ query, narrow, refreshError }) {
+  if (query.isLoading) return jsx(LoadingBlock, { rows: 8 })
+  if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'AI usage is unavailable' })
+  const data = query.data
+  return jsx('div', {
+    style: { flex: 1, minHeight: 0, overflow: 'auto', padding: '1rem' },
+    children: jsxs('div', {
+      style: { display: 'grid', gap: '1rem', margin: '0 auto', maxWidth: '84rem' },
+      children: [
+        jsx(SectionHeading, {
+          title: 'Provider allowances and balances',
+          description: 'Current account-level usage from the credentials already configured in Hermes. These limits are separate from Session Lens token and cost history.'
+        }),
+        refreshError
+          ? jsx('div', {
+              role: 'alert',
+              style: { background: color.dangerSoft, borderRadius: '5px', color: color.danger, fontSize: '0.75rem', padding: '0.65rem 0.75rem' },
+              children: `Manual refresh failed: ${refreshError}`
+            })
+          : null,
+        jsx('div', {
+          style: { display: 'grid', gap: '0.85rem', gridTemplateColumns: narrow ? 'minmax(0, 1fr)' : 'repeat(2, minmax(0, 1fr))' },
+          children: (data?.providers || []).map(provider => jsx(UsageProvider, { provider }, provider.provider))
+        }),
+        jsxs('div', {
+          style: { alignItems: 'flex-start', borderTop: border, color: color.tertiary, display: 'flex', fontSize: '0.6875rem', gap: '0.5rem', lineHeight: 1.5, paddingTop: '0.75rem' },
+          children: [
+            jsx(Codicon, { name: 'lock', size: '0.75rem', style: { marginTop: '0.15rem' } }),
+            jsx('span', {
+              children: 'Credentials remain in the Hermes Python backend. Session Lens returns only normalized usage, status, and reset information; it does not read browser cookies or expose tokens to the desktop UI.'
+            })
+          ]
+        })
+      ]
+    })
+  })
+}
+
 function DefinitionList({ rows }) {
   return jsx('dl', {
     style: { borderTop: border, margin: 0 },
@@ -1743,6 +1983,8 @@ function SystemView({ ctx }) {
             jsx(DefinitionList, {
               rows: [
                 ['Network upload', data.privacy.network_upload ? 'Enabled' : 'None'],
+                ['Provider usage checks', data.privacy.provider_usage_requests ? 'Direct to configured providers' : 'Disabled'],
+                ['Credentials in desktop UI', data.privacy.provider_credentials_returned_to_desktop ? 'Review required' : 'Never returned'],
                 ['Mutation endpoints', String(data.privacy.mutation_endpoints)],
                 ['Snippets', data.privacy.snippets_redacted_and_bounded ? 'Redacted and bounded' : 'Review required'],
                 ['Connection', data.privacy.database_connection],
@@ -1760,6 +2002,8 @@ function SessionLensPage({ ctx }) {
   const viewport = useValue(host.state.viewport)
   const queryClient = useQueryClient()
   const [tab, setTab] = useState(() => ctx.storage.get('activeTab', 'sessions'))
+  const [aiManualRefreshing, setAiManualRefreshing] = useState(false)
+  const [aiRefreshError, setAiRefreshError] = useState('')
   const [daysText, setDaysText] = useState(() => {
     const stored = String(ctx.storage.get('timeRange', ctx.storage.get('days', 30)))
     return timeOptions.some(option => option.id === stored) ? stored : '30'
@@ -1772,6 +2016,12 @@ function SessionLensPage({ ctx }) {
     queryFn: () => ctx.rest(apiPath('/overview', period)),
     refetchInterval: 60_000
   })
+  const aiUsageQuery = useQuery({
+    queryKey: [PLUGIN_ID, 'ai-usage'],
+    queryFn: () => ctx.rest('/ai-usage'),
+    enabled: tab === 'ai-usage',
+    refetchInterval: tab === 'ai-usage' ? 300_000 : false
+  })
 
   useEffect(() => ctx.storage.set('activeTab', tab), [ctx, tab])
   useEffect(() => {
@@ -1781,7 +2031,22 @@ function SessionLensPage({ ctx }) {
   useEffect(() => ctx.storage.set('customStart', customStart), [ctx, customStart])
   useEffect(() => ctx.storage.set('customEnd', customEnd), [ctx, customEnd])
 
-  const refresh = () => queryClient.invalidateQueries({ queryKey: [PLUGIN_ID] })
+  const refresh = async () => {
+    if (tab !== 'ai-usage') {
+      queryClient.invalidateQueries({ queryKey: [PLUGIN_ID] })
+      return
+    }
+    setAiManualRefreshing(true)
+    setAiRefreshError('')
+    try {
+      const data = await ctx.rest('/ai-usage?fresh=true')
+      queryClient.setQueryData([PLUGIN_ID, 'ai-usage'], data)
+    } catch (error) {
+      setAiRefreshError(error?.message || String(error || 'The backend did not return data.'))
+    } finally {
+      setAiManualRefreshing(false)
+    }
+  }
   const updateCustomStart = value => {
     if (!value) return
     setCustomStart(value)
@@ -1798,6 +2063,11 @@ function SessionLensPage({ ctx }) {
   if (tab === 'tools') content = jsx(ToolsView, { ctx, period })
   if (tab === 'skills') content = jsx(SkillsViewPanel, { ctx, period })
   if (tab === 'system') content = jsx(SystemView, { ctx })
+  if (tab === 'ai-usage') content = jsx(AIUsageView, {
+    query: aiUsageQuery,
+    narrow: Boolean(viewport?.narrow),
+    refreshError: aiRefreshError
+  })
 
   return jsxs('div', {
     style: { color: color.primary, display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, minWidth: 0 },
@@ -1814,15 +2084,20 @@ function SessionLensPage({ ctx }) {
               }),
               jsx('p', {
                 style: { color: color.tertiary, fontSize: '0.6875rem', lineHeight: 1.4, margin: '0.12rem 0 0' },
-                children: 'Session evidence, runtime health, and work orchestration—grounded in local Hermes records.'
+                children: 'Session evidence, account usage, runtime health, and work orchestration—grounded in Hermes records.'
               })
             ]
           }),
           jsxs('div', {
             style: { alignItems: 'center', display: 'flex', flex: '1 1 auto', flexWrap: 'wrap', gap: '0.5rem', justifyContent: 'flex-end' },
             children: [
-              jsx(SegmentedControl, { options: timeOptions, value: daysText, onChange: setDaysText }),
-              daysText === 'custom'
+              tab === 'ai-usage'
+                ? jsx(Pill, {
+                    tone: 'accent',
+                    children: jsxs(Fragment, { children: [jsx(Codicon, { name: 'pulse', size: '0.65rem' }), 'Live account quotas'] })
+                  })
+                : jsx(SegmentedControl, { options: timeOptions, value: daysText, onChange: setDaysText }),
+              tab !== 'ai-usage' && daysText === 'custom'
                 ? jsxs('div', {
                     'aria-label': 'Custom date range',
                     style: { alignItems: 'center', display: 'flex', flexWrap: 'wrap', gap: '0.45rem' },
@@ -1838,13 +2113,18 @@ function SessionLensPage({ ctx }) {
                 onClick: refresh,
                 'aria-label': 'Refresh Session Lens',
                 title: 'Refresh Session Lens',
-                children: jsx(Codicon, { name: overviewQuery.isFetching ? 'sync~spin' : 'refresh' })
+                disabled: aiManualRefreshing,
+                children: jsx(Codicon, {
+                  name: (tab === 'ai-usage' ? aiManualRefreshing || aiUsageQuery.isFetching : overviewQuery.isFetching) ? 'sync~spin' : 'refresh'
+                })
               })
             ]
           })
         ]
       }),
-      jsx(StatStrip, { overview: overviewQuery.data }),
+      tab === 'ai-usage'
+        ? jsx(AIUsageStatStrip, { data: aiUsageQuery.data })
+        : jsx(StatStrip, { overview: overviewQuery.data }),
       jsx('nav', {
         'aria-label': 'Session Lens views',
         style: { borderBottom: border, display: 'flex', overflowX: 'auto', padding: '0 0.65rem' },
@@ -1879,7 +2159,7 @@ function SessionLensPage({ ctx }) {
 export default {
   id: PLUGIN_ID,
   name: 'Hermes Session Lens',
-  description: 'Native read-only session telemetry, trace, runtime health, profiles, schedules, and Kanban operations.',
+  description: 'Native read-only session telemetry, account usage, trace, runtime health, profiles, schedules, and Kanban operations.',
   defaultEnabled: true,
   register(ctx) {
     ctx.registerMany([
@@ -1901,7 +2181,7 @@ export default {
         data: {
           id: 'session-lens.open',
           label: 'Session Lens: Open telemetry',
-          keywords: ['sessions', 'tokens', 'cost', 'tools', 'skills', 'failures', 'telemetry', 'profiles', 'gateway', 'schedules', 'kanban'],
+          keywords: ['sessions', 'tokens', 'cost', 'usage', 'quota', 'codex', 'grok', 'nous', 'openrouter', 'tools', 'skills', 'failures', 'telemetry', 'profiles', 'gateway', 'schedules', 'kanban'],
           run: () => host.navigate(ROUTE)
         }
       }

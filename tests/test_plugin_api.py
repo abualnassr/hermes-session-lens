@@ -9,6 +9,8 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "dashboard" / "plugin_api.py"
@@ -344,6 +346,8 @@ class SessionLensApiTests(unittest.TestCase):
     def tearDown(self):
         api.SessionDB = self.original_session_db
         api._log_file_cache.clear()
+        api._ai_usage_cache = None
+        api._ai_usage_last_success.clear()
         if self.original_home is None:
             os.environ.pop("HERMES_HOME", None)
         else:
@@ -402,7 +406,151 @@ class SessionLensApiTests(unittest.TestCase):
         system = api._system_sync()
         self.assertTrue(system["database"]["read_only"])
         self.assertEqual(system["privacy"]["mutation_endpoints"], 0)
+        self.assertFalse(system["privacy"]["provider_credentials_returned_to_desktop"])
         self.assertEqual(system["database"]["schema_version"], 26)
+
+    def test_account_usage_snapshot_is_normalised_and_secret_redacted(self):
+        snapshot = SimpleNamespace(
+            unavailable_reason=None,
+            plan="Plus",
+            windows=(
+                SimpleNamespace(
+                    label="Session",
+                    used_percent=42.5,
+                    reset_at="2027-01-20T12:00:00+00:00",
+                    detail="5 hour window",
+                ),
+            ),
+            details=("api_key=must-not-leak",),
+        )
+        payload = api._account_usage_payload("codex", snapshot)
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["plan"], "Plus")
+        self.assertEqual(payload["windows"][0]["percentage_remaining"], 57.5)
+        self.assertIn("[redacted]", payload["details"][0])
+        self.assertNotIn("must-not-leak", json.dumps(payload))
+
+    def test_grok_windows_map_weekly_and_extra_credit_envelopes(self):
+        windows = api._grok_windows_from_payloads(
+            {
+                "config": {
+                    "creditUsagePercent": 42.5,
+                    "currentPeriod": {"end": "2027-01-20T12:00:00Z"},
+                }
+            },
+            {
+                "config": {
+                    "monthlyLimit": {"val": 5000},
+                    "used": {"val": 1250},
+                    "billingPeriodEnd": "2027-02-01T00:00:00Z",
+                }
+            },
+        )
+        self.assertEqual(len(windows), 2)
+        self.assertEqual(windows[0]["percentage_remaining"], 57.5)
+        self.assertEqual(windows[1]["limit"], 50.0)
+        self.assertEqual(windows[1]["used"], 12.5)
+        self.assertEqual(windows[1]["remaining"], 37.5)
+        self.assertEqual(windows[1]["unit"], "credits")
+
+    def test_openrouter_keeps_key_usage_when_account_credits_need_management_key(self):
+        payload = api._openrouter_payload(
+            {
+                "limit": 100,
+                "limit_remaining": 74.5,
+                "limit_reset": "monthly",
+                "usage_daily": 1.25,
+                "usage_weekly": 4.5,
+                "usage_monthly": 25.5,
+            },
+            None,
+            partial_message="Account credits require an OpenRouter management key",
+        )
+        self.assertEqual(payload["status"], "ok")
+        self.assertTrue(payload["partial"])
+        self.assertEqual(payload["windows"][0]["percentage_remaining"], 74.5)
+        self.assertIn("$25.50 this month", payload["details"][0])
+
+    def test_ai_usage_cache_preserves_last_success_as_stale(self):
+        def ok(provider):
+            return api._provider_payload(
+                provider,
+                status="ok",
+                windows=[api._usage_window("Weekly", used_percent=25)],
+            )
+
+        first = {
+            "_collect_codex_usage": Mock(return_value=ok("codex")),
+            "_collect_grok_usage": Mock(return_value=ok("grok")),
+            "_collect_nous_usage": Mock(return_value=ok("nous")),
+            "_collect_openrouter_usage": Mock(return_value=ok("openrouter")),
+        }
+        with patch.multiple(api, **first):
+            fresh = api._ai_usage_sync(True)
+            cached = api._ai_usage_sync(False)
+        self.assertEqual(fresh["summary"]["connected"], 4)
+        self.assertTrue(cached["cached"])
+        for collector in first.values():
+            collector.assert_called_once()
+
+        failing = {
+            "_collect_codex_usage": Mock(return_value=ok("codex")),
+            "_collect_grok_usage": Mock(
+                return_value=api._provider_payload(
+                    "grok", status="unavailable", message="temporary failure"
+                )
+            ),
+            "_collect_nous_usage": Mock(return_value=ok("nous")),
+            "_collect_openrouter_usage": Mock(return_value=ok("openrouter")),
+        }
+        with patch.multiple(api, **failing):
+            refreshed = api._ai_usage_sync(True)
+        grok = next(item for item in refreshed["providers"] if item["provider"] == "grok")
+        self.assertEqual(grok["status"], "stale")
+        self.assertTrue(grok["stale"])
+        self.assertEqual(grok["last_error_status"], "unavailable")
+        self.assertEqual(grok["windows"][0]["percentage_remaining"], 75.0)
+        self.assertEqual(refreshed["summary"]["connected"], 3)
+        self.assertEqual(refreshed["summary"]["needs_attention"], 1)
+
+    def test_ai_usage_expired_login_does_not_reuse_stale_reading(self):
+        api._ai_usage_last_success["grok"] = api._provider_payload(
+            "grok",
+            status="ok",
+            windows=[api._usage_window("Weekly", used_percent=25)],
+        )
+        collectors = {
+            "_collect_codex_usage": Mock(return_value=api._provider_payload("codex", status="not_configured")),
+            "_collect_grok_usage": Mock(return_value=api._provider_payload("grok", status="expired")),
+            "_collect_nous_usage": Mock(return_value=api._provider_payload("nous", status="not_configured")),
+            "_collect_openrouter_usage": Mock(
+                return_value=api._provider_payload("openrouter", status="not_configured")
+            ),
+        }
+        with patch.multiple(api, **collectors):
+            payload = api._ai_usage_sync(True)
+        grok = next(item for item in payload["providers"] if item["provider"] == "grok")
+        self.assertEqual(grok["status"], "expired")
+        self.assertFalse(grok["stale"])
+        self.assertNotIn("grok", api._ai_usage_last_success)
+
+    def test_ai_usage_provider_failure_isolated_from_other_collectors(self):
+        def explode():
+            raise RuntimeError("api_key=must-not-leak")
+
+        with patch.multiple(
+            api,
+            _collect_codex_usage=explode,
+            _collect_grok_usage=Mock(return_value=api._provider_payload("grok", status="not_configured")),
+            _collect_nous_usage=Mock(return_value=api._provider_payload("nous", status="not_configured")),
+            _collect_openrouter_usage=Mock(
+                return_value=api._provider_payload("openrouter", status="not_configured")
+            ),
+        ):
+            payload = api._ai_usage_sync(True)
+        codex = next(item for item in payload["providers"] if item["provider"] == "codex")
+        self.assertEqual(codex["status"], "unavailable")
+        self.assertNotIn("must-not-leak", json.dumps(codex))
 
     def test_trace_is_paginated_redacted_and_excludes_system_prompts(self):
         trace = api._trace_sync("session-1", 100, 0)

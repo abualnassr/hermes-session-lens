@@ -1,6 +1,6 @@
 ---
 name: Hermes Session Lens
-description: A native Hermes observatory for session evidence, accounting, and operational health.
+description: A native Hermes observatory for provider capacity, session evidence, accounting, and operational health.
 colors:
   accent: "var(--ui-accent)"
   accent-soft: "color-mix(in srgb, var(--ui-accent) 14%, transparent)"
@@ -98,7 +98,7 @@ components:
 
 **Creative North Star: "The Native Observatory"**
 
-Hermes Session Lens is an **Operate** surface inside Hermes Desktop: one native observatory connecting session evidence to accounting and operational health. It inherits Hermes typography, controls, codicons, focus behavior, and light/dark theme roles; it does not establish a separate brand skin.
+Hermes Session Lens is an **Operate** surface inside Hermes Desktop: one native observatory connecting provider capacity and session evidence to accounting and operational health. It inherits Hermes typography, controls, codicons, focus behavior, and light/dark theme roles; it does not establish a separate brand skin.
 
 The interface is compact, quiet, and evidence-first. A user finds a session, verifies trace and accounting, then inspects runtime, profile, schedule, or Kanban state without leaving Hermes. Progressive disclosure carries the density, while explicit provenance, bounded excerpts, and read-only language make the trust boundary visible.
 
@@ -161,7 +161,7 @@ The palette is wholly theme-owned: Hermes accent and neutral roles carry structu
 
 ## Layout
 
-The page fills its Hermes route and uses a compact header, a four-signal strip, six stable view tabs, then a dense scroll-managed workspace. The first viewport establishes recorded cost, tokens, sessions, failures, and the active view before deeper evidence begins.
+The page fills its Hermes route and uses a compact header, a four-signal strip, seven stable view tabs, then a dense scroll-managed workspace. Session views establish recorded cost, tokens, sessions, and failures; AI Usage swaps those signals for connected providers, attention, next reset, and refresh freshness.
 
 Sessions uses a wide master/detail split with a minimum 20rem list and 28rem detail, weighted 0.82/1.38. List and detail scroll independently. The detail proceeds through its own header, four metrics, Summary/Trace/Tools/Failures/Files/Ask Lens tabs, then a single content scroller.
 
@@ -191,13 +191,13 @@ The form language is compact and lightly softened. Native/select controls use re
 
 ### Header and signals
 
-- **Header:** Compact title and grounding sentence on the left; preset/custom time range and explicit refresh on the right. Custom ranges expose labelled native start/end date fields and treat the end date as inclusive.
+- **Header:** Compact title and grounding sentence on the left; preset/custom time range and explicit refresh on the right. Custom ranges expose labelled native start/end date fields and treat the end date as inclusive. AI Usage replaces historical controls with a labelled live-quota state and makes refresh bypass the provider cache.
 - **Signal strip:** Four equal accounting cells—Recorded cost, Tokens, Sessions, and Failures detected—with a small provenance/detail line below each value.
 - **Partial-known cost:** When some sessions are unpriced, preserve the sum of known cost and show the unpriced session count; do not replace known accounting with a false zero.
 
 ### Navigation
 
-- **View tabs:** Sessions, Overview, Operations, Tools, Skills, and System remain stable and horizontally scrollable. Active state uses stronger text and an accent underline.
+- **View tabs:** Sessions, Overview, Operations, Tools, Skills, System, and AI Usage remain stable and horizontally scrollable. Active state uses stronger text and an accent underline.
 - **Operations segments:** Health, Profiles, Schedules, and Kanban use the Hermes segmented control.
 - **Detail segments:** Summary, Trace, Tools, Failures, Files, and Ask Lens preserve their order and surface counts when known.
 
@@ -205,6 +205,13 @@ The form language is compact and lightly softened. Native/select controls use re
 
 - **Session row:** Title and outcome lead; timestamp/source, tokens, tool calls, cost, model, and optional bounded search snippet follow in descending emphasis. Selection uses the accent wash.
 - **Pills:** Neutral, accent, and destructive tones are compact and fully rounded. Outcome pills pair label and codicon; failure counts remain visibly distinct.
+
+### AI Usage
+
+- **Provider sections:** Codex, Grok, Nous Portal, and OpenRouter use compact bordered sections in a two-column wide layout and a one-column narrow layout. They are operational groupings, not decorative cards.
+- **Quota windows:** Labels and tabular remaining values lead; progress bars carry `progressbar` semantics and never communicate state by color alone. Monetary balances retain their unit and never become a fabricated percentage when no denominator exists.
+- **Provider states:** Connected, not configured, expired, forbidden, unavailable, partial, and stale are stated in text. Grok carries an Experimental source pill, and stale data names the failed refresh while preserving the last successful reading.
+- **Trust boundary:** The view states that credentials stay in the Python backend, browser cookies are not read, and only normalized account usage reaches JavaScript.
 
 ### Evidence tables and trace
 
@@ -223,7 +230,7 @@ The form language is compact and lightly softened. Native/select controls use re
 ### Do:
 
 - **Do** preserve Hermes SDK controls, theme variables, codicons, and native focus behavior.
-- **Do** keep the four-signal strip, stable tabs, and dense evidence workspace visible in the first viewport.
+- **Do** keep the context-appropriate four-signal strip, stable tabs, and dense evidence workspace visible in the first viewport.
 - **Do** pair failure color with text or a codicon and expose bounded evidence for inspection.
 - **Do** preserve known aggregate cost alongside an explicit unpriced-session count.
 - **Do** exclude scheduled-job scaffold prompts and system prompts from trace presentation.

@@ -8,15 +8,15 @@ adaptive
 
 ## Stack
 
-Hermes unified plugin package: a plain JavaScript ESM desktop plugin using `@hermes/plugin-sdk`, plus a dependency-free Python/FastAPI backend that reads Hermes' SQLite session store in read-only mode.
+Hermes unified plugin package: a plain JavaScript ESM desktop plugin using `@hermes/plugin-sdk`, plus a Python/FastAPI backend using Hermes-bundled dependencies for read-only session inspection and direct provider usage checks.
 
 ## Users
 
-Hermes Desktop users who need to understand the activity, token consumption, cost, tools, skills, failures, files, and delegated work behind each agent session without leaving the desktop app.
+Hermes Desktop users who need to understand provider allowances plus the activity, token consumption, cost, tools, skills, failures, files, and delegated work behind each agent session without leaving the desktop app.
 
 ## Product Purpose
 
-Make Hermes activity explainable at a glance and inspectable in depth. Success means a user can find a session, understand what it consumed and did, trace the recorded evidence, and inspect surrounding runtime and orchestration health from one native Hermes page.
+Make Hermes activity and account capacity explainable at a glance and inspectable in depth. Success means a user can check what remains on configured AI accounts, find a session, understand what it consumed and did, trace the recorded evidence, and inspect surrounding runtime and orchestration health from one native Hermes page.
 
 ## Positioning
 
@@ -30,7 +30,8 @@ The plugin appears in Hermes Desktop's left sidebar as **Session Lens** and open
 
 - Native route `/session-lens` and `SIDEBAR_NAV_AREA` contribution; no iframe or standalone web server.
 - Session list and detail views for tokens, cost, model, provider, tools, skills, failures, files, and delegations.
-- Overview, Operations, Tools, Skills, and System aggregate views.
+- Overview, Operations, Tools, Skills, System, and AI Usage views.
+- Current Codex, Grok, Nous Portal, and OpenRouter account allowances and balances through Hermes-resolved credentials; Grok is explicitly experimental.
 - Chronological, paginated session trace for active user, assistant, reasoning, tool-call, and tool-result rows; system prompts excluded.
 - Conservative session outcomes that preserve Hermes' recorded end reason.
 - Cached local-log telemetry for latency, cache efficiency, and tool duration.
@@ -40,7 +41,7 @@ The plugin appears in Hermes Desktop's left sidebar as **Session Lens** and open
 - Read-only database access. The plugin must not mutate, archive, delete, or rewrite sessions.
 - Cost precedence: recorded actual cost, then recorded estimate, then a clearly labelled included or unpriced state.
 - Skills must distinguish recorded invocation from merely available capabilities.
-- Local-first operation with no telemetry upload.
+- Local-first operation with no third-party telemetry upload. AI Usage makes direct authenticated quota requests only to the configured providers and never returns credentials to JavaScript.
 - Operational readers load only when their view is opened and never poll faster than every 30 seconds.
 
 ## Brand Commitments
@@ -57,14 +58,14 @@ The plugin appears in Hermes Desktop's left sidebar as **Session Lens** and open
 - Hermes Agent v0.20.5 database schema v26, verified on Windows on 2026-08-23.
 - Installed Hermes Desktop Plugin SDK and bundled `hermes-desktop-plugins` instructions.
 - Hermes `sessions`, `messages`, `session_model_usage`, FTS, and `async_delegations` tables.
-- TokenTelemetry and Hermes Session Analyzer are product-behavior references; this implementation is original and should not fabricate compatibility claims beyond verified Hermes versions.
+- TokenTelemetry and Hermes Session Analyzer are product-behavior references; Hermes LLM Quota Monitor informs the experimental Grok adapter. Compatibility claims remain bounded to verified Hermes versions and provider responses.
 
 ## Product Principles
 
 - Evidence before estimates.
 - Failures should be easier to find than successes are to admire.
 - Dense information remains scan-friendly through progressive disclosure.
-- Privacy is the default: local reads, bounded snippets, and no external telemetry.
+- Privacy is the default: local reads, bounded snippets, no third-party telemetry, and direct provider quota checks that never expose credentials to the Desktop UI.
 - The plugin should feel maintained by Hermes, while remaining independently installable.
 
 ## Accessibility & Inclusion

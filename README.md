@@ -1,8 +1,8 @@
 # Hermes Session Lens
 
-Hermes Session Lens is a native, read-only observability page for Hermes Desktop. It appears in the left sidebar and explains what each session consumed and did, then connects that evidence to runtime health, profiles, schedules, and Kanban execution.
+Hermes Session Lens is a native observability page for Hermes Desktop. It appears in the left sidebar and explains what each session consumed and did, shows current provider allowances and balances, then connects that evidence to runtime health, profiles, schedules, and Kanban execution.
 
-It is a unified Hermes plugin—one install contains the native Desktop page and its namespaced Python API. There is no iframe, separate dashboard, Node server, or telemetry upload.
+It is a unified Hermes plugin—one install contains the native Desktop page and its namespaced Python API. There is no iframe, separate dashboard, Node server, or third-party telemetry service.
 
 ## What it includes
 
@@ -21,7 +21,9 @@ It is a unified Hermes plugin—one install contains the native Desktop page and
 - Gateway and platform health for the default and named profiles.
 - Schedule status, next/last run, delivery errors, and failure streaks without exposing schedule prompts.
 - Shared Kanban task and run status with bounded failure evidence.
-- Overview, Operations, Tools, Skills, and System views.
+- Overview, Operations, Tools, Skills, System, and AI Usage views.
+- Live account-level usage for OpenAI Codex, Grok, Nous Research Portal, and OpenRouter using credentials already configured in Hermes.
+- Five-minute in-memory provider cache, explicit partial/stale states, and a manual fresh refresh. Grok is labelled experimental because its billing surface is private and may change.
 - Ask Lens: builds a grounded analysis prompt locally, copies it, and opens a new Hermes chat.
 - Failure-first, recent, cost, token, and tool-call sorting; pagination grows to a 500-session safety limit.
 - Click-to-sort headers on every evidence table, with visible direction and keyboard-accessible controls.
@@ -73,7 +75,9 @@ Hermes Agent updates do not remove this plugin because it lives under `$HERMES_H
 - Tool results, transcript events, schedule errors, gateway errors, and Kanban evidence are secret-redacted and length-bounded before reaching the Desktop page.
 - Schedule and system prompts are never returned by the API.
 - Runtime logs are parsed locally with per-file memory caching; no new cache file is written.
-- No session content or usage telemetry is sent over the internet.
+- Session content, prompts, and local telemetry are never sent to a third-party analytics service.
+- The AI Usage tab makes direct authenticated quota requests only to OpenAI, xAI, Nous Research, and OpenRouter. Credentials remain in the Python backend and are never returned to the Desktop plugin.
+- Provider checks do not read browser cookies. Grok reuses Hermes `xai-oauth`; no Grok CLI is required.
 - Ask Lens copies a locally generated prompt; the user decides whether to paste and submit it in Hermes.
 
 Failure detection combines Hermes' recorded finish/effect states with conservative signatures in tool results. The evidence is shown so users can verify it. File paths are observed evidence, not a guaranteed audit of every filesystem operation.
@@ -91,4 +95,4 @@ node --check desktop/plugin.js
 
 ## Credits and license
 
-Hermes Session Lens is MIT licensed. See [UPSTREAM.md](UPSTREAM.md) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for transparent behavior-level credit to TokenTelemetry, Hermes Session Analyzer, and Hermes Agent.
+Hermes Session Lens is MIT licensed. See [UPSTREAM.md](UPSTREAM.md) and [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for transparent credit to TokenTelemetry, Hermes Session Analyzer, Hermes Agent, and the Grok quota adapter informed by Hermes LLM Quota Monitor.

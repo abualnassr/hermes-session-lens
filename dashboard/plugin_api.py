@@ -8,16 +8,21 @@ contains no mutation endpoint and never opens a writable SQLite connection.
 from __future__ import annotations
 
 import asyncio
+import copy
 import datetime as dt
 import json
+import math
 import os
 import re
 import sqlite3
+import threading
 import time
 from collections import Counter, defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
+from urllib.parse import urlparse
 
 from fastapi import APIRouter, HTTPException, Query
 
@@ -31,7 +36,7 @@ except ImportError:  # pragma: no cover - makes isolated editor/test imports cle
 
 router = APIRouter()
 
-PLUGIN_VERSION = "0.3.0"
+PLUGIN_VERSION = "0.4.0"
 MAX_SESSION_PAGE = 500
 MAX_ANALYSIS_EVENTS = 5000
 MAX_SEARCH_MATCHES = 2000
@@ -40,6 +45,8 @@ MAX_TRACE_PAGE = 200
 MAX_TRACE_CONTENT_CHARS = 6000
 MAX_LOG_FILES = 5
 MAX_LOG_FILE_BYTES = 6 * 1024 * 1024
+AI_USAGE_CACHE_TTL_SECONDS = 300
+AI_USAGE_PROVIDER_TIMEOUT_SECONDS = 12
 
 _ERROR_FINISH_REASONS = {"error", "agent_error", "content_filter"}
 _ERROR_EFFECTS = {"blocked", "denied", "error", "failed", "failure"}
@@ -120,6 +127,9 @@ _TOOL_METRIC_RE = re.compile(
 )
 
 _log_file_cache: Dict[str, Tuple[Tuple[int, int], Dict[str, Any]]] = {}
+_ai_usage_cache_lock = threading.Lock()
+_ai_usage_cache: Optional[Tuple[float, Dict[str, Any]]] = None
+_ai_usage_last_success: Dict[str, Dict[str, Any]] = {}
 
 
 def _hermes_home() -> Path:
@@ -1880,6 +1890,537 @@ async def kanban() -> Dict[str, Any]:
     return await asyncio.to_thread(_kanban_sync)
 
 
+_AI_USAGE_PROVIDER_META = {
+    "codex": {"label": "OpenAI Codex", "auth_source": "Hermes OAuth", "experimental": False},
+    "grok": {"label": "Grok", "auth_source": "Hermes xAI OAuth", "experimental": True},
+    "nous": {"label": "Nous Research Portal", "auth_source": "Hermes OAuth", "experimental": False},
+    "openrouter": {"label": "OpenRouter", "auth_source": "Hermes API key", "experimental": False},
+}
+_AI_USAGE_PROVIDER_ORDER = tuple(_AI_USAGE_PROVIDER_META)
+
+
+def _usage_number(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or value in (None, ""):
+        return None
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    return number if math.isfinite(number) else None
+
+
+def _usage_percent(value: Any) -> Optional[float]:
+    number = _usage_number(value)
+    return None if number is None else max(0.0, min(100.0, number))
+
+
+def _usage_iso(value: Any) -> Optional[str]:
+    if value in (None, ""):
+        return None
+    if isinstance(value, dt.datetime):
+        moment = value if value.tzinfo else value.replace(tzinfo=dt.timezone.utc)
+        return moment.isoformat()
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        try:
+            return dt.datetime.fromtimestamp(float(value), tz=dt.timezone.utc).isoformat()
+        except (OSError, OverflowError, ValueError):
+            return None
+    text = _clean_text(value, 120)
+    return text or None
+
+
+def _provider_message(error: BaseException) -> str:
+    response = getattr(error, "response", None)
+    status_code = getattr(response, "status_code", None)
+    if status_code:
+        return f"HTTP {status_code}"
+    return _clean_text(f"{type(error).__name__}: {error}", 200) or type(error).__name__
+
+
+def _provider_payload(
+    provider: str,
+    *,
+    status: str,
+    plan: Optional[str] = None,
+    windows: Optional[List[Dict[str, Any]]] = None,
+    details: Optional[List[str]] = None,
+    message: Optional[str] = None,
+    partial: bool = False,
+) -> Dict[str, Any]:
+    meta = _AI_USAGE_PROVIDER_META[provider]
+    return {
+        "provider": provider,
+        "label": meta["label"],
+        "status": status,
+        "auth_source": meta["auth_source"],
+        "experimental": meta["experimental"],
+        "plan": _clean_text(plan, 120) or None,
+        "windows": windows or [],
+        "details": [_clean_text(item, 320) for item in (details or []) if _clean_text(item, 320)],
+        "message": _clean_text(message, 240) or None,
+        "partial": bool(partial),
+        "stale": False,
+        "fetched_at": time.time(),
+    }
+
+
+def _window_id(label: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", label.strip().lower()).strip("-") or "usage"
+
+
+def _usage_window(
+    label: str,
+    *,
+    kind: str = "quota",
+    used_percent: Any = None,
+    reset_at: Any = None,
+    detail: Any = None,
+    limit: Any = None,
+    used: Any = None,
+    remaining: Any = None,
+    unit: Optional[str] = None,
+) -> Dict[str, Any]:
+    used_pct = _usage_percent(used_percent)
+    return {
+        "id": _window_id(label),
+        "label": _clean_text(label, 120),
+        "kind": kind,
+        "percentage_used": used_pct,
+        "percentage_remaining": None if used_pct is None else 100.0 - used_pct,
+        "reset_at": _usage_iso(reset_at),
+        "detail": _clean_text(detail, 240) or None,
+        "limit": _usage_number(limit),
+        "used": _usage_number(used),
+        "remaining": _usage_number(remaining),
+        "unit": _clean_text(unit, 40) or None,
+    }
+
+
+def _account_usage_payload(provider: str, snapshot: Any) -> Dict[str, Any]:
+    if snapshot is None:
+        return _provider_payload(
+            provider,
+            status="unavailable",
+            message="Hermes did not return account-usage data for this provider.",
+        )
+    unavailable = _clean_text(getattr(snapshot, "unavailable_reason", None), 240)
+    if unavailable:
+        return _provider_payload(provider, status="unavailable", message=unavailable)
+    windows = []
+    for raw in tuple(getattr(snapshot, "windows", ()) or ()):
+        label = _clean_text(getattr(raw, "label", None), 120) or "Usage"
+        windows.append(
+            _usage_window(
+                label,
+                used_percent=getattr(raw, "used_percent", None),
+                reset_at=getattr(raw, "reset_at", None),
+                detail=getattr(raw, "detail", None),
+            )
+        )
+    details = list(getattr(snapshot, "details", ()) or ())
+    if not windows and not details:
+        return _provider_payload(
+            provider,
+            status="unavailable",
+            message="The provider returned no quota windows or balance details.",
+        )
+    return _provider_payload(
+        provider,
+        status="ok",
+        plan=getattr(snapshot, "plan", None),
+        windows=windows,
+        details=[str(item) for item in details],
+    )
+
+
+def _collect_codex_usage() -> Dict[str, Any]:
+    try:
+        from agent.account_usage import fetch_account_usage
+
+        return _account_usage_payload("codex", fetch_account_usage("openai-codex"))
+    except Exception as error:
+        return _provider_payload("codex", status="unavailable", message=_provider_message(error))
+
+
+def _grok_windows_from_payloads(
+    weekly_payload: Optional[Mapping[str, Any]],
+    monthly_payload: Optional[Mapping[str, Any]],
+) -> List[Dict[str, Any]]:
+    windows: List[Dict[str, Any]] = []
+    weekly_config = weekly_payload.get("config") if isinstance(weekly_payload, Mapping) else None
+    if isinstance(weekly_config, Mapping):
+        used_pct = _usage_percent(weekly_config.get("creditUsagePercent"))
+        period = weekly_config.get("currentPeriod")
+        reset_at = period.get("end") if isinstance(period, Mapping) else None
+        reset_at = reset_at or weekly_config.get("billingPeriodEnd")
+        if used_pct is not None:
+            windows.append(
+                _usage_window(
+                    "Weekly allowance",
+                    used_percent=used_pct,
+                    reset_at=reset_at,
+                    detail="Shared across Grok products",
+                )
+            )
+
+    monthly_config = monthly_payload.get("config") if isinstance(monthly_payload, Mapping) else None
+    if isinstance(monthly_config, Mapping):
+        raw_limit = monthly_config.get("monthlyLimit")
+        raw_used = monthly_config.get("used")
+        limit_value = _usage_number(raw_limit.get("val")) if isinstance(raw_limit, Mapping) else None
+        used_value = _usage_number(raw_used.get("val")) if isinstance(raw_used, Mapping) else None
+        if limit_value is not None and limit_value > 0 and used_value is not None:
+            limit = limit_value / 100.0
+            used = max(0.0, used_value / 100.0)
+            remaining = max(0.0, limit - used)
+            windows.append(
+                _usage_window(
+                    "Extra usage credits",
+                    kind="balance",
+                    used_percent=(used / limit) * 100.0,
+                    reset_at=monthly_config.get("billingPeriodEnd"),
+                    limit=limit,
+                    used=used,
+                    remaining=remaining,
+                    unit="credits",
+                )
+            )
+    return windows
+
+
+def _collect_grok_usage() -> Dict[str, Any]:
+    # Billing response mapping is informed by the MIT-licensed
+    # bnogalski/hermes-llm-quota project; see UPSTREAM.md.
+    try:
+        from hermes_cli.auth import resolve_xai_oauth_runtime_credentials
+
+        credentials = resolve_xai_oauth_runtime_credentials(refresh_if_expiring=True) or {}
+        token = str(credentials.get("api_key") or "").strip()
+    except Exception as error:
+        return _provider_payload("grok", status="unavailable", message=_provider_message(error))
+    if not token:
+        return _provider_payload("grok", status="not_configured", message="No Hermes xAI OAuth login was found.")
+
+    try:
+        import httpx
+    except ImportError:
+        return _provider_payload("grok", status="unavailable", message="Hermes HTTP client is unavailable.")
+
+    url = "https://cli-chat-proxy.grok.com/v1/billing"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/json",
+        "User-Agent": "xai-grok-cli",
+        "X-Xai-Token-Auth": "xai-grok-cli",
+        "x-grok-client-identifier": "grok-cli",
+        "x-grok-client-version": "0.2.103",
+    }
+    payloads: Dict[str, Mapping[str, Any]] = {}
+    errors: List[str] = []
+    statuses: List[int] = []
+    try:
+        with httpx.Client(timeout=AI_USAGE_PROVIDER_TIMEOUT_SECONDS) as client:
+            for name, params in (("weekly", {"format": "credits"}), ("monthly", None)):
+                try:
+                    response = client.get(url, params=params, headers=headers)
+                    statuses.append(response.status_code)
+                    if response.status_code == 200:
+                        payload = response.json()
+                        if isinstance(payload, Mapping):
+                            payloads[name] = payload
+                        else:
+                            errors.append(f"{name}: invalid response")
+                    else:
+                        errors.append(f"{name}: HTTP {response.status_code}")
+                except Exception as error:
+                    errors.append(f"{name}: {_provider_message(error)}")
+    finally:
+        token = ""
+        headers.clear()
+
+    if not payloads:
+        if statuses and all(code == 401 for code in statuses):
+            return _provider_payload("grok", status="expired", message="The xAI OAuth login has expired.")
+        if statuses and all(code == 403 for code in statuses):
+            return _provider_payload("grok", status="forbidden", message="xAI rejected access to account usage.")
+        return _provider_payload(
+            "grok",
+            status="unavailable",
+            message="; ".join(errors) or "Grok usage is temporarily unavailable.",
+        )
+
+    windows = _grok_windows_from_payloads(payloads.get("weekly"), payloads.get("monthly"))
+    if not windows:
+        return _provider_payload(
+            "grok",
+            status="unavailable",
+            message="Grok returned no recognized quota fields.",
+            partial=bool(errors),
+        )
+    return _provider_payload(
+        "grok",
+        status="ok",
+        windows=windows,
+        details=["Private xAI billing surface; response compatibility may change."],
+        message="; ".join(errors) if errors else None,
+        partial=bool(errors),
+    )
+
+
+def _collect_nous_usage() -> Dict[str, Any]:
+    try:
+        from agent.account_usage import build_nous_credits_snapshot
+        from hermes_cli.nous_account import get_nous_portal_account_info
+
+        account = get_nous_portal_account_info(force_fresh=True)
+        if account is None or not getattr(account, "logged_in", False):
+            return _provider_payload("nous", status="not_configured", message="No Nous Portal login was found.")
+        return _account_usage_payload("nous", build_nous_credits_snapshot(account))
+    except Exception as error:
+        return _provider_payload("nous", status="unavailable", message=_provider_message(error))
+
+
+def _openrouter_payload(
+    key_data: Optional[Mapping[str, Any]],
+    credits_data: Optional[Mapping[str, Any]],
+    *,
+    partial_message: Optional[str] = None,
+) -> Dict[str, Any]:
+    windows: List[Dict[str, Any]] = []
+    details: List[str] = []
+    if isinstance(key_data, Mapping):
+        limit = _usage_number(key_data.get("limit"))
+        remaining = _usage_number(key_data.get("limit_remaining"))
+        if limit is not None and limit > 0 and remaining is not None and 0 <= remaining <= limit:
+            used = limit - remaining
+            reset = _clean_text(key_data.get("limit_reset"), 80)
+            windows.append(
+                _usage_window(
+                    "API key limit",
+                    used_percent=(used / limit) * 100.0,
+                    detail=f"Resets {reset}" if reset else None,
+                    limit=limit,
+                    used=used,
+                    remaining=remaining,
+                    unit="USD",
+                )
+            )
+        usage_parts = []
+        for key, label in (
+            ("usage_daily", "today"),
+            ("usage_weekly", "this week"),
+            ("usage_monthly", "this month"),
+        ):
+            value = _usage_number(key_data.get(key))
+            if value is not None:
+                usage_parts.append(f"${value:,.2f} {label}")
+        if usage_parts:
+            details.append("API key usage: " + " · ".join(usage_parts))
+    if isinstance(credits_data, Mapping):
+        total = _usage_number(credits_data.get("total_credits"))
+        used = _usage_number(credits_data.get("total_usage"))
+        if total is not None and used is not None:
+            remaining = max(0.0, total - used)
+            windows.append(
+                _usage_window(
+                    "Account credits",
+                    kind="balance",
+                    used_percent=(used / total) * 100.0 if total > 0 else None,
+                    limit=total,
+                    used=used,
+                    remaining=remaining,
+                    unit="USD",
+                )
+            )
+    if not windows and not details:
+        return _provider_payload(
+            "openrouter",
+            status="unavailable",
+            message=partial_message or "OpenRouter returned no recognized usage fields.",
+        )
+    return _provider_payload(
+        "openrouter",
+        status="ok",
+        windows=windows,
+        details=details,
+        message=partial_message,
+        partial=bool(partial_message),
+    )
+
+
+def _collect_openrouter_usage() -> Dict[str, Any]:
+    try:
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        runtime = resolve_runtime_provider(
+            requested="openrouter",
+            explicit_base_url=None,
+            explicit_api_key=None,
+        )
+        token = str(runtime.get("api_key") or "").strip()
+        base_url = str(runtime.get("base_url") or "https://openrouter.ai/api/v1").strip().rstrip("/")
+    except Exception as error:
+        return _provider_payload("openrouter", status="unavailable", message=_provider_message(error))
+    if not token:
+        return _provider_payload("openrouter", status="not_configured", message="No Hermes OpenRouter API key was found.")
+    parsed = urlparse(base_url)
+    if parsed.scheme != "https" or (parsed.hostname or "").lower() != "openrouter.ai":
+        return _provider_payload(
+            "openrouter",
+            status="unavailable",
+            message="Usage checks require the official https://openrouter.ai API endpoint.",
+        )
+
+    try:
+        import httpx
+    except ImportError:
+        return _provider_payload("openrouter", status="unavailable", message="Hermes HTTP client is unavailable.")
+
+    headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+    key_data: Optional[Mapping[str, Any]] = None
+    credits_data: Optional[Mapping[str, Any]] = None
+    errors: List[str] = []
+    statuses: List[int] = []
+    try:
+        with httpx.Client(timeout=AI_USAGE_PROVIDER_TIMEOUT_SECONDS) as client:
+            for name, path in (("key", "/key"), ("credits", "/credits")):
+                try:
+                    response = client.get(base_url + path, headers=headers)
+                    statuses.append(response.status_code)
+                    if response.status_code == 200:
+                        payload = response.json()
+                        data = payload.get("data") if isinstance(payload, Mapping) else None
+                        if isinstance(data, Mapping):
+                            if name == "key":
+                                key_data = data
+                            else:
+                                credits_data = data
+                        else:
+                            errors.append(f"{name}: invalid response")
+                    elif name == "credits" and response.status_code == 403:
+                        errors.append("Account credits require an OpenRouter management key")
+                    else:
+                        errors.append(f"{name}: HTTP {response.status_code}")
+                except Exception as error:
+                    errors.append(f"{name}: {_provider_message(error)}")
+    finally:
+        token = ""
+        headers.clear()
+
+    if key_data is None and credits_data is None:
+        if statuses and all(code == 401 for code in statuses):
+            return _provider_payload("openrouter", status="expired", message="OpenRouter rejected the configured API key.")
+        if statuses and all(code in {401, 403} for code in statuses):
+            return _provider_payload("openrouter", status="forbidden", message="OpenRouter rejected account-usage access.")
+    return _openrouter_payload(
+        key_data,
+        credits_data,
+        partial_message="; ".join(errors) if errors else None,
+    )
+
+
+def _usage_reset_epoch(value: Any) -> Optional[float]:
+    text = _usage_iso(value)
+    if not text:
+        return None
+    try:
+        return dt.datetime.fromisoformat(text.replace("Z", "+00:00")).timestamp()
+    except (OverflowError, ValueError):
+        return None
+
+
+def _ai_usage_summary(providers: List[Dict[str, Any]]) -> Dict[str, Any]:
+    reset_epochs = [
+        epoch
+        for provider in providers
+        for window in provider.get("windows", [])
+        if (epoch := _usage_reset_epoch(window.get("reset_at"))) is not None and epoch > time.time()
+    ]
+    return {
+        "providers": len(providers),
+        "connected": sum(1 for item in providers if item.get("status") == "ok"),
+        "not_configured": sum(1 for item in providers if item.get("status") == "not_configured"),
+        "needs_attention": sum(
+            1 for item in providers if item.get("status") in {"expired", "forbidden", "unavailable", "stale"}
+        ),
+        "stale": sum(1 for item in providers if item.get("status") == "stale"),
+        "next_reset_at": _usage_iso(min(reset_epochs)) if reset_epochs else None,
+    }
+
+
+def _ai_usage_sync(fresh: bool = False) -> Dict[str, Any]:
+    global _ai_usage_cache
+    now = time.time()
+    with _ai_usage_cache_lock:
+        if not fresh and _ai_usage_cache and now - _ai_usage_cache[0] < AI_USAGE_CACHE_TTL_SECONDS:
+            cached = copy.deepcopy(_ai_usage_cache[1])
+            cached["cached"] = True
+            return cached
+
+    collectors = {
+        "codex": _collect_codex_usage,
+        "grok": _collect_grok_usage,
+        "nous": _collect_nous_usage,
+        "openrouter": _collect_openrouter_usage,
+    }
+    results: Dict[str, Dict[str, Any]] = {}
+    with ThreadPoolExecutor(max_workers=len(collectors), thread_name_prefix="session-lens-usage") as pool:
+        futures = {pool.submit(collector): provider for provider, collector in collectors.items()}
+        for future in as_completed(futures):
+            provider = futures[future]
+            try:
+                result = future.result()
+            except Exception as error:
+                result = _provider_payload(provider, status="unavailable", message=_provider_message(error))
+            results[provider] = result
+
+    with _ai_usage_cache_lock:
+        for provider in _AI_USAGE_PROVIDER_ORDER:
+            result = results.get(provider) or _provider_payload(
+                provider,
+                status="unavailable",
+                message="Provider collector returned no result.",
+            )
+            if result.get("status") == "ok":
+                _ai_usage_last_success[provider] = copy.deepcopy(result)
+            elif result.get("status") in {"not_configured", "expired", "forbidden"}:
+                _ai_usage_last_success.pop(provider, None)
+            elif result.get("status") == "unavailable" and provider in _ai_usage_last_success:
+                current_status = result.get("status")
+                current_message = result.get("message")
+                result = copy.deepcopy(_ai_usage_last_success[provider])
+                result.update(
+                    {
+                        "status": "stale",
+                        "stale": True,
+                        "last_error_status": current_status,
+                        "message": current_message or "The latest refresh failed; showing the last successful reading.",
+                    }
+                )
+            results[provider] = result
+
+        providers = [results[provider] for provider in _AI_USAGE_PROVIDER_ORDER]
+        payload = {
+            "providers": providers,
+            "summary": _ai_usage_summary(providers),
+            "generated_at": time.time(),
+            "cached": False,
+            "cache_ttl_seconds": AI_USAGE_CACHE_TTL_SECONDS,
+            "privacy": {
+                "credentials_returned_to_desktop": False,
+                "browser_cookies_read": False,
+                "external_requests": "Direct authenticated quota requests to the configured providers only",
+            },
+        }
+        _ai_usage_cache = (time.time(), copy.deepcopy(payload))
+        return payload
+
+
+@router.get("/ai-usage")
+async def ai_usage(fresh: bool = False) -> Dict[str, Any]:
+    return await asyncio.to_thread(_ai_usage_sync, fresh)
+
+
 def _system_sync() -> Dict[str, Any]:
     with _database() as db:
         path = Path(getattr(db, "db_path", _hermes_home() / "state.db"))
@@ -1916,6 +2457,8 @@ def _system_sync() -> Dict[str, Any]:
             "counts": _row_dict(counts),
             "privacy": {
                 "network_upload": False,
+                "provider_usage_requests": True,
+                "provider_credentials_returned_to_desktop": False,
                 "mutation_endpoints": 0,
                 "snippets_redacted_and_bounded": True,
                 "database_connection": "Hermes SessionDB(read_only=True)",

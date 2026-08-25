@@ -7,5 +7,6 @@ Hermes Session Lens uses public APIs and behavior patterns from MIT-licensed ope
 | TokenTelemetry | Copyright (c) 2026 Hemanth Vasi | MIT | Product-behavior reference |
 | Hermes Session Analyzer | Copyright (c) 2026 Tom Mulkins | MIT | Product-behavior reference |
 | Hermes Agent | Nous Research and contributors | MIT | Runtime API and host UI/database contracts |
+| Hermes LLM Quota Monitor | Copyright (c) 2026 Bartosz Nogalski | MIT | Grok OAuth billing behavior and response-shape reference |
 
 Links and attribution details are maintained in `UPSTREAM.md`.
