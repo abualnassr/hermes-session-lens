@@ -4,6 +4,10 @@ description: A native Hermes observatory for provider capacity, session evidence
 colors:
   accent: "var(--ui-accent)"
   accent-soft: "color-mix(in srgb, var(--ui-accent) 14%, transparent)"
+  success: "var(--ui-success)"
+  success-soft: "color-mix(in srgb, var(--ui-success) 12%, transparent)"
+  warning: "var(--ui-warning)"
+  warning-soft: "color-mix(in srgb, var(--ui-warning) 12%, transparent)"
   destructive: "var(--destructive)"
   destructive-soft: "color-mix(in srgb, var(--destructive) 12%, transparent)"
   text-primary: "var(--ui-text-primary)"
@@ -100,6 +104,8 @@ components:
 
 Hermes Session Lens is an **Operate** surface inside Hermes Desktop: one native observatory connecting provider capacity and session evidence to accounting and operational health. It inherits Hermes typography, controls, codicons, focus behavior, and light/dark theme roles; it does not establish a separate brand skin.
 
+This design document describes Hermes Session Lens `0.6.0`.
+
 The interface is compact, quiet, and evidence-first. A user finds a session, verifies trace and accounting, then inspects runtime, profile, schedule, or Kanban state without leaving Hermes. Progressive disclosure carries the density, while explicit provenance, bounded excerpts, and read-only language make the trust boundary visible.
 
 **Key Characteristics:**
@@ -161,7 +167,7 @@ The palette is wholly theme-owned: Hermes accent and neutral roles carry structu
 
 ## Layout
 
-The page fills its Hermes route and uses a compact header, a four-signal strip, seven stable view tabs, then a dense scroll-managed workspace. Session views establish recorded cost, tokens, sessions, and failures; AI Usage swaps those signals for connected providers, attention, next reset, and refresh freshness.
+The page fills its Hermes route and uses a compact header, a four-signal strip, eight stable view tabs, then a dense scroll-managed workspace. Session views establish recorded cost, tokens, sessions, and failures; AI Usage swaps those signals for connected providers, attention, next reset, and refresh freshness; AI Models shows distinct models, requests, total tokens, and known API cost.
 
 Sessions uses a wide master/detail split with a minimum 20rem list and 28rem detail, weighted 0.82/1.38. List and detail scroll independently. The detail proceeds through its own header, four metrics, Summary/Trace/Tools/Failures/Files/Ask Lens tabs, then a single content scroller.
 
@@ -191,13 +197,13 @@ The form language is compact and lightly softened. Native/select controls use re
 
 ### Header and signals
 
-- **Header:** Compact title and grounding sentence on the left; preset/custom time range and explicit refresh on the right. Custom ranges expose labelled native start/end date fields and treat the end date as inclusive. AI Usage replaces historical controls with a labelled live-quota state and makes refresh bypass the provider cache.
+- **Header:** Compact title and grounding sentence on the left; preset/custom time range and explicit refresh on the right. Custom ranges expose labelled native start/end date fields and treat the end date as inclusive. AI Usage replaces historical controls with a labelled live-quota state and makes refresh bypass the provider cache. AI Models keeps the historical range and refreshes both local model evidence and shared account quotas.
 - **Signal strip:** Four equal accounting cells—Recorded cost, Tokens, Sessions, and Failures detected—with a small provenance/detail line below each value.
 - **Partial-known cost:** When some sessions are unpriced, preserve the sum of known cost and show the unpriced session count; do not replace known accounting with a false zero.
 
 ### Navigation
 
-- **View tabs:** Sessions, Overview, Operations, Tools, Skills, System, and AI Usage remain stable and horizontally scrollable. Active state uses stronger text and an accent underline.
+- **View tabs:** Sessions, Overview, Operations, Tools, Skills, System, AI Usage, and AI Models remain stable and horizontally scrollable. Active state uses stronger text and an accent underline.
 - **Operations segments:** Health, Profiles, Schedules, and Kanban use the Hermes segmented control.
 - **Detail segments:** Summary, Trace, Tools, Failures, Files, and Ask Lens preserve their order and surface counts when known.
 
@@ -212,6 +218,14 @@ The form language is compact and lightly softened. Native/select controls use re
 - **Quota windows:** Labels and tabular remaining values lead; progress bars carry `progressbar` semantics and never communicate state by color alone. Monetary balances retain their unit and never become a fabricated percentage when no denominator exists.
 - **Provider states:** Connected, not configured, expired or rejected, forbidden, unavailable, partial, and stale are stated in text. Stale data names the failed refresh while preserving the last successful reading.
 - **Trust boundary:** The view states that credentials stay in the Python backend, browser cookies are not read, and only normalized account usage reaches JavaScript.
+
+### AI Models
+
+- **Automatic inventory:** One row per all-time distinct model ID from `session_model_usage`, with a session-row fallback for older accounting. No model list is hardcoded, so first-time routes appear automatically; requests, tokens, cost, reliability, latency, task mix, and trend values honor the selected period.
+- **Comparison table:** All ten headers—Model, Route, Requests, Tokens in/out/cached, Cost, Quota burn, Fail rate, Retry/switch, Latency (TTFT/total), and Trend—are keyboard-sortable. The default is total tokens descending; the wide evidence table scrolls horizontally and retains input/output/cached token alignment.
+- **Expandable evidence:** Clicking any row reveals task-type request counts with first-attempt acceptance proxy bars, rate-limit/timeout/error counts, per-accepted-task efficiency, a threshold insight, route provenance, and coverage notes.
+- **Quota burn:** OAuth subscription routes reuse provider-account quota windows. The fill states cap used and a one-pixel tick marks inferred period elapsed; text labels accompany success, warning, and destructive theme roles. Pay-as-you-go routes say `pay-go`.
+- **Honest gaps:** Cached tokens become a dash when the route has not demonstrated cache reporting. Failure rate and total latency are explicitly bounded-log observations. TTFT remains a dash because Hermes does not record it.
 
 ### Evidence tables and trace
 

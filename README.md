@@ -4,6 +4,8 @@ Hermes Session Lens is a native observability page for Hermes Desktop. It appear
 
 It is a unified Hermes plugin—one install contains the native Desktop page and its namespaced Python API. There is no iframe, separate dashboard, Node server, or third-party telemetry service.
 
+This documentation describes Hermes Session Lens `0.6.0`.
+
 ## What it includes
 
 - Failure-first session browser with full-text search snippets.
@@ -17,11 +19,12 @@ It is a unified Hermes plugin—one install contains the native Desktop page and
 - A chronological Trace tab for user, assistant, reasoning, tool-call, and tool-result evidence. System prompts are excluded and displayed content is redacted and bounded.
 - Conservative session outcomes that preserve Hermes' raw end reason.
 - Local agent-log telemetry for model latency, cache-hit ratio, and tool duration, cached until a source log changes.
+- An **AI Models** tab that keeps an automatic all-time inventory of every recorded model while requests, token mix, cost, shared OAuth quota burn, observed failures, retry/model-switch sessions, total latency, and seven-day request trends honor the selected period. Its ten sortable columns are Model, Route, Requests, Tokens in/out/cached, Cost, Quota burn, Fail rate, Retry/switch, Latency (TTFT/total), and Trend; the default sort is total tokens descending. Rows expand into task-type acceptance proxies, reliability and efficiency evidence, route provenance, and coverage notes.
 - Cross-profile session, token, cost, model, and outcome totals.
 - Gateway and platform health for the default and named profiles.
 - Schedule status, next/last run, delivery errors, and failure streaks without exposing schedule prompts.
 - Shared Kanban task and run status with bounded failure evidence.
-- Overview, Operations, Tools, Skills, System, and AI Usage views.
+- Overview, Operations, Tools, Skills, System, AI Usage, and AI Models views.
 - Live account-level usage for OpenAI Codex, Anthropic Claude, Nous Research Portal, OpenRouter, DeepSeek, Grok, Kimi Code Plan, and Z.AI GLM Coding Plan using credentials already configured in Hermes.
 - Five-minute in-memory provider cache, explicit partial/stale states, and a manual fresh refresh.
 - Ask Lens: builds a grounded analysis prompt locally, copies it, and opens a new Hermes chat.
@@ -77,6 +80,7 @@ Hermes Agent updates do not remove this plugin because it lives under `$HERMES_H
 - Runtime logs are parsed locally with per-file memory caching; no new cache file is written.
 - Session content, prompts, and local telemetry are never sent to a third-party analytics service.
 - The AI Usage tab makes direct authenticated quota requests only to OpenAI, Anthropic, xAI, Nous Research, OpenRouter, DeepSeek, Kimi, and Z.AI. Credentials remain in the Python backend and are never returned to the Desktop plugin.
+- AI Models reads model IDs, routes, accounting, and session evidence locally. OAuth quota is shared at provider-account level, and a subscription model's cap-per-accepted-task value is an allocation estimate rather than an independent model limit. Cost preserves recorded actual, estimated, free, subscription, mixed, or unpriced state; cached tokens show zero only after the route demonstrates cache reporting. Failure percentages and total latency are bounded-log observations, while TTFT is unavailable because Hermes does not record it.
 - Provider checks do not read browser cookies. Anthropic reuses Hermes OAuth, Grok reuses Hermes `xai-oauth`, and Kimi/Z.AI reuse Hermes API keys; no provider CLI needs to remain running.
 - Usage checks accept provider credentials only when Hermes resolves them for the official provider host. Z.AI credential resolution deliberately avoids Hermes inference probes.
 - Ask Lens copies a locally generated prompt; the user decides whether to paste and submit it in Hermes.

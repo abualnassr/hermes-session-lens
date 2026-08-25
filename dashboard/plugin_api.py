@@ -37,7 +37,7 @@ except ImportError:  # pragma: no cover - makes isolated editor/test imports cle
 
 router = APIRouter()
 
-PLUGIN_VERSION = "0.5.2"
+PLUGIN_VERSION = "0.6.0"
 MAX_SESSION_PAGE = 500
 MAX_ANALYSIS_EVENTS = 5000
 MAX_SEARCH_MATCHES = 2000
@@ -121,6 +121,11 @@ _API_METRIC_RE = re.compile(
     r"in=(?P<input>\d+) out=(?P<output>\d+) total=(?P<total>\d+) "
     r"latency=(?P<latency>[\d.]+)s"
     r"(?: cache=(?P<cache_read>\d+)/(?P<prompt>\d+) \((?P<cache_pct>\d+)%\))?"
+)
+_API_ERROR_RE = re.compile(
+    r"(?:Error during (?:local message processing after )?OpenAI-compatible API call"
+    r"|Outer loop error in API call) #(?P<call>\d+)(?::\s*(?P<detail>.*))?",
+    re.IGNORECASE,
 )
 _TOOL_METRIC_RE = re.compile(
     r"tool (?P<tool>[\w.:-]+) (?P<status>completed|failed|cancelled) "
@@ -1014,7 +1019,9 @@ def _parse_log_file(path: Path) -> Dict[str, Any]:
         return cached[1]
 
     api_events: List[Dict[str, Any]] = []
+    api_errors: List[Dict[str, Any]] = []
     tool_events: List[Dict[str, Any]] = []
+    seen_api_errors: set[Tuple[str, int, int]] = set()
     with path.open("rb") as handle:
         if stat.st_size > MAX_LOG_FILE_BYTES:
             handle.seek(stat.st_size - MAX_LOG_FILE_BYTES)
@@ -1043,6 +1050,30 @@ def _parse_log_file(path: Path) -> Dict[str, Any]:
                 }
             )
             continue
+        error_match = _API_ERROR_RE.search(message)
+        if error_match:
+            detail = str(error_match.group("detail") or message)
+            detail_lower = detail.lower()
+            if any(marker in detail_lower for marker in ("rate limit", "rate_limit", "http 429", "status 429", " 429")):
+                category = "rate_limit"
+            elif any(marker in detail_lower for marker in ("timed out", "timeout", "http 408", "status 408", "http 504", "status 504")):
+                category = "timeout"
+            else:
+                category = "error"
+            session_id = envelope.group("session") or ""
+            call_number = _integer(error_match.group("call"))
+            signature_key = (session_id, call_number, round(timestamp))
+            if signature_key not in seen_api_errors:
+                seen_api_errors.add(signature_key)
+                api_errors.append(
+                    {
+                        "timestamp": timestamp,
+                        "session_id": session_id or None,
+                        "call": call_number,
+                        "category": category,
+                    }
+                )
+            continue
         tool_match = _TOOL_METRIC_RE.search(message)
         if tool_match:
             tool_events.append(
@@ -1055,7 +1086,7 @@ def _parse_log_file(path: Path) -> Dict[str, Any]:
                     "output_chars": _integer(tool_match.group("chars")),
                 }
             )
-    parsed = {"api": api_events, "tools": tool_events}
+    parsed = {"api": api_events, "errors": api_errors, "tools": tool_events}
     _log_file_cache[key] = (signature, parsed)
     return parsed
 
@@ -1071,13 +1102,14 @@ def _percentile(values: Iterable[float], percentile: float) -> Optional[float]:
 def _runtime_events() -> Dict[str, Any]:
     log_dir = _hermes_home() / "logs"
     if not log_dir.exists():
-        return {"api": [], "tools": [], "files": []}
+        return {"api": [], "errors": [], "tools": [], "files": []}
     candidates = sorted(
         (path for path in log_dir.glob("agent.log*") if path.is_file()),
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )[:MAX_LOG_FILES]
     api_events: List[Dict[str, Any]] = []
+    api_errors: List[Dict[str, Any]] = []
     tool_events: List[Dict[str, Any]] = []
     files = []
     for path in reversed(candidates):
@@ -1086,9 +1118,10 @@ def _runtime_events() -> Dict[str, Any]:
         except OSError:
             continue
         api_events.extend(parsed["api"])
+        api_errors.extend(parsed.get("errors", []))
         tool_events.extend(parsed["tools"])
         files.append({"name": path.name, "size_bytes": path.stat().st_size, "updated_at": path.stat().st_mtime})
-    return {"api": api_events, "tools": tool_events, "files": files}
+    return {"api": api_events, "errors": api_errors, "tools": tool_events, "files": files}
 
 
 def _metric_groups(rows: List[Dict[str, Any]], key: str) -> List[Dict[str, Any]]:
@@ -1355,6 +1388,700 @@ async def overview(
     end_at: Optional[float] = Query(None, ge=0),
 ) -> Dict[str, Any]:
     return await asyncio.to_thread(_overview_sync, days, start_at, end_at)
+
+
+_MODEL_ROUTE_META: Dict[str, Dict[str, Any]] = {
+    "openai-codex": {"label": "OpenAI OAuth", "provider": "OpenAI", "oauth": True, "quota_provider": "codex"},
+    "xai-oauth": {"label": "SuperGrok OAuth", "provider": "xAI", "oauth": True, "quota_provider": "grok"},
+    "anthropic-oauth": {"label": "Anthropic OAuth", "provider": "Anthropic", "oauth": True, "quota_provider": "anthropic"},
+    "openrouter": {"label": "OpenRouter API", "provider": "OpenRouter"},
+    "nous": {"label": "Nous Portal", "provider": "Nous Research", "quota_provider": "nous"},
+    "deepseek": {"label": "DeepSeek API", "provider": "DeepSeek"},
+    "nvidia": {"label": "NVIDIA NIM API", "provider": "NVIDIA"},
+    "opencode": {"label": "OpenCode Zen API", "provider": "OpenCode"},
+    "kimi-coding": {"label": "Kimi Code Plan API", "provider": "Kimi", "quota_provider": "kimi"},
+    "kimi-coding-cn": {"label": "Kimi Code Plan API", "provider": "Kimi", "quota_provider": "kimi"},
+    "zai": {"label": "Z.AI API", "provider": "Z.AI", "quota_provider": "zai"},
+    "zai-coding": {"label": "Z.AI Coding Plan API", "provider": "Z.AI", "quota_provider": "zai"},
+    "alibaba": {"label": "Qwen Cloud API", "provider": "Qwen"},
+    "alibaba-coding-plan": {"label": "Qwen Coding Plan API", "provider": "Qwen"},
+    "qwen-oauth": {"label": "Qwen OAuth", "provider": "Qwen", "oauth": True},
+}
+
+_MODEL_ORIGIN_NAMES = {
+    "anthropic": "Anthropic",
+    "deepseek": "DeepSeek",
+    "google": "Google",
+    "meta-llama": "Meta",
+    "mistralai": "Mistral AI",
+    "moonshotai": "Moonshot AI",
+    "nvidia": "NVIDIA",
+    "openai": "OpenAI",
+    "qwen": "Qwen",
+    "x-ai": "xAI",
+    "z-ai": "Z.AI",
+}
+
+
+def _table_columns(connection: Any, table: str) -> set[str]:
+    try:
+        return {str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+    except sqlite3.OperationalError:
+        return set()
+
+
+def _humanize_identifier(value: Any) -> str:
+    text = _clean_text(value, 160).strip(" /_-.")
+    if not text:
+        return "Unknown"
+    words = re.split(r"[-_\s]+", text)
+    acronyms = {
+        "ai": "AI",
+        "api": "API",
+        "codex": "Codex",
+        "glm": "GLM",
+        "gpt": "GPT",
+        "nim": "NIM",
+        "oauth": "OAuth",
+        "xai": "xAI",
+    }
+    return " ".join(acronyms.get(word.lower(), word if any(char.isupper() for char in word) else word.title()) for word in words)
+
+
+def _model_display_name(model_id: str) -> str:
+    leaf = str(model_id or "unknown").rsplit("/", 1)[-1]
+    return _humanize_identifier(leaf)
+
+
+def _model_origin_label(model_id: str, billing_provider: str) -> str:
+    model = str(model_id or "").lower()
+    if "/" in model:
+        namespace = model.split("/", 1)[0]
+        return _MODEL_ORIGIN_NAMES.get(namespace, _humanize_identifier(namespace))
+    family_names = (
+        (("claude",), "Anthropic"),
+        (("gpt", "o1", "o3", "o4", "codex"), "OpenAI"),
+        (("grok",), "xAI"),
+        (("kimi", "k2", "k3"), "Kimi"),
+        (("glm",), "Z.AI"),
+        (("deepseek",), "DeepSeek"),
+        (("qwen",), "Qwen"),
+        (("gemini",), "Google"),
+    )
+    for prefixes, label in family_names:
+        if model.startswith(prefixes):
+            return label
+    provider_key = str(billing_provider or "").strip().lower()
+    meta = _MODEL_ROUTE_META.get(provider_key)
+    return str(meta.get("provider")) if meta else _humanize_identifier(provider_key or "unknown")
+
+
+def _route_descriptor(provider: Any, base_url: Any, billing_mode: Any) -> Dict[str, Any]:
+    provider_key = str(provider or "").strip().lower() or "unknown"
+    mode = str(billing_mode or "").strip().lower()
+    meta = dict(_MODEL_ROUTE_META.get(provider_key) or {})
+    oauth = bool(meta.get("oauth")) or "oauth" in provider_key or "oauth" in mode
+    mode_subscription = any(marker in mode for marker in ("subscription", "included"))
+    if provider_key == "anthropic" and mode_subscription:
+        meta = {"label": "Anthropic OAuth", "provider": "Anthropic", "quota_provider": "anthropic"}
+        oauth = True
+    subscription = oauth and provider_key not in {"nous"}
+    provider_label = str(meta.get("provider") or _humanize_identifier(provider_key))
+    route_label = str(meta.get("label") or f"{provider_label} {'OAuth' if oauth else 'API'}")
+    parsed = urlparse(str(base_url or ""))
+    return {
+        "key": "\u001f".join((provider_key, parsed.hostname or "", mode)),
+        "provider": provider_key,
+        "provider_label": provider_label,
+        "label": route_label,
+        "host": (parsed.hostname or "")[:160] or None,
+        "billing_mode": mode or None,
+        "oauth": oauth,
+        "subscription": subscription,
+        "quota_provider": meta.get("quota_provider"),
+    }
+
+
+def _auxiliary_task_label(task: str) -> str:
+    labels = {
+        "background_review": "Analysis",
+        "compression": "Compression",
+        "title_generation": "Writing",
+        "vision": "Analysis",
+        "web_extract": "Analysis",
+    }
+    normalised = str(task or "").strip().lower()
+    return labels.get(normalised, _humanize_identifier(normalised))
+
+
+def _session_task_type(tool_names: Iterable[str], source: Any, delegated: bool) -> str:
+    names = " ".join(str(name or "").lower() for name in tool_names)
+    source_text = str(source or "").lower()
+    if delegated or source_text in {"cron", "schedule", "webhook"} or any(
+        marker in names
+        for marker in ("delegate", "spawn_agent", "send_message", "wait_agent", "create_thread", "handoff", "kanban", "schedule", "goal", "collaboration")
+    ):
+        return "Orchestration"
+    if any(
+        marker in names
+        for marker in ("apply_patch", "exec_command", "terminal", "shell", "write_file", "edit_file", "replace_in_file", "git", "lsp", "run_test", "code_")
+    ):
+        return "Coding"
+    if any(
+        marker in names
+        for marker in ("document", "presentation", "slides", "gmail", "email", "write_doc", "spreadsheet")
+    ):
+        return "Writing"
+    if any(
+        marker in names
+        for marker in ("browser", "search", "web", "read_file", "view_image", "inspect", "query", "finance", "weather", "sports", "pdf")
+    ):
+        return "Analysis"
+    return "General"
+
+
+def _model_match(raw_model: Any, known_models: Iterable[str]) -> Optional[str]:
+    raw = str(raw_model or "").strip()
+    if not raw:
+        return None
+    material = list(known_models)
+    if raw in material:
+        return raw
+    raw_leaf = raw.rsplit("/", 1)[-1].lower()
+    matches = [model for model in material if model.rsplit("/", 1)[-1].lower() == raw_leaf]
+    return matches[0] if len(matches) == 1 else None
+
+
+def _ai_models_sync(
+    days: int,
+    start_at: Optional[float] = None,
+    end_at: Optional[float] = None,
+) -> Dict[str, Any]:
+    period_start, period_end = _period_bounds(days, start_at, end_at)
+    period_sql, period_params = _period_sql("s.started_at", period_start, period_end)
+    now = time.time()
+    trend_end = max(period_start, (period_end if period_end is not None else now) - 0.001)
+    trend_end_day = dt.datetime.fromtimestamp(trend_end).date()
+    trend_days = [(trend_end_day - dt.timedelta(days=offset)).isoformat() for offset in range(6, -1, -1)]
+
+    with _database() as db:
+        connection = db._conn
+        session_columns = _table_columns(connection, "sessions")
+        usage_columns = _table_columns(connection, "session_model_usage")
+        rewind_expr = "coalesce(s.rewind_count,0)" if "rewind_count" in session_columns else "0"
+        session_rows = [
+            _row_dict(row)
+            for row in connection.execute(
+                f"""
+                SELECT s.id, s.source, s.model, s.started_at, s.ended_at, s.end_reason,
+                       s.last_activity_at, s.input_tokens, s.output_tokens,
+                       s.cache_read_tokens, s.cache_write_tokens, s.reasoning_tokens,
+                       s.api_call_count, s.billing_provider, s.billing_base_url,
+                       s.billing_mode, s.estimated_cost_usd, s.actual_cost_usd,
+                       s.cost_status, s.cost_source, {rewind_expr} AS rewind_count
+                FROM sessions s
+                WHERE {period_sql} AND coalesce(s.hidden,0)=0
+                """,
+                tuple(period_params),
+            ).fetchall()
+        ]
+        sessions_by_id = {str(row["id"]): row for row in session_rows}
+
+        usage_rows: List[Dict[str, Any]] = []
+        inventory_rows: List[Dict[str, Any]] = []
+        if usage_columns:
+            base_url_expr = "u.billing_base_url" if "billing_base_url" in usage_columns else "''"
+            task_expr = "u.task" if "task" in usage_columns else "''"
+            usage_rows = [
+                _row_dict(row)
+                for row in connection.execute(
+                    f"""
+                    SELECT u.session_id, u.model, u.billing_provider,
+                           {base_url_expr} AS billing_base_url, u.billing_mode,
+                           {task_expr} AS task, u.api_call_count, u.input_tokens,
+                           u.output_tokens, u.cache_read_tokens, u.cache_write_tokens,
+                           u.reasoning_tokens, u.estimated_cost_usd, u.actual_cost_usd,
+                           u.cost_status, u.cost_source, u.first_seen, u.last_seen
+                    FROM session_model_usage u
+                    JOIN sessions s ON s.id=u.session_id
+                    WHERE {period_sql} AND coalesce(s.hidden,0)=0
+                    """,
+                    tuple(period_params),
+                ).fetchall()
+            ]
+            inventory_rows = [
+                _row_dict(row)
+                for row in connection.execute(
+                    f"""
+                    SELECT u.model, u.billing_provider,
+                           {base_url_expr} AS billing_base_url, u.billing_mode,
+                           MAX(coalesce(u.last_seen, s.last_activity_at, s.started_at)) AS last_seen
+                    FROM session_model_usage u
+                    JOIN sessions s ON s.id=u.session_id
+                    WHERE coalesce(s.hidden,0)=0
+                    GROUP BY u.model, u.billing_provider, {base_url_expr}, u.billing_mode
+                    """
+                ).fetchall()
+            ]
+
+        inventoried_models = {str(row.get("model") or "unknown") for row in inventory_rows}
+        session_inventory_rows = [
+            _row_dict(row)
+            for row in connection.execute(
+                """
+                SELECT model, billing_provider, billing_base_url, billing_mode,
+                       MAX(coalesce(last_activity_at, started_at)) AS last_seen
+                FROM sessions
+                WHERE coalesce(hidden,0)=0 AND model IS NOT NULL AND trim(model) != ''
+                GROUP BY model, billing_provider, billing_base_url, billing_mode
+                """
+            ).fetchall()
+        ]
+        for session in session_inventory_rows:
+            model_id = str(session.get("model") or "").strip()
+            if not model_id or model_id in inventoried_models:
+                continue
+            inventory_rows.append(
+                {
+                    "model": model_id,
+                    "billing_provider": session.get("billing_provider") or "",
+                    "billing_base_url": session.get("billing_base_url") or "",
+                    "billing_mode": session.get("billing_mode") or "",
+                    "last_seen": session.get("last_seen"),
+                }
+            )
+            inventoried_models.add(model_id)
+
+        accounted_sessions = {str(row.get("session_id")) for row in usage_rows}
+        for session in session_rows:
+            session_id = str(session.get("id"))
+            if session_id in accounted_sessions or not session.get("model"):
+                continue
+            usage_rows.append(
+                {
+                    "session_id": session_id,
+                    "model": session.get("model") or "unknown",
+                    "billing_provider": session.get("billing_provider") or "",
+                    "billing_base_url": session.get("billing_base_url") or "",
+                    "billing_mode": session.get("billing_mode") or "",
+                    "task": "",
+                    "api_call_count": session.get("api_call_count") or 0,
+                    "input_tokens": session.get("input_tokens") or 0,
+                    "output_tokens": session.get("output_tokens") or 0,
+                    "cache_read_tokens": session.get("cache_read_tokens") or 0,
+                    "cache_write_tokens": session.get("cache_write_tokens") or 0,
+                    "reasoning_tokens": session.get("reasoning_tokens") or 0,
+                    "estimated_cost_usd": session.get("estimated_cost_usd") or 0,
+                    "actual_cost_usd": session.get("actual_cost_usd") or 0,
+                    "cost_status": session.get("cost_status"),
+                    "cost_source": session.get("cost_source"),
+                    "first_seen": session.get("started_at"),
+                    "last_seen": session.get("last_activity_at") or session.get("started_at"),
+                    "fallback": True,
+                }
+            )
+
+        failure_counts: Dict[str, int] = {}
+        if session_rows:
+            for row in connection.execute(
+                f"""
+                SELECT m.session_id, COUNT(*) AS failures
+                FROM messages m
+                JOIN sessions s ON s.id=m.session_id
+                WHERE {period_sql} AND coalesce(s.hidden,0)=0
+                  AND coalesce(m.active,1)=1 AND {_failure_sql('m')}
+                GROUP BY m.session_id
+                """,
+                tuple(period_params),
+            ).fetchall():
+                failure_counts[str(row["session_id"])] = _integer(row["failures"])
+
+        tools_by_session: Dict[str, set[str]] = defaultdict(set)
+        if session_rows:
+            for row in connection.execute(
+                f"""
+                SELECT m.session_id, m.tool_name, m.tool_calls
+                FROM messages m
+                JOIN sessions s ON s.id=m.session_id
+                WHERE {period_sql} AND coalesce(s.hidden,0)=0
+                  AND coalesce(m.active,1)=1
+                  AND (m.tool_name IS NOT NULL OR m.tool_calls IS NOT NULL)
+                """,
+                tuple(period_params),
+            ).fetchall():
+                session_id = str(row["session_id"])
+                if row["tool_name"]:
+                    tools_by_session[session_id].add(str(row["tool_name"]))
+                for call in _iter_tool_calls(row["tool_calls"]):
+                    tools_by_session[session_id].add(str(call.get("name") or ""))
+
+        delegated_sessions: set[str] = set()
+        if _table_columns(connection, "async_delegations"):
+            for row in connection.execute(
+                "SELECT origin_session, parent_session_id FROM async_delegations"
+            ).fetchall():
+                for key in (row["origin_session"], row["parent_session_id"]):
+                    if key and str(key) in sessions_by_id:
+                        delegated_sessions.add(str(key))
+
+    main_models_by_session: Dict[str, set[str]] = defaultdict(set)
+    usage_by_session: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    cache_reporting_providers: set[str] = set()
+    for usage in usage_rows:
+        session_id = str(usage.get("session_id") or "")
+        usage_by_session[session_id].append(usage)
+        if not str(usage.get("task") or "").strip():
+            main_models_by_session[session_id].add(str(usage.get("model") or "unknown"))
+        if _integer(usage.get("cache_read_tokens")) or _integer(usage.get("cache_write_tokens")):
+            cache_reporting_providers.add(str(usage.get("billing_provider") or "").strip().lower())
+
+    session_facts: Dict[str, Dict[str, Any]] = {}
+    for session_id, session in sessions_by_id.items():
+        outcome = _session_outcome(session)["outcome"]
+        retry_or_switch = _integer(session.get("rewind_count")) > 0 or len(main_models_by_session.get(session_id, set())) > 1
+        eligible = session.get("ended_at") is not None and outcome not in {"failed", "cancelled", "open", "running"}
+        accepted = eligible and not retry_or_switch and failure_counts.get(session_id, 0) == 0
+        session_facts[session_id] = {
+            "retry_or_switch": retry_or_switch,
+            "eligible": eligible,
+            "accepted": accepted,
+            "task_type": _session_task_type(
+                tools_by_session.get(session_id, set()),
+                session.get("source"),
+                session_id in delegated_sessions,
+            ),
+        }
+
+    models: Dict[str, Dict[str, Any]] = {}
+    for usage in usage_rows:
+        model_id = str(usage.get("model") or "unknown")
+        session_id = str(usage.get("session_id") or "")
+        session = sessions_by_id.get(session_id, {})
+        provider_key = str(usage.get("billing_provider") or "").strip().lower()
+        route = _route_descriptor(provider_key, usage.get("billing_base_url"), usage.get("billing_mode"))
+        task_name = str(usage.get("task") or "").strip()
+        task_type = _auxiliary_task_label(task_name) if task_name else session_facts.get(session_id, {}).get("task_type", "General")
+        input_tokens = _integer(usage.get("input_tokens"))
+        output_tokens = _integer(usage.get("output_tokens"))
+        cache_tokens = _integer(usage.get("cache_read_tokens")) + _integer(usage.get("cache_write_tokens"))
+        requests = _integer(usage.get("api_call_count"))
+        cost_view = _cost_view(usage)
+        row_cost = max(0.0, _number(cost_view.get("display_cost_usd")))
+        row_cost_kind = str(cost_view.get("cost_kind") or "unpriced")
+        last_used = _number(usage.get("last_seen") or session.get("last_activity_at") or session.get("started_at"), 0)
+
+        model = models.setdefault(
+            model_id,
+            {
+                "model_id": model_id,
+                "display_name": _model_display_name(model_id),
+                "provider_label": "",
+                "last_used_at": None,
+                "requests": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_tokens_raw": 0,
+                "reasoning_tokens": 0,
+                "total_tokens": 0,
+                "cost_usd": 0.0,
+                "actual_cost": False,
+                "estimated_cost": False,
+                "included_cost": False,
+                "free_api_cost": False,
+                "sessions_set": set(),
+                "accepted_sessions_set": set(),
+                "retry_sessions_set": set(),
+                "routes_map": {},
+                "task_types_map": {},
+                "trend_map": {day: 0 for day in trend_days},
+            },
+        )
+        model["last_used_at"] = max(_number(model.get("last_used_at"), 0), last_used) or None
+        model["requests"] += requests
+        model["input_tokens"] += input_tokens
+        model["output_tokens"] += output_tokens
+        model["cache_tokens_raw"] += cache_tokens
+        model["reasoning_tokens"] += _integer(usage.get("reasoning_tokens"))
+        model["total_tokens"] += input_tokens + output_tokens + cache_tokens
+        model["cost_usd"] += row_cost
+        model["actual_cost"] = bool(model["actual_cost"] or row_cost_kind == "actual")
+        model["estimated_cost"] = bool(model["estimated_cost"] or row_cost_kind == "estimated")
+        model["included_cost"] = bool(model["included_cost"] or route["subscription"])
+        model["free_api_cost"] = bool(
+            model["free_api_cost"]
+            or (not route["subscription"] and row_cost_kind == "included")
+        )
+        model["sessions_set"].add(session_id)
+        facts = session_facts.get(session_id, {})
+        if facts.get("accepted"):
+            model["accepted_sessions_set"].add(session_id)
+        if facts.get("retry_or_switch"):
+            model["retry_sessions_set"].add(session_id)
+
+        route_row = model["routes_map"].setdefault(
+            route["key"],
+            {**route, "requests": 0, "input_tokens": 0, "output_tokens": 0, "cache_tokens": 0, "cost_usd": 0.0, "last_used_at": None},
+        )
+        route_row["requests"] += requests
+        route_row["input_tokens"] += input_tokens
+        route_row["output_tokens"] += output_tokens
+        route_row["cache_tokens"] += cache_tokens
+        route_row["cost_usd"] += row_cost
+        route_row["last_used_at"] = max(_number(route_row.get("last_used_at"), 0), last_used) or None
+
+        task = model["task_types_map"].setdefault(
+            task_type,
+            {"task_type": task_type, "requests": 0, "sessions_set": set(), "eligible_sessions_set": set(), "accepted_sessions_set": set()},
+        )
+        task["requests"] += requests
+        task["sessions_set"].add(session_id)
+        if facts.get("eligible"):
+            task["eligible_sessions_set"].add(session_id)
+        if facts.get("accepted"):
+            task["accepted_sessions_set"].add(session_id)
+
+        if last_used:
+            day = dt.datetime.fromtimestamp(last_used).date().isoformat()
+            if day in model["trend_map"]:
+                model["trend_map"][day] += requests
+
+    for inventory in inventory_rows:
+        model_id = str(inventory.get("model") or "unknown")
+        route = _route_descriptor(
+            inventory.get("billing_provider"),
+            inventory.get("billing_base_url"),
+            inventory.get("billing_mode"),
+        )
+        last_used = _number(inventory.get("last_seen"), 0)
+        model = models.setdefault(
+            model_id,
+            {
+                "model_id": model_id,
+                "display_name": _model_display_name(model_id),
+                "provider_label": "",
+                "last_used_at": None,
+                "requests": 0,
+                "input_tokens": 0,
+                "output_tokens": 0,
+                "cache_tokens_raw": 0,
+                "reasoning_tokens": 0,
+                "total_tokens": 0,
+                "cost_usd": 0.0,
+                "actual_cost": False,
+                "estimated_cost": False,
+                "included_cost": False,
+                "free_api_cost": False,
+                "sessions_set": set(),
+                "accepted_sessions_set": set(),
+                "retry_sessions_set": set(),
+                "routes_map": {},
+                "task_types_map": {},
+                "trend_map": {day: 0 for day in trend_days},
+            },
+        )
+        model["last_used_at"] = max(_number(model.get("last_used_at"), 0), last_used) or None
+        route_row = model["routes_map"].setdefault(
+            route["key"],
+            {**route, "requests": 0, "input_tokens": 0, "output_tokens": 0, "cache_tokens": 0, "cost_usd": 0.0, "last_used_at": None},
+        )
+        route_row["last_used_at"] = max(_number(route_row.get("last_used_at"), 0), last_used) or None
+
+    runtime = _runtime_events()
+    known_models = set(models)
+    latency_by_model: Dict[str, List[float]] = defaultdict(list)
+    successes_by_model: Counter[str] = Counter()
+    failures_by_model: Dict[str, Counter[str]] = defaultdict(Counter)
+    observed_timestamps: List[float] = []
+    for event in runtime.get("api", []):
+        timestamp = _number(event.get("timestamp"), 0)
+        if timestamp < period_start or (period_end is not None and timestamp >= period_end):
+            continue
+        model_id = _model_match(event.get("model"), known_models)
+        if not model_id:
+            continue
+        successes_by_model[model_id] += 1
+        latency_by_model[model_id].append(_number(event.get("latency_seconds")))
+        observed_timestamps.append(timestamp)
+
+    unattributed_failures = 0
+    for event in runtime.get("errors", []):
+        timestamp = _number(event.get("timestamp"), 0)
+        if timestamp < period_start or (period_end is not None and timestamp >= period_end):
+            continue
+        session_id = str(event.get("session_id") or "")
+        candidates = [row for row in usage_by_session.get(session_id, []) if not str(row.get("task") or "").strip()]
+        model_id: Optional[str] = None
+        if len({str(row.get("model") or "unknown") for row in candidates}) == 1 and candidates:
+            model_id = str(candidates[0].get("model") or "unknown")
+        elif candidates:
+            def distance(row: Mapping[str, Any]) -> float:
+                first = _number(row.get("first_seen"), 0)
+                last = _number(row.get("last_seen"), first)
+                if first and first <= timestamp <= max(first, last) + 300:
+                    return 0.0
+                points = [point for point in (first, last) if point]
+                return min((abs(timestamp - point) for point in points), default=float("inf"))
+
+            closest = min(candidates, key=distance)
+            if math.isfinite(distance(closest)):
+                model_id = str(closest.get("model") or "unknown")
+        if model_id not in known_models:
+            unattributed_failures += 1
+            continue
+        failures_by_model[model_id][str(event.get("category") or "error")] += 1
+        observed_timestamps.append(timestamp)
+
+    final_models: List[Dict[str, Any]] = []
+    for model_id, model in models.items():
+        routes = sorted(model.pop("routes_map").values(), key=lambda item: _number(item.get("last_used_at")), reverse=True)
+        primary_route = routes[0] if routes else _route_descriptor("unknown", "", "")
+        route_providers = {str(route.get("provider") or "") for route in routes}
+        reporting_routes = route_providers & cache_reporting_providers
+        if model["cache_tokens_raw"] > 0 or reporting_routes:
+            cache_tokens: Optional[int] = _integer(model["cache_tokens_raw"])
+            cache_coverage = "recorded" if reporting_routes == route_providers else "partial"
+        else:
+            cache_tokens = None
+            cache_coverage = "unavailable"
+
+        included = bool(model.pop("included_cost"))
+        free_api = bool(model.pop("free_api_cost"))
+        actual = bool(model.pop("actual_cost"))
+        estimated = bool(model.pop("estimated_cost"))
+        has_metered_cost = model["cost_usd"] > 0
+        if included and has_metered_cost:
+            cost_kind = "mixed"
+        elif included:
+            cost_kind = "subscription"
+        elif free_api and not has_metered_cost:
+            cost_kind = "free"
+        elif actual:
+            cost_kind = "actual"
+        elif estimated:
+            cost_kind = "estimated"
+        else:
+            cost_kind = "unpriced"
+
+        sessions_set = model.pop("sessions_set")
+        accepted_sessions = model.pop("accepted_sessions_set")
+        retry_sessions = model.pop("retry_sessions_set")
+        retry_switch_rate = len(retry_sessions) / len(sessions_set) if sessions_set else None
+        task_types = []
+        for task in model.pop("task_types_map").values():
+            eligible_sessions = task.pop("eligible_sessions_set")
+            accepted_task_sessions = task.pop("accepted_sessions_set")
+            task["sessions"] = len(task.pop("sessions_set"))
+            task["eligible_sessions"] = len(eligible_sessions)
+            task["accepted_sessions"] = len(accepted_task_sessions)
+            task["first_attempt_acceptance_rate"] = (
+                len(accepted_task_sessions) / len(eligible_sessions) if eligible_sessions else None
+            )
+            task_types.append(task)
+        task_types.sort(key=lambda item: (item["requests"], item["sessions"]), reverse=True)
+
+        failure_counts_by_type = failures_by_model.get(model_id, Counter())
+        observed_failures = sum(failure_counts_by_type.values())
+        observed_successes = successes_by_model.get(model_id, 0)
+        failure_rate = observed_failures / (observed_successes + observed_failures) if observed_successes + observed_failures else None
+        latencies = latency_by_model.get(model_id, [])
+        latency_p50 = _percentile(latencies, 0.50)
+        if failure_rate is not None and failure_rate > 0.05:
+            insight = f"Observed request failures reached {failure_rate * 100:.1f}% in the bounded log window."
+        elif retry_switch_rate is not None and retry_switch_rate > 0.05:
+            insight = f"{retry_switch_rate * 100:.1f}% of recorded sessions used a rewind or another model."
+        elif latency_p50 is not None and latency_p50 > 10:
+            insight = f"Median recorded response latency is {latency_p50:.1f}s."
+        else:
+            insight = None
+
+        model.update(
+            {
+                "provider_label": _model_origin_label(model_id, primary_route.get("provider")),
+                "route_label": primary_route.get("label"),
+                "routes": routes,
+                "route_count": len(routes),
+                "cache_tokens": cache_tokens,
+                "cache_coverage": cache_coverage,
+                "cost_kind": cost_kind,
+                "sessions": len(sessions_set),
+                "accepted_tasks": len(accepted_sessions),
+                "retry_switch_sessions": len(retry_sessions),
+                "retry_switch_rate": retry_switch_rate,
+                "task_types": task_types,
+                "failures": {
+                    "rate": failure_rate,
+                    "rate_limits": failure_counts_by_type.get("rate_limit", 0),
+                    "timeouts": failure_counts_by_type.get("timeout", 0),
+                    "errors": failure_counts_by_type.get("error", 0),
+                    "observed_successes": observed_successes,
+                    "observed_failures": observed_failures,
+                    "coverage": "bounded_logs" if observed_successes + observed_failures else "unavailable",
+                },
+                "latency": {
+                    "ttft_p50_seconds": None,
+                    "total_p50_seconds": latency_p50,
+                    "total_p95_seconds": _percentile(latencies, 0.95),
+                    "samples": len(latencies),
+                    "coverage": "bounded_logs" if latencies else "unavailable",
+                },
+                "trend": [{"day": day, "requests": model["trend_map"][day]} for day in trend_days],
+                "insight": insight,
+            }
+        )
+        model.pop("cache_tokens_raw", None)
+        model.pop("trend_map", None)
+        final_models.append(model)
+
+    final_models.sort(key=lambda item: item["total_tokens"], reverse=True)
+    active_models = sum(1 for item in final_models if _integer(item.get("sessions")) > 0)
+    known_cost_models = sum(
+        1
+        for item in final_models
+        if _integer(item.get("sessions")) > 0
+        and item["cost_kind"] in {"actual", "estimated", "free", "mixed"}
+    )
+    return {
+        "period_days": days,
+        "period": _period_payload(days, period_start, period_end),
+        "models": final_models,
+        "summary": {
+            "models": len(final_models),
+            "inventory_models": len(final_models),
+            "active_models": active_models,
+            "requests": sum(_integer(item.get("requests")) for item in final_models),
+            "total_tokens": sum(_integer(item.get("total_tokens")) for item in final_models),
+            "cost_usd": sum(_number(item.get("cost_usd")) for item in final_models),
+            "known_cost_models": known_cost_models,
+            "subscription_models": sum(
+                1
+                for item in final_models
+                if _integer(item.get("sessions")) > 0
+                and item["cost_kind"] in {"subscription", "mixed"}
+            ),
+        },
+        "coverage": {
+            "model_source": "all-time distinct model IDs from Hermes session_model_usage with session-row fallback; metrics honor the selected period",
+            "task_types": "derived from recorded Hermes tool names, session source, delegation links, and auxiliary task labels",
+            "first_attempt_acceptance": "derived proxy: eligible closed sessions without a rewind, model switch, or detected recorded failure",
+            "retry_switch": "sessions with rewind_count > 0 or more than one recorded main-loop model",
+            "failure_latency": "bounded local Hermes agent logs; percentages describe observed log events, not complete historical coverage",
+            "ttft_available": False,
+            "cache": "a zero is shown only when the route has demonstrated cache reporting in the selected period; otherwise unavailable is returned",
+            "log_start_at": min(observed_timestamps) if observed_timestamps else None,
+            "log_end_at": max(observed_timestamps) if observed_timestamps else None,
+            "unattributed_log_failures": unattributed_failures,
+        },
+        "generated_at": time.time(),
+    }
+
+
+@router.get("/ai-models")
+async def ai_models(
+    days: int = Query(30, ge=0, le=3650),
+    start_at: Optional[float] = Query(None, ge=0),
+    end_at: Optional[float] = Query(None, ge=0),
+) -> Dict[str, Any]:
+    return await asyncio.to_thread(_ai_models_sync, days, start_at, end_at)
 
 
 def _tools_sync(

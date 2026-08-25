@@ -33,6 +33,10 @@ const ROUTE = '/session-lens'
 const color = {
   accent: 'var(--ui-accent)',
   accentSoft: 'color-mix(in srgb, var(--ui-accent) 14%, transparent)',
+  success: 'var(--ui-success)',
+  successSoft: 'color-mix(in srgb, var(--ui-success) 12%, transparent)',
+  warning: 'var(--ui-warning)',
+  warningSoft: 'color-mix(in srgb, var(--ui-warning) 12%, transparent)',
   danger: 'var(--destructive)',
   dangerSoft: 'color-mix(in srgb, var(--destructive) 12%, transparent)',
   primary: 'var(--ui-text-primary)',
@@ -60,7 +64,8 @@ const pageTabs = [
   { id: 'tools', label: 'Tools', codicon: 'tools' },
   { id: 'skills', label: 'Skills', codicon: 'sparkle' },
   { id: 'system', label: 'System', codicon: 'server-environment' },
-  { id: 'ai-usage', label: 'AI Usage', codicon: 'dashboard' }
+  { id: 'ai-usage', label: 'AI Usage', codicon: 'dashboard' },
+  { id: 'ai-models', label: 'AI Models', codicon: 'symbol-enum' }
 ]
 
 function apiPath(path, params = {}) {
@@ -172,6 +177,37 @@ function formatSeconds(value) {
   if (value === null || value === undefined) return '—'
   const seconds = Number(value) || 0
   return seconds < 10 ? `${seconds.toFixed(2)}s` : `${seconds.toFixed(1)}s`
+}
+
+function formatRelativeTime(timestamp) {
+  const date = timestampDate(timestamp)
+  if (!date) return 'last used unknown'
+  const seconds = Math.max(0, Math.round((Date.now() - date.getTime()) / 1000))
+  if (seconds < 60) return 'last used just now'
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `last used ${minutes}m ago`
+  const hours = Math.floor(minutes / 60)
+  if (hours < 24) return `last used ${hours}h ago`
+  const days = Math.floor(hours / 24)
+  if (days < 30) return `last used ${days}d ago`
+  const months = Math.floor(days / 30)
+  if (months < 12) return `last used ${months}mo ago`
+  return `last used ${Math.floor(months / 12)}y ago`
+}
+
+function metricTone(value) {
+  if (value === null || value === undefined) return 'neutral'
+  const numeric = Number(value)
+  if (numeric < 0.02) return 'success'
+  if (numeric <= 0.05) return 'warning'
+  return 'danger'
+}
+
+function toneColor(tone) {
+  if (tone === 'success') return color.success
+  if (tone === 'warning') return color.warning
+  if (tone === 'danger') return color.danger
+  return color.tertiary
 }
 
 function LoadingBlock({ rows = 4 }) {
@@ -1954,6 +1990,495 @@ function AIUsageView({ query, narrow, refreshError }) {
   })
 }
 
+function formatModelCost(model) {
+  if (model.cost_kind === 'subscription') return 'sub.'
+  if (model.cost_kind === 'mixed') return model.cost_usd > 0 ? `${formatCost(model.cost_usd, 'actual')} + sub.` : 'sub.'
+  if (model.cost_kind === 'free') return '$0.00'
+  if (model.cost_kind === 'actual' || model.cost_kind === 'estimated') return formatCost(model.cost_usd, model.cost_kind)
+  if (Number(model.sessions) === 0 && (model.routes || []).some(route => route.subscription)) return 'sub.'
+  return '—'
+}
+
+function quotaWindowDurationSeconds(label) {
+  const text = String(label || '').toLowerCase()
+  if (text.includes('week')) return 7 * 86400
+  if (text.includes('month')) return 30 * 86400
+  if (text.includes('day')) return 86400
+  const hourMatch = text.match(/(\d+(?:\.\d+)?)\s*[- ]?hour|\((\d+(?:\.\d+)?)h\)/)
+  if (hourMatch) return Number(hourMatch[1] || hourMatch[2]) * 3600
+  return null
+}
+
+function modelQuota(model, quotaData, allModels) {
+  const routes = model.routes || []
+  const oauthInventoryRoutes = routes.filter(route => route.oauth && route.subscription)
+  if (!oauthInventoryRoutes.length) return { kind: 'pay_go' }
+  const periodRoutes = routes.filter(route => Number(route.requests) > 0)
+  if (!periodRoutes.length) {
+    return { kind: 'subscription', available: false, inactive: true, route: oauthInventoryRoutes[0] }
+  }
+  const oauthRoutes = periodRoutes.filter(route => route.oauth && route.subscription)
+  if (!oauthRoutes.length) return { kind: 'pay_go' }
+  const route = oauthRoutes[0]
+  const provider = (quotaData?.providers || []).find(item => item.provider === route.quota_provider)
+  const windows = (provider?.windows || []).filter(window =>
+    window.kind === 'quota' && window.percentage_used !== null && window.percentage_used !== undefined
+  )
+  const window = windows.find(item => /week/i.test(item.label)) || windows[0]
+  if (!window || !['ok', 'stale'].includes(provider?.status)) {
+    return { kind: 'subscription', available: false, provider, route }
+  }
+  const burn = Math.max(0, Math.min(100, Number(window.percentage_used) || 0))
+  const duration = quotaWindowDurationSeconds(window.label)
+  const reset = timestampDate(window.reset_at)
+  let elapsed = null
+  if (duration && reset) {
+    const startedAt = reset.getTime() - duration * 1000
+    elapsed = Math.max(0, Math.min(100, ((Date.now() - startedAt) / (duration * 1000)) * 100))
+  }
+  let tone = 'neutral'
+  if (elapsed !== null) tone = burn <= elapsed ? 'success' : burn - elapsed <= 10 ? 'warning' : 'danger'
+  const providerRequests = (allModels || []).reduce((sum, candidate) =>
+    sum + (candidate.routes || [])
+      .filter(item => item.quota_provider === route.quota_provider && item.oauth && item.subscription)
+      .reduce((routeSum, item) => routeSum + (Number(item.requests) || 0), 0), 0)
+  const modelRequests = oauthRoutes
+    .filter(item => item.quota_provider === route.quota_provider)
+    .reduce((sum, item) => sum + (Number(item.requests) || 0), 0)
+  const accepted = Number(model.accepted_tasks) || 0
+  const capPerAcceptedTask = providerRequests > 0 && accepted > 0
+    ? burn * (modelRequests / providerRequests) / accepted
+    : null
+  return {
+    kind: 'subscription',
+    available: true,
+    burn,
+    elapsed,
+    tone,
+    window,
+    provider,
+    route,
+    capPerAcceptedTask
+  }
+}
+
+function RateValue({ value, label }) {
+  const tone = metricTone(value)
+  return jsx('span', {
+    title: value === null || value === undefined ? `${label} is unavailable` : `${label}: ${(Number(value) * 100).toFixed(1)}%`,
+    style: { ...tabular, color: toneColor(tone), fontWeight: value !== null && value !== undefined ? 650 : 400 },
+    children: value === null || value === undefined ? '—' : `${(Number(value) * 100).toFixed(1)}%`
+  })
+}
+
+function QuotaBurn({ quota }) {
+  if (quota.kind === 'pay_go') {
+    return jsx('span', { style: { color: color.tertiary, fontSize: '0.6875rem' }, children: 'pay-go' })
+  }
+  if (!quota.available) {
+    return jsx('span', {
+      title: quota.inactive
+        ? 'This OAuth subscription model has no recorded use in the selected period.'
+        : 'This is an OAuth subscription route, but no account quota window is available.',
+      style: { color: color.tertiary, fontSize: '0.6875rem' },
+      children: quota.inactive ? 'sub. · no use' : 'sub. · —'
+    })
+  }
+  const paceLabel = quota.tone === 'success' ? 'on pace' : quota.tone === 'warning' ? 'watch' : quota.tone === 'danger' ? 'over pace' : ''
+  const label = quota.elapsed === null
+    ? `${Math.round(quota.burn)}% used`
+    : `${Math.round(quota.burn)}% / ${Math.round(quota.elapsed)}% elapsed${paceLabel ? ` · ${paceLabel}` : ''}`
+  return jsxs('div', {
+    title: `${quota.window.label}: ${label}. The tick marks billing-period elapsed time; this quota is shared at provider-account level.`,
+    style: { display: 'grid', gap: '0.28rem', minWidth: '8.5rem' },
+    children: [
+      jsx('span', { style: { ...tabular, color: toneColor(quota.tone), fontSize: '0.6875rem', fontWeight: 650 }, children: label }),
+      jsxs('div', {
+        role: 'progressbar',
+        'aria-label': `${quota.window.label} quota burn`,
+        'aria-valuemin': 0,
+        'aria-valuemax': 100,
+        'aria-valuenow': Math.round(quota.burn),
+        style: { background: color.surfaceRaised, borderRadius: '999px', height: '0.36rem', overflow: 'hidden', position: 'relative' },
+        children: [
+          jsx('div', {
+            style: {
+              background: toneColor(quota.tone),
+              borderRadius: '999px',
+              height: '100%',
+              width: `${quota.burn}%`
+            }
+          }),
+          quota.elapsed !== null
+            ? jsx('span', {
+                'aria-hidden': true,
+                style: {
+                  background: color.primary,
+                  height: '100%',
+                  left: `calc(${quota.elapsed}% - 0.5px)`,
+                  opacity: 0.8,
+                  position: 'absolute',
+                  top: 0,
+                  width: '1px'
+                }
+              })
+            : null
+        ]
+      })
+    ]
+  })
+}
+
+function TrendBars({ rows }) {
+  const values = (rows || []).map(row => Number(row.requests) || 0)
+  const max = Math.max(...values, 1)
+  const description = (rows || []).map(row => `${row.day}: ${formatCount(row.requests)}`).join(', ')
+  return jsx('div', {
+    role: 'img',
+    'aria-label': `Seven-day request trend. ${description || 'No requests recorded.'}`,
+    title: description || 'No requests recorded in the seven-day trend window.',
+    style: { alignItems: 'end', display: 'flex', gap: '0.16rem', height: '1.45rem', justifyContent: 'flex-end', minWidth: '3.5rem' },
+    children: (rows || []).map(row => {
+      const value = Number(row.requests) || 0
+      const height = value ? Math.max(3, (value / max) * 22) : 2
+      return jsx('span', {
+        style: {
+          background: value ? color.accent : color.stroke,
+          borderRadius: '1px 1px 0 0',
+          display: 'block',
+          height: `${height}px`,
+          opacity: value ? 0.82 : 0.7,
+          width: '0.28rem'
+        }
+      }, row.day)
+    })
+  })
+}
+
+function TaskTypeBreakdown({ rows }) {
+  if (!rows?.length) return jsx('div', { style: { color: color.quaternary, fontSize: '0.75rem' }, children: 'No task-type evidence is available.' })
+  return jsx('div', {
+    style: { display: 'grid', gap: '0.7rem' },
+    children: rows.map(row => {
+      const acceptance = row.first_attempt_acceptance_rate
+      const width = acceptance === null || acceptance === undefined ? 0 : Math.max(0, Math.min(100, Number(acceptance) * 100))
+      return jsxs('div', {
+        style: { display: 'grid', gap: '0.28rem' },
+        children: [
+          jsxs('div', {
+            style: { alignItems: 'baseline', display: 'flex', gap: '0.75rem', justifyContent: 'space-between' },
+            children: [
+              jsx('span', { style: { color: color.secondary, fontSize: '0.75rem', fontWeight: 600 }, children: row.task_type }),
+              jsx('span', {
+                style: { ...tabular, color: color.tertiary, fontSize: '0.6875rem' },
+                children: `${formatCount(row.requests)} requests · ${acceptance === null || acceptance === undefined ? '—' : `${width.toFixed(0)}%`} accepted first attempt`
+              })
+            ]
+          }),
+          jsx('div', {
+            role: acceptance === null || acceptance === undefined ? undefined : 'progressbar',
+            'aria-label': `${row.task_type} first-attempt acceptance`,
+            'aria-valuemin': acceptance === null || acceptance === undefined ? undefined : 0,
+            'aria-valuemax': acceptance === null || acceptance === undefined ? undefined : 100,
+            'aria-valuenow': acceptance === null || acceptance === undefined ? undefined : Math.round(width),
+            style: { background: color.surfaceRaised, borderRadius: '999px', height: '0.34rem', overflow: 'hidden' },
+            children: jsx('div', {
+              style: { background: color.success, borderRadius: '999px', height: '100%', width: `${width}%` }
+            })
+          })
+        ]
+      }, row.task_type)
+    })
+  })
+}
+
+function ModelExpanded({ model, quota, coverage, narrow }) {
+  const failures = model.failures || {}
+  const costPerAccepted = quota.kind === 'subscription'
+    ? (quota.capPerAcceptedTask === null || quota.capPerAcceptedTask === undefined ? '—' : `~${quota.capPerAcceptedTask.toFixed(2)}% of cap`)
+    : model.accepted_tasks > 0 && ['actual', 'estimated', 'free', 'mixed'].includes(model.cost_kind)
+      ? formatCost((Number(model.cost_usd) || 0) / model.accepted_tasks, model.cost_kind === 'free' ? 'actual' : 'actual')
+      : '—'
+  const quotaInsight = quota.available && quota.elapsed !== null && quota.burn > quota.elapsed
+    ? `${quota.window.label} is burning ${Math.round(quota.burn - quota.elapsed)} percentage points faster than the billing period is elapsing.`
+    : null
+  const insight = quotaInsight || model.insight
+  return jsxs('div', {
+    style: {
+      background: color.surface,
+      borderTop: border,
+      boxSizing: 'border-box',
+      display: 'grid',
+      gap: '1rem',
+      left: narrow ? 0 : undefined,
+      maxWidth: narrow ? 'calc(100vw - 2rem)' : undefined,
+      padding: '0.9rem 1rem',
+      position: narrow ? 'sticky' : 'static',
+      width: narrow ? 'calc(100vw - 2rem)' : 'auto'
+    },
+    children: [
+      jsx('div', {
+        style: { display: 'grid', gap: '1.25rem', gridTemplateColumns: narrow ? '1fr' : 'minmax(20rem, 1.35fr) minmax(17rem, 1fr)' },
+        children: [
+          jsxs('section', {
+            children: [
+              jsx('h3', { style: { color: color.primary, fontSize: '0.8125rem', fontWeight: 650, margin: '0 0 0.65rem' }, children: 'Task-type breakdown' }),
+              jsx(TaskTypeBreakdown, { rows: model.task_types })
+            ]
+          }),
+          jsxs('section', {
+            children: [
+              jsx('h3', { style: { color: color.primary, fontSize: '0.8125rem', fontWeight: 650, margin: '0 0 0.65rem' }, children: 'Reliability and efficiency' }),
+              jsx('div', {
+                style: { borderTop: border, display: 'grid', gridTemplateColumns: 'repeat(3, minmax(5rem, 1fr))' },
+                children: [
+                  ['Rate limits', failures.rate_limits],
+                  ['Timeouts', failures.timeouts],
+                  ['Errors', failures.errors]
+                ].map(([label, value]) => jsxs('div', {
+                  style: { borderBottom: border, padding: '0.55rem 0.45rem' },
+                  children: [
+                    jsx('div', { style: { color: color.quaternary, fontSize: '0.625rem' }, children: label }),
+                    jsx('div', { style: { ...tabular, color: Number(value) > 0 ? color.danger : color.primary, fontSize: '0.8125rem', fontWeight: 650, marginTop: '0.15rem' }, children: formatCount(value) })
+                  ]
+                }, label))
+              }),
+              jsxs('div', {
+                style: { alignItems: 'baseline', display: 'flex', gap: '0.75rem', justifyContent: 'space-between', paddingTop: '0.65rem' },
+                children: [
+                  jsx('span', { style: { color: color.tertiary, fontSize: '0.6875rem' }, children: quota.kind === 'subscription' ? 'Cap per accepted task' : 'Cost per accepted task' }),
+                  jsx('span', { style: { ...tabular, color: color.primary, fontSize: '0.75rem', fontWeight: 650 }, children: costPerAccepted })
+                ]
+              }),
+              quota.kind === 'subscription' && quota.capPerAcceptedTask !== null && quota.capPerAcceptedTask !== undefined
+                ? jsx('div', { style: { color: color.quaternary, fontSize: '0.625rem', lineHeight: 1.45, marginTop: '0.25rem' }, children: 'Estimate allocated by this model’s share of recorded OAuth requests in the selected period; provider quota is account-level.' })
+                : null
+            ]
+          })
+        ]
+      }),
+      insight
+        ? jsxs('div', {
+            style: {
+              alignItems: 'flex-start',
+              background: quotaInsight ? (quota.tone === 'danger' ? color.dangerSoft : color.warningSoft) : color.surfaceRaised,
+              borderRadius: '5px',
+              color: quotaInsight ? toneColor(quota.tone) : color.secondary,
+              display: 'flex',
+              fontSize: '0.6875rem',
+              gap: '0.45rem',
+              lineHeight: 1.5,
+              padding: '0.5rem 0.6rem'
+            },
+            children: [jsx(Codicon, { name: 'lightbulb', size: '0.72rem', style: { marginTop: '0.15rem' } }), jsx('span', { children: insight })]
+          })
+        : null,
+      jsxs('div', {
+        style: { borderTop: border, color: color.quaternary, display: 'grid', fontSize: '0.625rem', gap: '0.25rem', lineHeight: 1.45, paddingTop: '0.65rem' },
+        children: [
+          jsx('span', { children: `Routes: ${(model.routes || []).map(route => route.label).join(' · ') || 'Unknown'}` }),
+          jsx('span', { children: `Failure and total-latency samples come from bounded logs${coverage?.log_start_at ? ` (${formatShortDate(coverage.log_start_at)}–${formatShortDate(coverage.log_end_at)})` : ''}; time-to-first-token is not recorded by Hermes.` }),
+          jsx('span', { children: 'First-attempt acceptance is a derived proxy for eligible closed sessions without a rewind, model switch, or detected recorded failure.' })
+        ]
+      })
+    ]
+  })
+}
+
+function AIModelsTable({ models, quotaData, coverage, narrow }) {
+  const [sortState, setSortState] = useState({ key: 'total_tokens', direction: 'desc' })
+  const [expanded, setExpanded] = useState(() => new Set())
+  const rows = useMemo(() => (models || []).map((model, index) => ({
+    model,
+    index,
+    quota: modelQuota(model, quotaData, models)
+  })), [models, quotaData])
+  const columns = [
+    { key: 'model', label: 'Model', value: item => item.model.display_name },
+    { key: 'route', label: 'Route', value: item => item.model.route_label || '' },
+    { key: 'requests', label: 'Requests', align: 'right', value: item => item.model.requests },
+    { key: 'total_tokens', label: 'Tokens in / out / cached', align: 'right', value: item => item.model.total_tokens },
+    { key: 'cost', label: 'Cost', align: 'right', value: item => ['actual', 'estimated', 'free', 'mixed'].includes(item.model.cost_kind) ? item.model.cost_usd : null },
+    { key: 'quota', label: 'Quota burn', value: item => item.quota.available ? item.quota.burn : null },
+    { key: 'failure', label: 'Fail rate', align: 'right', value: item => item.model.failures?.rate },
+    { key: 'retry', label: 'Retry / switch', align: 'right', value: item => item.model.retry_switch_rate },
+    { key: 'latency', label: 'Latency (TTFT / total)', align: 'right', value: item => item.model.latency?.total_p50_seconds },
+    { key: 'trend', label: 'Trend', align: 'right', value: item => (item.model.trend || []).reduce((sum, row) => sum + (Number(row.requests) || 0), 0) }
+  ]
+  const sortedRows = useMemo(() => {
+    const column = columns.find(item => item.key === sortState.key) || columns[3]
+    const direction = sortState.direction === 'desc' ? -1 : 1
+    return [...rows].sort((left, right) => {
+      const leftValue = column.value(left)
+      const rightValue = column.value(right)
+      if (leftValue === null || leftValue === undefined) return rightValue === null || rightValue === undefined ? left.index - right.index : 1
+      if (rightValue === null || rightValue === undefined) return -1
+      const comparison = typeof leftValue === 'number' && typeof rightValue === 'number'
+        ? leftValue - rightValue
+        : String(leftValue).localeCompare(String(rightValue), undefined, { numeric: true, sensitivity: 'base' })
+      return comparison === 0 ? left.index - right.index : comparison * direction
+    })
+  }, [rows, sortState])
+  const toggle = modelId => setExpanded(current => {
+    const next = new Set(current)
+    if (next.has(modelId)) next.delete(modelId)
+    else next.add(modelId)
+    return next
+  })
+
+  if (!models?.length) {
+    return jsx(EmptyState, { title: 'No recorded models yet', description: 'Models appear automatically as soon as Hermes records a session with a model ID.' })
+  }
+  return jsx('div', {
+    style: { border, borderRadius: '6px', overflowX: 'auto' },
+    children: jsx('table', {
+      style: { borderCollapse: 'collapse', fontSize: '0.75rem', minWidth: '92rem', width: '100%' },
+      children: [
+        jsx('thead', {
+          children: jsx('tr', {
+            children: columns.map(column => jsx('th', {
+              scope: 'col',
+              'aria-sort': sortState.key === column.key ? (sortState.direction === 'asc' ? 'ascending' : 'descending') : 'none',
+              style: { background: color.surface, borderBottom: border, padding: 0, whiteSpace: 'nowrap' },
+              children: jsx('button', {
+                type: 'button',
+                onClick: () => setSortState(current => ({
+                  key: column.key,
+                  direction: current.key === column.key && current.direction === 'desc' ? 'asc' : 'desc'
+                })),
+                'aria-label': `Sort by ${column.label}`,
+                title: `Sort by ${column.label}`,
+                style: {
+                  alignItems: 'center',
+                  background: 'transparent',
+                  border: 'none',
+                  color: sortState.key === column.key ? color.primary : color.tertiary,
+                  cursor: 'pointer',
+                  display: 'flex',
+                  font: 'inherit',
+                  fontSize: '0.6875rem',
+                  fontWeight: sortState.key === column.key ? 650 : 600,
+                  gap: '0.3rem',
+                  justifyContent: column.align === 'right' ? 'flex-end' : 'flex-start',
+                  outlineColor: color.accent,
+                  padding: '0.5rem 0.65rem',
+                  width: '100%'
+                },
+                children: [
+                  jsx('span', { children: column.label }),
+                  jsx(Codicon, { name: sortState.key === column.key ? (sortState.direction === 'asc' ? 'arrow-small-up' : 'arrow-small-down') : 'arrow-swap', size: '0.7rem', style: { color: sortState.key === column.key ? color.accent : color.quaternary } })
+                ]
+              })
+            }, column.key))
+          })
+        }),
+        jsx('tbody', {
+          children: sortedRows.flatMap(item => {
+            const model = item.model
+            const isExpanded = expanded.has(model.model_id)
+            const detailId = `model-detail-${item.index}`
+            const cells = [
+              jsx('td', {
+                style: { borderBottom: isExpanded ? 'none' : border, minWidth: '14rem', padding: 0, verticalAlign: 'top' },
+                children: jsx('button', {
+                  type: 'button',
+                  onClick: event => {
+                    event.stopPropagation()
+                    toggle(model.model_id)
+                  },
+                  'aria-expanded': isExpanded,
+                  'aria-controls': detailId,
+                  style: { alignItems: 'flex-start', background: 'transparent', border: 'none', color: color.primary, cursor: 'pointer', display: 'flex', gap: '0.48rem', outlineColor: color.accent, padding: '0.62rem 0.65rem', textAlign: 'left', width: '100%' },
+                  children: [
+                    jsx(Codicon, { name: isExpanded ? 'chevron-down' : 'chevron-right', size: '0.72rem', style: { color: color.quaternary, marginTop: '0.16rem' } }),
+                    jsxs('span', {
+                      style: { display: 'grid', gap: '0.12rem', minWidth: 0 },
+                      children: [
+                        jsx('span', { style: { fontWeight: 650, overflowWrap: 'anywhere' }, children: model.display_name }),
+                        jsx('span', { style: { color: color.tertiary, fontSize: '0.6875rem' }, children: `${model.provider_label} · ${formatRelativeTime(model.last_used_at)}` })
+                      ]
+                    })
+                  ]
+                })
+              }, 'model'),
+              jsx('td', { style: { borderBottom: isExpanded ? 'none' : border, color: color.secondary, minWidth: '9rem', padding: '0.62rem 0.65rem', verticalAlign: 'top' }, children: jsxs('span', { children: [model.route_label || 'Unknown route', model.route_count > 1 ? jsx('span', { style: { color: color.quaternary, display: 'block', fontSize: '0.625rem', marginTop: '0.12rem' }, children: `+${model.route_count - 1} more` }) : null] }) }, 'route'),
+              jsx('td', { style: { ...tabular, borderBottom: isExpanded ? 'none' : border, padding: '0.62rem 0.65rem', textAlign: 'right', verticalAlign: 'top' }, children: formatCount(model.requests) }, 'requests'),
+              jsx('td', { title: model.cache_coverage === 'partial' ? 'Cached-token coverage is partial across routes.' : model.cache_coverage === 'unavailable' ? 'This route has not demonstrated cached-token reporting in the selected period.' : undefined, style: { ...tabular, borderBottom: isExpanded ? 'none' : border, minWidth: '11rem', padding: '0.62rem 0.65rem', textAlign: 'right', verticalAlign: 'top' }, children: `${formatCount(model.input_tokens)} / ${formatCount(model.output_tokens)} / ${model.cache_tokens === null || model.cache_tokens === undefined ? '–' : formatCount(model.cache_tokens)}` }, 'tokens'),
+              jsx('td', { style: { ...tabular, borderBottom: isExpanded ? 'none' : border, padding: '0.62rem 0.65rem', textAlign: 'right', verticalAlign: 'top' }, children: formatModelCost(model) }, 'cost'),
+              jsx('td', { style: { borderBottom: isExpanded ? 'none' : border, padding: '0.58rem 0.65rem', verticalAlign: 'top' }, children: jsx(QuotaBurn, { quota: item.quota }) }, 'quota'),
+              jsx('td', { style: { borderBottom: isExpanded ? 'none' : border, padding: '0.62rem 0.65rem', textAlign: 'right', verticalAlign: 'top' }, children: jsx(RateValue, { value: model.failures?.rate, label: 'Observed request failure rate' }) }, 'failure'),
+              jsx('td', { style: { borderBottom: isExpanded ? 'none' : border, padding: '0.62rem 0.65rem', textAlign: 'right', verticalAlign: 'top' }, children: jsx(RateValue, { value: model.retry_switch_rate, label: 'Retry or model-switch session rate' }) }, 'retry'),
+              jsx('td', { title: `${model.latency?.samples || 0} bounded-log samples. Hermes does not record time-to-first-token.`, style: { ...tabular, borderBottom: isExpanded ? 'none' : border, minWidth: '7rem', padding: '0.62rem 0.65rem', textAlign: 'right', verticalAlign: 'top' }, children: `– / ${formatSeconds(model.latency?.total_p50_seconds)}` }, 'latency'),
+              jsx('td', { style: { borderBottom: isExpanded ? 'none' : border, padding: '0.54rem 0.65rem', verticalAlign: 'top' }, children: jsx(TrendBars, { rows: model.trend }) }, 'trend')
+            ]
+            const detail = isExpanded
+              ? jsx('tr', {
+                  children: jsx('td', {
+                    id: detailId,
+                    colSpan: columns.length,
+                    style: { borderBottom: border, padding: 0 },
+                    children: jsx(ModelExpanded, { model, quota: item.quota, coverage, narrow })
+                  })
+                }, `${model.model_id}-detail`)
+              : null
+            return [jsx('tr', {
+              onClick: () => toggle(model.model_id),
+              title: `${isExpanded ? 'Collapse' : 'Expand'} ${model.display_name}`,
+              style: { cursor: 'pointer' },
+              children: cells
+            }, model.model_id), detail].filter(Boolean)
+          })
+        })
+      ]
+    })
+  })
+}
+
+function AIModelsStatStrip({ data }) {
+  const summary = data?.summary || {}
+  return jsx('div', {
+    style: { borderBottom: border, borderTop: border, display: 'grid', gridTemplateColumns: 'repeat(4, minmax(8rem, 1fr))', overflowX: 'auto' },
+    children: [
+      jsx(Metric, { label: 'Model inventory', value: data ? formatCount(summary.inventory_models ?? summary.models) : '—', detail: data ? `${formatCount(summary.active_models)} active in this period` : null }, 'models'),
+      jsx(Metric, { label: 'Requests', value: data ? formatCount(summary.requests) : '—', detail: data ? 'Successful calls recorded by Hermes' : null }, 'requests'),
+      jsx(Metric, { label: 'Tokens', value: data ? formatCount(summary.total_tokens) : '—', detail: data ? 'Input + output + recorded cache' : null }, 'tokens'),
+      jsx(Metric, { label: 'Known API cost', value: data ? formatCost(summary.cost_usd, 'actual') : '—', detail: data ? `${formatCount(summary.subscription_models)} subscription models` : null }, 'cost')
+    ]
+  })
+}
+
+function AIModelsView({ query, quotaQuery, narrow, refreshError }) {
+  if (query.isLoading) return jsx(LoadingBlock, { rows: 9 })
+  if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'AI model analytics are unavailable' })
+  const data = query.data
+  return jsx('div', {
+    style: { flex: 1, minHeight: 0, overflow: 'auto', padding: '1rem' },
+    children: jsxs('div', {
+      style: { display: 'grid', gap: '1rem', margin: '0 auto', maxWidth: '100rem' },
+      children: [
+        jsx(SectionHeading, {
+          title: 'Model performance and efficiency',
+          description: 'The inventory includes every model Hermes has recorded; requests, tokens, cost, and performance honor the selected period. Click a row for task mix, reliability evidence, cost efficiency, and threshold insights.'
+        }),
+        refreshError
+          ? jsx('div', { role: 'alert', style: { background: color.dangerSoft, borderRadius: '5px', color: color.danger, fontSize: '0.6875rem', padding: '0.5rem 0.6rem' }, children: `Manual refresh failed: ${refreshError}` })
+          : null,
+        quotaQuery?.isError
+          ? jsx('div', { role: 'status', style: { background: color.warningSoft, borderRadius: '5px', color: color.warning, fontSize: '0.6875rem', padding: '0.5rem 0.6rem' }, children: 'OAuth quota burn is temporarily unavailable; recorded model analytics remain visible.' })
+          : null,
+        jsx(AIModelsTable, { models: data.models, quotaData: quotaQuery?.data, coverage: data.coverage, narrow }),
+        jsxs('div', {
+          style: { alignItems: 'flex-start', borderTop: border, color: color.tertiary, display: 'flex', fontSize: '0.6875rem', gap: '0.5rem', lineHeight: 1.5, paddingTop: '0.75rem' },
+          children: [
+            jsx(Codicon, { name: 'info', size: '0.75rem', style: { marginTop: '0.15rem' } }),
+            jsx('span', { children: 'Requests, tokens, routes, and cost come from Hermes session accounting. Retry/switch and first-attempt acceptance are derived session proxies. Failure rate and total latency cover only bounded local agent logs; time-to-first-token is not recorded.' })
+          ]
+        })
+      ]
+    })
+  })
+}
+
 function DefinitionList({ rows }) {
   return jsx('dl', {
     style: { borderTop: border, margin: 0 },
@@ -2058,8 +2583,14 @@ function SessionLensPage({ ctx }) {
   const aiUsageQuery = useQuery({
     queryKey: [PLUGIN_ID, 'ai-usage'],
     queryFn: () => ctx.rest('/ai-usage'),
-    enabled: tab === 'ai-usage',
-    refetchInterval: tab === 'ai-usage' ? 300_000 : false
+    enabled: tab === 'ai-usage' || tab === 'ai-models',
+    refetchInterval: tab === 'ai-usage' || tab === 'ai-models' ? 300_000 : false
+  })
+  const aiModelsQuery = useQuery({
+    queryKey: [PLUGIN_ID, 'ai-models', period.days, period.start_at, period.end_at],
+    queryFn: () => ctx.rest(apiPath('/ai-models', period)),
+    enabled: tab === 'ai-models',
+    refetchInterval: tab === 'ai-models' ? 60_000 : false
   })
 
   useEffect(() => ctx.storage.set('activeTab', tab), [ctx, tab])
@@ -2071,18 +2602,27 @@ function SessionLensPage({ ctx }) {
   useEffect(() => ctx.storage.set('customEnd', customEnd), [ctx, customEnd])
 
   const refresh = async () => {
-    if (tab !== 'ai-usage') {
+    if (tab !== 'ai-usage' && tab !== 'ai-models') {
       queryClient.invalidateQueries({ queryKey: [PLUGIN_ID] })
       return
     }
     setAiManualRefreshing(true)
     setAiRefreshError('')
+    const refreshErrors = []
+    if (tab === 'ai-models') {
+      try {
+        await queryClient.invalidateQueries({ queryKey: [PLUGIN_ID, 'ai-models'] })
+      } catch (error) {
+        refreshErrors.push(`Model analytics: ${error?.message || String(error || 'refresh failed')}`)
+      }
+    }
     try {
       const data = await ctx.rest('/ai-usage?fresh=true')
       queryClient.setQueryData([PLUGIN_ID, 'ai-usage'], data)
     } catch (error) {
-      setAiRefreshError(error?.message || String(error || 'The backend did not return data.'))
+      refreshErrors.push(`OAuth quotas: ${error?.message || String(error || 'the backend did not return data')}`)
     } finally {
+      if (refreshErrors.length) setAiRefreshError(refreshErrors.join(' · '))
       setAiManualRefreshing(false)
     }
   }
@@ -2104,6 +2644,12 @@ function SessionLensPage({ ctx }) {
   if (tab === 'system') content = jsx(SystemView, { ctx })
   if (tab === 'ai-usage') content = jsx(AIUsageView, {
     query: aiUsageQuery,
+    narrow: Boolean(viewport?.narrow),
+    refreshError: aiRefreshError
+  })
+  if (tab === 'ai-models') content = jsx(AIModelsView, {
+    query: aiModelsQuery,
+    quotaQuery: aiUsageQuery,
     narrow: Boolean(viewport?.narrow),
     refreshError: aiRefreshError
   })
@@ -2154,7 +2700,9 @@ function SessionLensPage({ ctx }) {
                 title: 'Refresh Session Lens',
                 disabled: aiManualRefreshing,
                 children: jsx(Codicon, {
-                  name: (tab === 'ai-usage' ? aiManualRefreshing || aiUsageQuery.isFetching : overviewQuery.isFetching) ? 'sync~spin' : 'refresh'
+                  name: (tab === 'ai-usage' || tab === 'ai-models'
+                    ? aiManualRefreshing || aiUsageQuery.isFetching || (tab === 'ai-models' && aiModelsQuery.isFetching)
+                    : overviewQuery.isFetching) ? 'sync~spin' : 'refresh'
                 })
               })
             ]
@@ -2163,7 +2711,9 @@ function SessionLensPage({ ctx }) {
       }),
       tab === 'ai-usage'
         ? jsx(AIUsageStatStrip, { data: aiUsageQuery.data })
-        : jsx(StatStrip, { overview: overviewQuery.data }),
+        : tab === 'ai-models'
+          ? jsx(AIModelsStatStrip, { data: aiModelsQuery.data })
+          : jsx(StatStrip, { overview: overviewQuery.data }),
       jsx('nav', {
         'aria-label': 'Session Lens views',
         style: { borderBottom: border, display: 'flex', overflowX: 'auto', padding: '0 0.65rem' },
@@ -2220,7 +2770,7 @@ export default {
         data: {
           id: 'session-lens.open',
           label: 'Session Lens: Open telemetry',
-          keywords: ['sessions', 'tokens', 'cost', 'usage', 'quota', 'codex', 'grok', 'nous', 'openrouter', 'tools', 'skills', 'failures', 'telemetry', 'profiles', 'gateway', 'schedules', 'kanban'],
+          keywords: ['sessions', 'models', 'tokens', 'cost', 'usage', 'quota', 'codex', 'grok', 'nous', 'openrouter', 'tools', 'skills', 'failures', 'latency', 'telemetry', 'profiles', 'gateway', 'schedules', 'kanban'],
           run: () => host.navigate(ROUTE)
         }
       }

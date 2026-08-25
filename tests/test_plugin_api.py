@@ -277,7 +277,9 @@ class SessionLensApiTests(unittest.TestCase):
             "API call #1: model=provider/model-a provider=provider in=1000 out=250 total=1250 "
             "latency=2.5s cache=500/1000 (50%)\n"
             "2027-01-15 08:00:03,000 INFO [session-1] agent.tool_executor: "
-            "tool write_file failed (1.25s)\n",
+            "tool write_file failed (1.25s)\n"
+            "2027-01-15 08:00:04,000 ERROR [session-1] agent.conversation_loop: "
+            "Error during OpenAI-compatible API call #2: HTTP 429 rate limit\n",
             encoding="utf-8",
         )
         (self.home / "gateway_state.json").write_text(
@@ -680,6 +682,55 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertEqual(telemetry["summary"]["latency_p95_seconds"], 2.5)
         self.assertEqual(telemetry["summary"]["cache_hit_ratio"], 0.5)
         self.assertEqual(telemetry["tools"][0]["failed"], 1)
+
+    def test_ai_models_are_discovered_sorted_and_explicit_about_coverage(self):
+        payload = api._ai_models_sync(0)
+        self.assertEqual(payload["summary"]["models"], 1)
+        model = payload["models"][0]
+        self.assertEqual(model["model_id"], "provider/model-a")
+        self.assertEqual(model["route_label"], "Provider API")
+        self.assertEqual(model["requests"], 1)
+        self.assertEqual(model["total_tokens"], 1750)
+        self.assertEqual(model["cache_tokens"], 500)
+        self.assertEqual(model["task_types"][0]["task_type"], "Coding")
+        self.assertEqual(model["failures"]["rate_limits"], 1)
+        self.assertEqual(model["failures"]["rate"], 0.5)
+        self.assertIsNone(model["latency"]["ttft_p50_seconds"])
+        self.assertEqual(model["latency"]["total_p50_seconds"], 2.5)
+        self.assertFalse(payload["coverage"]["ttft_available"])
+
+        outside_period = api._ai_models_sync(0, 1_800_001_000, 1_800_002_000)
+        self.assertEqual([item["model_id"] for item in outside_period["models"]], ["provider/model-a"])
+        self.assertEqual(outside_period["models"][0]["requests"], 0)
+        self.assertEqual(outside_period["models"][0]["last_used_at"], 1_800_000_100)
+        self.assertEqual(outside_period["summary"]["inventory_models"], 1)
+        self.assertEqual(outside_period["summary"]["active_models"], 0)
+        self.assertEqual(outside_period["summary"]["known_cost_models"], 0)
+
+        connection = sqlite3.connect(self.db_path)
+        try:
+            connection.execute(
+                """
+                UPDATE session_model_usage
+                SET actual_cost_usd=0, estimated_cost_usd=0.012,
+                    cost_status='actual', cost_source='provider'
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        actual_zero = api._ai_models_sync(0)
+        self.assertEqual(actual_zero["models"][0]["cost_kind"], "actual")
+        self.assertEqual(actual_zero["models"][0]["cost_usd"], 0)
+
+        connection = sqlite3.connect(self.db_path)
+        try:
+            connection.execute("DELETE FROM session_model_usage")
+            connection.commit()
+        finally:
+            connection.close()
+        session_fallback = api._ai_models_sync(0, 1_800_001_000, 1_800_002_000)
+        self.assertEqual(session_fallback["models"][0]["last_used_at"], 1_800_000_120)
 
     def test_custom_period_is_inclusive_by_start_and_exclusive_by_end(self):
         start = 1_799_999_999

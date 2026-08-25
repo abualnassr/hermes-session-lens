@@ -30,16 +30,18 @@ The plugin appears in Hermes Desktop's left sidebar as **Session Lens** and open
 
 - Native route `/session-lens` and `SIDEBAR_NAV_AREA` contribution; no iframe or standalone web server.
 - Session list and detail views for tokens, cost, model, provider, tools, skills, failures, files, and delegations.
-- Overview, Operations, Tools, Skills, System, and AI Usage views.
+- Overview, Operations, Tools, Skills, System, AI Usage, and AI Models views.
+- An all-time model inventory discovered dynamically from distinct session accounting records, with selected-period requests, token mix, cost, quota burn, reliability, retry/switch, latency, and seven-day trend evidence plus expandable task-type diagnostics. Ten columns are sortable and default to total tokens descending.
 - Current Codex, Anthropic Claude, Nous Portal, OpenRouter, DeepSeek, Grok, Kimi Code Plan, and Z.AI GLM Coding Plan account allowances or balances through Hermes-resolved credentials.
 - Chronological, paginated session trace for active user, assistant, reasoning, tool-call, and tool-result rows; system prompts excluded.
 - Conservative session outcomes that preserve Hermes' recorded end reason.
-- Cached local-log telemetry for latency, cache efficiency, and tool duration.
+- Cached local-log telemetry for latency, cache efficiency, request-failure observations, and tool duration; time-to-first-token remains explicitly unavailable because Hermes does not record it.
 - Cross-profile accounting, gateway/platform health, prompt-safe schedules, and shared Kanban execution status.
 - Failure-first sorting, a dedicated failed-call inspector, Hermes FTS search with snippets, and cursor-style pagination up to 500 rows.
 - An Ask Lens workflow that produces a privacy-conscious, session-grounded prompt for analysis in Hermes.
 - Read-only database access. The plugin must not mutate, archive, delete, or rewrite sessions.
 - Cost precedence: recorded actual cost, then recorded estimate, then a clearly labelled included or unpriced state.
+- AI Models treats OAuth quota as a shared provider-account limit, labels per-model subscription allocation as an estimate, distinguishes unavailable cache reporting from a recorded zero, bounds failure and latency evidence to available local logs, and does not estimate unavailable TTFT.
 - Skills must distinguish recorded invocation from merely available capabilities.
 - Local-first operation with no third-party telemetry upload. AI Usage makes direct authenticated quota requests only to the configured providers and never returns credentials to JavaScript.
 - Operational readers load only when their view is opened and never poll faster than every 30 seconds.
@@ -50,6 +52,7 @@ The plugin appears in Hermes Desktop's left sidebar as **Session Lens** and open
 - Sidebar label: **Session Lens**.
 - Repository name: `hermes-session-lens`.
 - Plugin id: `session-lens`.
+- Current documented release: `0.6.0`.
 - The interface inherits Hermes Desktop's native components, typography, spacing, and theme variables.
 - Upstream inspiration is credited transparently; no upstream logo or endorsement is implied.
 
