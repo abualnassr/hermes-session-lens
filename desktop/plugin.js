@@ -2239,7 +2239,7 @@ function ModelExpanded({ model, quota, coverage, narrow }) {
     `Failure and total-latency samples come from bounded logs${coverage?.log_start_at ? ` (${formatShortDate(coverage.log_start_at)}–${formatShortDate(coverage.log_end_at)})` : ''}; time-to-first-token is not recorded by Hermes.`,
     'Counts API errors, timeouts, and rate limits; tool-call failures are shown separately.',
     'Retry/switch counts rewinds, near-identical prompts resent to the same model within five minutes, and model changes within the same task role; models on different roles are not switches.',
-    'Acceptance uses the existing proxy only for General and Analysis; Coding requires a resolved session with a recorded saved or committed file change; Orchestration and unsupported task types are n/a.'
+    'Session Lens assigns one primary type in this order: Orchestration, Coding, Writing, Analysis, General. General and Analysis use the existing proxy; Coding requires a resolved code-shaped save or commit; Writing requires a resolved non-code artifact write; Orchestration and auxiliary jobs are n/a.'
   ])
   return jsxs('div', {
     style: {

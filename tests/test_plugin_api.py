@@ -20,6 +20,19 @@ assert SPEC.loader is not None
 SPEC.loader.exec_module(api)
 
 
+def tool_rows(name: str, arguments: dict | None = None, result: str = "Done!"):
+    call_id = f"call-{name}-{abs(hash(json.dumps(arguments or {}, sort_keys=True)))}"
+    calls = [{
+        "id": call_id,
+        "type": "function",
+        "function": {"name": name, "arguments": json.dumps(arguments or {})},
+    }]
+    return [
+        {"role": "assistant", "tool_calls": json.dumps(calls)},
+        {"role": "tool", "tool_call_id": call_id, "tool_name": name, "content": result},
+    ]
+
+
 class FakeSessionDB:
     path: Path
 
@@ -683,6 +696,91 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertEqual(telemetry["summary"]["cache_hit_ratio"], 0.5)
         self.assertEqual(telemetry["tools"][0]["failed"], 1)
 
+    def test_session_task_type_uses_five_path_aware_types_in_precedence_order(self):
+        self.assertEqual(api._session_task_type(tool_rows("delegate_task", {"prompt": "work"})), "Orchestration")
+        self.assertEqual(api._session_task_type(tool_rows("write_file", {"path": "app.py"})), "Coding")
+        self.assertEqual(
+            api._session_task_type(tool_rows("web_search", {"query": "daily brief"})),
+            "Analysis",
+        )
+        self.assertEqual(api._session_task_type(tool_rows("send_message", {"message": "hello"})), "General")
+        self.assertEqual(api._session_task_type(tool_rows("write_file", {"path": "vault/note.md"})), "Writing")
+        self.assertEqual(api._session_task_type(tool_rows("write_file", {"path": "plugins/demo/plugin.js"})), "Coding")
+        self.assertEqual(
+            api._session_task_type(tool_rows("terminal", {"command": "git add app.py && git commit -m done"})),
+            "Coding",
+        )
+        self.assertEqual(api._session_task_type(tool_rows("terminal", {"command": "date"})), "General")
+        self.assertEqual(api._session_task_type([]), "General")
+
+    def test_session_task_type_classifies_mixed_research_by_saved_artifact(self):
+        research = tool_rows("web_search", {"query": "provider release"})
+        writing = tool_rows("write_file", {"path": "brief.md"})
+        coding = tool_rows("write_file", {"path": "app.py"})
+        self.assertEqual(api._session_task_type(research + writing), "Writing")
+        self.assertEqual(api._session_task_type(research + coding), "Coding")
+
+    def test_change_evidence_distinguishes_code_writing_and_commit_contents(self):
+        writing = tool_rows("write_file", {"path": "vault/note.md"})
+        coding = tool_rows("apply_patch", {"path": "app.py", "patch": "+ok"})
+        markdown_commit = tool_rows(
+            "terminal",
+            {"command": "git commit -m docs"},
+            "[main abc123] docs\n release-notes.md | 2 ++",
+        )
+        code_commit = tool_rows(
+            "terminal",
+            {"command": "git add app.py && git commit -m code"},
+            "[main def456] code\n app.py | 2 ++",
+        )
+
+        self.assertTrue(api._writing_change_evidence(writing))
+        self.assertIsNone(api._coding_change_evidence(writing))
+        self.assertTrue(api._coding_change_evidence(coding))
+        self.assertIsNone(api._writing_change_evidence(coding))
+        self.assertEqual(api._session_task_type(markdown_commit), "Writing")
+        self.assertTrue(api._writing_change_evidence(markdown_commit))
+        self.assertEqual(api._session_task_type(code_commit), "Coding")
+        self.assertTrue(api._coding_change_evidence(code_commit))
+        self.assertEqual(
+            api._acceptance_for_task(
+                "Writing",
+                {"closed": True, "resolved": True, "writing_change": True},
+            ),
+            (True, True),
+        )
+
+    def test_auxiliary_labels_are_separate_and_unscored(self):
+        self.assertEqual(api._auxiliary_task_label("compression"), "Compression")
+        self.assertEqual(api._auxiliary_task_label("title_generation"), "Title")
+        self.assertEqual(api._auxiliary_task_label("vision"), "Vision")
+        self.assertEqual(api._auxiliary_task_label("web_extract"), "Web extract")
+        self.assertEqual(api._auxiliary_task_label("background_review"), "Review")
+        self.assertEqual(api._auxiliary_task_label("approval"), "Approval")
+        self.assertEqual(api._auxiliary_task_label("custom_aux_job"), "Custom Aux Job")
+        self.assertEqual(api._auxiliary_task_label("analysis"), "Analysis job")
+        self.assertEqual(api._acceptance_for_task("Title", {"closed": True, "resolved": True}), (False, False))
+        self.assertEqual(api._acceptance_for_task("Orchestration", {"closed": True, "resolved": True}), (False, False))
+
+        connection = sqlite3.connect(self.db_path)
+        try:
+            connection.execute(
+                "INSERT INTO session_model_usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (
+                    "session-1", "provider/model-a", "provider", "metered", "title_generation",
+                    1, 20, 5, 0, 0, 0, 0.0001, 0, "estimated", "test",
+                    1_800_000_020, 1_800_000_030,
+                ),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        model = api._ai_models_sync(0)["models"][0]
+        self.assertNotIn("Title", {row["task_type"] for row in model["task_types"]})
+        title = next(row for row in model["auxiliary_tasks"] if row["task_type"] == "Title")
+        self.assertIsNone(title["first_attempt_acceptance_rate"])
+        self.assertEqual(title["acceptance_basis"], "auxiliary job; acceptance is not scored")
+
     def test_ai_models_are_discovered_sorted_and_explicit_about_coverage(self):
         payload = api._ai_models_sync(0)
         self.assertEqual(payload["summary"]["models"], 1)
@@ -774,6 +872,15 @@ class SessionLensApiTests(unittest.TestCase):
                 VALUES (?,?,?,?,?,?,1)
                 """,
                 ("coding-success", "tool", "Done!", "call-patch", "apply_patch", 1_800_000_211),
+            )
+            delegate_call = [{
+                "id": "call-delegate",
+                "type": "function",
+                "function": {"name": "delegate_task", "arguments": json.dumps({"prompt": "Inspect the work"})},
+            }]
+            connection.execute(
+                "INSERT INTO messages (session_id,role,tool_calls,timestamp,active) VALUES (?,?,?,?,1)",
+                ("orchestration", "assistant", json.dumps(delegate_call), 1_800_000_410),
             )
             connection.execute(
                 "INSERT INTO async_delegations VALUES (?,?,?,?,?,?,?,?)",

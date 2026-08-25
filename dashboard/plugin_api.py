@@ -145,6 +145,70 @@ _NO_FILE_CHANGE_RE = re.compile(
     r"\bnothing to commit\b|\bno changes?\b|\bpatch did not apply\b",
     re.IGNORECASE,
 )
+_SESSION_TASK_TYPES = ("Orchestration", "Coding", "Writing", "Analysis", "General")
+_SESSION_TASK_TYPE_SET = set(_SESSION_TASK_TYPES)
+_CODE_FILE_EXTENSIONS = {
+    ".bash",
+    ".c",
+    ".cc",
+    ".cjs",
+    ".cpp",
+    ".css",
+    ".go",
+    ".gradle",
+    ".h",
+    ".hpp",
+    ".html",
+    ".java",
+    ".js",
+    ".json",
+    ".jsx",
+    ".kt",
+    ".lock",
+    ".mjs",
+    ".ps1",
+    ".py",
+    ".rs",
+    ".scss",
+    ".sh",
+    ".sql",
+    ".svelte",
+    ".swift",
+    ".toml",
+    ".ts",
+    ".tsx",
+    ".vue",
+    ".xml",
+    ".yaml",
+    ".yml",
+}
+_WRITING_FILE_EXTENSIONS = {
+    ".csv",
+    ".docx",
+    ".markdown",
+    ".md",
+    ".pdf",
+    ".pptx",
+    ".rtf",
+    ".txt",
+    ".xls",
+    ".xlsx",
+}
+_FILE_REFERENCE_RE = re.compile(
+    r"(?i)(?P<path>(?:[a-z]:)?(?:[^\s\"'<>|;&]+[\\/])*[^\s\"'<>|;&]+\."
+    r"(?:bash|c|cc|cjs|cpp|css|csv|docx|go|gradle|h|hpp|html|java|js|json|jsx|kt|lock|"
+    r"markdown|md|mjs|pdf|pptx|ps1|py|rs|rtf|scss|sh|sql|svelte|swift|toml|ts|tsx|txt|"
+    r"vue|xls|xlsx|xml|yaml|yml))\b"
+)
+_PATCH_FILE_RE = re.compile(r"(?im)^\*\*\* (?:add|delete|update) file:\s*(?P<path>.+?)\s*$")
+_CODE_COMMAND_RE = re.compile(
+    r"(?i)(?:^|[;&|]\s*|\s)(?:git|gh|pytest|npm|npx|pnpm|yarn|pip|pipx|uv|cargo|"
+    r"go\s+(?:build|test|install|run)|gradle|gradlew|mvn|mvnw|make|cmake|ninja|"
+    r"ruff|eslint|prettier|biome|tsc|jest|vitest|mocha|tox|nox|gdb|lldb)\b"
+)
+_WORKER_COMMAND_RE = re.compile(
+    r"(?i)(?:^|[;&|]\s*)(?:(?:npx\s+)?(?:claude(?:\s+code)?|codex(?:\.exe)?|openhands))\b"
+)
 
 _log_file_cache: Dict[str, Tuple[Tuple[int, int], Dict[str, Any]]] = {}
 _ai_usage_cache_lock = threading.Lock()
@@ -1637,39 +1701,197 @@ def _apply_route_mapping(
 
 def _auxiliary_task_label(task: str) -> str:
     labels = {
-        "background_review": "Analysis",
+        "approval": "Approval",
+        "background_review": "Review",
         "compression": "Compression",
-        "title_generation": "Writing",
-        "vision": "Analysis",
-        "web_extract": "Analysis",
+        "title_generation": "Title",
+        "vision": "Vision",
+        "web_extract": "Web extract",
     }
     normalised = str(task or "").strip().lower()
-    return labels.get(normalised, _humanize_identifier(normalised))
+    label = labels.get(normalised, _humanize_identifier(normalised))
+    return f"{label} job" if label in _SESSION_TASK_TYPE_SET else label
 
 
-def _session_task_type(tool_names: Iterable[str], source: Any, delegated: bool) -> str:
-    names = " ".join(str(name or "").lower() for name in tool_names)
-    source_text = str(source or "").lower()
-    if delegated or source_text in {"cron", "schedule", "webhook"} or any(
-        marker in names
-        for marker in ("delegate", "spawn_agent", "send_message", "wait_agent", "create_thread", "handoff", "kanban", "schedule", "goal", "collaboration")
-    ):
-        return "Orchestration"
-    if any(
-        marker in names
-        for marker in ("apply_patch", "exec_command", "terminal", "shell", "write_file", "edit_file", "replace_in_file", "git", "lsp", "run_test", "code_")
-    ):
+def _tool_text(call: Mapping[str, Any]) -> str:
+    arguments = call.get("arguments") if isinstance(call.get("arguments"), Mapping) else {}
+    action_values = [
+        arguments.get(key)
+        for key in ("action", "command", "code", "mode", "operation", "subcommand", "type")
+    ]
+    return " ".join([str(call.get("name") or ""), *(str(value or "") for value in action_values)]).lower()
+
+
+def _paths_from_tool_call(call: Mapping[str, Any], extra_text: Any = None) -> List[str]:
+    name = str(call.get("name") or "")
+    arguments = call.get("arguments") if isinstance(call.get("arguments"), Mapping) else {}
+    paths = [item["path"] for item in _files_from_call(name, arguments)]
+    searchable = [
+        arguments.get(key)
+        for key in ("command", "code", "diff", "patch")
+        if isinstance(arguments.get(key), str)
+    ]
+    if isinstance(extra_text, str):
+        searchable.append(extra_text)
+    for value in searchable:
+        for match in _PATCH_FILE_RE.finditer(value):
+            paths.append(match.group("path"))
+        for match in _FILE_REFERENCE_RE.finditer(value):
+            paths.append(match.group("path"))
+    return list(dict.fromkeys(path for path in paths if path))
+
+
+def _path_artifact_kind(value: Any) -> Optional[str]:
+    path = str(value or "").strip(" \t\r\n\"'`()[]{}.,;").replace("\\", "/").lower()
+    if not path:
+        return None
+    parts = [part for part in path.split("/") if part]
+    basename = parts[-1] if parts else path
+    if basename == "skill.md" and any(part in {"plugin", "plugins", "skill", "skills"} for part in parts[:-1]):
         return "Coding"
-    if any(
-        marker in names
-        for marker in ("document", "presentation", "slides", "gmail", "email", "write_doc", "spreadsheet")
-    ):
+    suffix = Path(basename).suffix.lower()
+    if suffix in _CODE_FILE_EXTENSIONS:
+        return "Coding"
+    if suffix in _WRITING_FILE_EXTENSIONS:
         return "Writing"
-    if any(
-        marker in names
-        for marker in ("browser", "search", "web", "read_file", "view_image", "inspect", "query", "finance", "weather", "sports", "pdf")
+    if any(part in {"notes", "vault", "wiki"} for part in parts[:-1]):
+        return "Writing"
+    return None
+
+
+def _is_file_mutation(call: Mapping[str, Any]) -> bool:
+    name = str(call.get("name") or "").lower()
+    return any(
+        marker in name
+        for marker in ("apply_patch", "edit_file", "patch_file", "replace_in_file", "write_file")
+    ) or name.rsplit(".", 1)[-1] == "patch"
+
+
+def _is_git_commit_call(call: Mapping[str, Any]) -> bool:
+    arguments = call.get("arguments") if isinstance(call.get("arguments"), Mapping) else {}
+    command = str(arguments.get("command") or arguments.get("code") or "")
+    return bool(_GIT_COMMIT_RE.search(command))
+
+
+def _is_orchestration_call(call: Mapping[str, Any]) -> bool:
+    name = str(call.get("name") or "").lower()
+    if any(marker in name for marker in ("delegate_task", "spawn_agent", "wait_agent", "handoff")):
+        return True
+    if "kanban" in name and any(
+        marker in name for marker in ("create", "assign", "dispatch", "complete", "block")
     ):
-        return "Analysis"
+        return True
+    arguments = call.get("arguments") if isinstance(call.get("arguments"), Mapping) else {}
+    command = str(arguments.get("command") or arguments.get("code") or "")
+    return bool(command and _WORKER_COMMAND_RE.search(command))
+
+
+def _is_coding_call(call: Mapping[str, Any]) -> bool:
+    name = str(call.get("name") or "").lower()
+    extra_text = call.get("result_content") if _is_git_commit_call(call) else None
+    paths = _paths_from_tool_call(call, extra_text)
+    path_kinds = {_path_artifact_kind(path) for path in paths}
+    if _is_file_mutation(call) and "Coding" in path_kinds:
+        return True
+    if "skill_manage" in name:
+        action = _tool_text(call)
+        if any(marker in action for marker in ("create", "edit", "patch", "replace", "update")):
+            return True
+    if ("github" in name or re.search(r"(?:^|[_:.])gh(?:$|[_:.])", name)) and any(
+        marker in _tool_text(call)
+        for marker in ("commit", "create", "delete", "edit", "merge", "mutate", "patch", "push", "update")
+    ):
+        return True
+    if any(marker in name for marker in ("exec_command", "execute_code", "terminal", "shell")):
+        arguments = call.get("arguments") if isinstance(call.get("arguments"), Mapping) else {}
+        command = str(arguments.get("command") or arguments.get("code") or "")
+        if _is_git_commit_call(call) and path_kinds and path_kinds <= {"Writing", None}:
+            return False
+        return bool(_CODE_COMMAND_RE.search(command))
+    return False
+
+
+def _is_read_action(call: Mapping[str, Any]) -> bool:
+    return bool(
+        re.search(
+            r"(?:^|[_:.\s-])(?:analy(?:se|sis|ze)?|extract|inspect|preview|query|read|search|view)(?:$|[_:.\s-])",
+            _tool_text(call),
+        )
+    )
+
+
+def _is_writing_call(call: Mapping[str, Any]) -> bool:
+    name = str(call.get("name") or "").lower()
+    extra_text = call.get("result_content") if _is_git_commit_call(call) else None
+    paths = _paths_from_tool_call(call, extra_text)
+    path_kinds = {_path_artifact_kind(path) for path in paths}
+    if _is_file_mutation(call) and "Writing" in path_kinds:
+        return True
+    if _is_git_commit_call(call) and "Writing" in path_kinds and "Coding" not in path_kinds:
+        return True
+    if any(marker in name for marker in ("image_generate", "imagegen")):
+        return True
+    if any(
+        marker in name
+        for marker in ("document", "docx", "nano-pdf", "nano_pdf", "pdf", "powerpoint", "presentation", "slides", "spreadsheet", "xlsx")
+    ):
+        return not _is_read_action(call)
+    if any(marker in name for marker in ("email", "gmail")):
+        return any(marker in _tool_text(call) for marker in ("compose", "create", "draft", "forward", "reply", "send", "write"))
+    return False
+
+
+def _is_analysis_call(call: Mapping[str, Any]) -> bool:
+    name = str(call.get("name") or "").lower()
+    return any(
+        marker in name
+        for marker in (
+            "arxiv",
+            "browser_exec",
+            "capture",
+            "computer_use",
+            "drive_preview",
+            "firecrawl",
+            "hermes_web_search",
+            "maps",
+            "ocr",
+            "pdf",
+            "read_file",
+            "read_preview",
+            "scrape",
+            "session_search",
+            "vision_analyze",
+            "web_extract",
+            "web_search",
+            "x_search",
+        )
+    )
+
+
+def _session_task_type(rows: Iterable[Mapping[str, Any]]) -> str:
+    material = [dict(row) for row in rows]
+    results_by_call = {
+        str(row.get("tool_call_id")): str(row.get("content") or "")
+        for row in material
+        if str(row.get("role") or "").lower() == "tool" and row.get("tool_call_id")
+    }
+    calls = []
+    for row in material:
+        if str(row.get("role") or "").lower() != "assistant":
+            continue
+        for call in _iter_tool_calls(row.get("tool_calls")):
+            enriched = dict(call)
+            enriched["result_content"] = results_by_call.get(str(call.get("call_id") or ""), "")
+            calls.append(enriched)
+    checks = (
+        ("Orchestration", _is_orchestration_call),
+        ("Coding", _is_coding_call),
+        ("Writing", _is_writing_call),
+        ("Analysis", _is_analysis_call),
+    )
+    for task_type, predicate in checks:
+        if any(predicate(call) for call in calls):
+            return task_type
     return "General"
 
 
@@ -1706,47 +1928,77 @@ def _has_near_identical_prompt_retry(rows: Iterable[Mapping[str, Any]]) -> bool:
     return False
 
 
-def _coding_change_evidence(rows: Iterable[Mapping[str, Any]]) -> Optional[bool]:
+def _change_evidence_by_type(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Optional[bool]]:
     material = [dict(row) for row in rows]
     results_by_call: Dict[str, Mapping[str, Any]] = {}
     for row in material:
         if str(row.get("role") or "").lower() == "tool" and row.get("tool_call_id"):
             results_by_call[str(row.get("tool_call_id"))] = row
 
-    detected_results = 0
+    detected_results = {"Coding": 0, "Writing": 0}
+    successful_change = {"Coding": False, "Writing": False}
     for row in material:
         if str(row.get("role") or "").lower() != "assistant" or not row.get("tool_calls"):
             continue
         for call in _iter_tool_calls(row.get("tool_calls")):
-            name = str(call.get("name") or "").lower()
-            arguments = call.get("arguments") or {}
-            command = str(arguments.get("command") or arguments.get("code") or "")
-            mutates_file = any(marker in name for marker in ("apply_patch", "write_file", "edit_file", "replace_in_file"))
-            commits_change = bool(_GIT_COMMIT_RE.search(command))
-            if not mutates_file and not commits_change:
-                continue
             result = results_by_call.get(str(call.get("call_id") or ""))
             if not result:
                 continue
-            detected_results += 1
+            result_content = str(result.get("content") or "")
+            paths = _paths_from_tool_call(call, result_content if _is_git_commit_call(call) else None)
+            kinds = {_path_artifact_kind(path) for path in paths}
+            kinds.discard(None)
+            if "skill_manage" in str(call.get("name") or "").lower() and _is_coding_call(call):
+                kinds.add("Coding")
+            writing_artifact_change = _is_writing_call(call)
+            if writing_artifact_change and not paths:
+                kinds.add("Writing")
+            if not (
+                _is_file_mutation(call)
+                or _is_git_commit_call(call)
+                or writing_artifact_change
+                or "skill_manage" in str(call.get("name") or "").lower()
+            ):
+                kinds.clear()
+            if not kinds:
+                continue
             failed = _is_failure(
                 role="tool",
                 content=result.get("content"),
                 finish_reason=result.get("finish_reason"),
                 effect_disposition=result.get("effect_disposition"),
             )
-            if not failed and not _NO_FILE_CHANGE_RE.search(str(result.get("content") or "")):
-                return True
-    return False if detected_results else None
+            for kind in kinds & {"Coding", "Writing"}:
+                detected_results[kind] += 1
+                if not failed and not _NO_FILE_CHANGE_RE.search(result_content):
+                    successful_change[kind] = True
+    return {
+        kind: True if successful_change[kind] else (False if detected_results[kind] else None)
+        for kind in ("Coding", "Writing")
+    }
+
+
+def _coding_change_evidence(rows: Iterable[Mapping[str, Any]]) -> Optional[bool]:
+    return _change_evidence_by_type(rows)["Coding"]
+
+
+def _writing_change_evidence(rows: Iterable[Mapping[str, Any]]) -> Optional[bool]:
+    return _change_evidence_by_type(rows)["Writing"]
 
 
 def _acceptance_for_task(task_type: str, facts: Mapping[str, Any]) -> Tuple[bool, bool]:
+    if task_type not in _SESSION_TASK_TYPE_SET:
+        return False, False
     if task_type in {"General", "Analysis"}:
         valid = bool(facts.get("eligible_proxy"))
         return valid, bool(valid and facts.get("proxy_accepted"))
     if task_type == "Coding":
         valid = bool(facts.get("closed")) and facts.get("coding_change") is not None
         accepted = bool(valid and facts.get("resolved") and facts.get("coding_change"))
+        return valid, accepted
+    if task_type == "Writing":
+        valid = bool(facts.get("closed")) and facts.get("writing_change") is not None
+        accepted = bool(valid and facts.get("resolved") and facts.get("writing_change"))
         return valid, accepted
     return False, False
 
@@ -1940,7 +2192,6 @@ def _ai_models_sync(
 
         message_rows_by_session: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
         tool_failure_rows: List[Dict[str, Any]] = []
-        tools_by_session: Dict[str, set[str]] = defaultdict(set)
         if session_rows:
             for row in connection.execute(
                 f"""
@@ -1959,10 +2210,6 @@ def _ai_models_sync(
                 material = _row_dict(row)
                 session_id = str(material.get("session_id") or "")
                 message_rows_by_session[session_id].append(material)
-                if material.get("tool_name"):
-                    tools_by_session[session_id].add(str(material.get("tool_name")))
-                for call in _iter_tool_calls(material.get("tool_calls")):
-                    tools_by_session[session_id].add(str(call.get("name") or ""))
                 if str(material.get("role") or "").lower() == "tool" and _is_failure(
                     role="tool",
                     content=material.get("content"),
@@ -1970,15 +2217,6 @@ def _ai_models_sync(
                     effect_disposition=material.get("effect_disposition"),
                 ):
                     tool_failure_rows.append(material)
-
-        delegated_sessions: set[str] = set()
-        if _table_columns(connection, "async_delegations"):
-            for row in connection.execute(
-                "SELECT origin_session, parent_session_id FROM async_delegations"
-            ).fetchall():
-                for key in (row["origin_session"], row["parent_session_id"]):
-                    if key and str(key) in sessions_by_id:
-                        delegated_sessions.add(str(key))
 
     role_models_by_session: Dict[str, Dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
     usage_by_session: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
@@ -2009,11 +2247,9 @@ def _ai_models_sync(
     session_facts: Dict[str, Dict[str, Any]] = {}
     for session_id, session in sessions_by_id.items():
         outcome = _session_outcome(session)["outcome"]
-        task_type = _session_task_type(
-            tools_by_session.get(session_id, set()),
-            session.get("source"),
-            session_id in delegated_sessions,
-        )
+        message_rows = message_rows_by_session.get(session_id, [])
+        task_type = _session_task_type(message_rows)
+        change_evidence = _change_evidence_by_type(message_rows)
         closed = session.get("ended_at") is not None and outcome not in {"open", "running"}
         resolved = closed and outcome not in {"failed", "cancelled"}
         eligible_proxy = resolved
@@ -2027,9 +2263,8 @@ def _ai_models_sync(
             "resolved": resolved,
             "eligible_proxy": eligible_proxy,
             "proxy_accepted": proxy_accepted,
-            "coding_change": _coding_change_evidence(message_rows_by_session.get(session_id, []))
-            if task_type == "Coding"
-            else None,
+            "coding_change": change_evidence["Coding"],
+            "writing_change": change_evidence["Writing"],
             "task_type": task_type,
         }
 
@@ -2054,7 +2289,8 @@ def _ai_models_sync(
         provider_key = str(usage.get("billing_provider") or "").strip().lower()
         route = _route_descriptor(provider_key, usage.get("billing_base_url"), usage.get("billing_mode"))
         task_name = str(usage.get("task") or "").strip()
-        task_type = _auxiliary_task_label(task_name) if task_name else session_facts.get(session_id, {}).get("task_type", "General")
+        auxiliary = bool(task_name)
+        task_type = _auxiliary_task_label(task_name) if auxiliary else session_facts.get(session_id, {}).get("task_type", "General")
         input_tokens = _integer(usage.get("input_tokens"))
         output_tokens = _integer(usage.get("output_tokens"))
         cache_tokens = _integer(usage.get("cache_read_tokens")) + _integer(usage.get("cache_write_tokens"))
@@ -2088,6 +2324,7 @@ def _ai_models_sync(
                 "retry_sessions_set": set(),
                 "routes_map": {},
                 "task_types_map": {},
+                "auxiliary_tasks_map": {},
                 "trend_map": {day: 0 for day in trend_days},
             },
         )
@@ -2127,7 +2364,8 @@ def _ai_models_sync(
         route_row["cost_usd"] += row_cost
         route_row["last_used_at"] = max(_number(route_row.get("last_used_at"), 0), last_used) or None
 
-        task = model["task_types_map"].setdefault(
+        task_map = model["auxiliary_tasks_map"] if auxiliary else model["task_types_map"]
+        task = task_map.setdefault(
             task_type,
             {
                 "task_type": task_type,
@@ -2181,6 +2419,7 @@ def _ai_models_sync(
                 "retry_sessions_set": set(),
                 "routes_map": {},
                 "task_types_map": {},
+                "auxiliary_tasks_map": {},
                 "trend_map": {day: 0 for day in trend_days},
             },
         )
@@ -2288,13 +2527,27 @@ def _ai_models_sync(
                 len(accepted_task_sessions) / len(eligible_sessions) if eligible_sessions else None
             )
             if task["task_type"] == "Coding":
-                task["acceptance_basis"] = "resolved session with a recorded successful saved or committed file change"
+                task["acceptance_basis"] = "resolved session with a recorded successful code-shaped save or commit"
+            elif task["task_type"] == "Writing":
+                task["acceptance_basis"] = "resolved session with a recorded successful non-code artifact write"
             elif task["task_type"] in {"General", "Analysis"}:
                 task["acceptance_basis"] = "eligible closed session without a retry, same-role switch, or detected recorded failure"
             else:
                 task["acceptance_basis"] = "unavailable for this task type"
             task_types.append(task)
         task_types.sort(key=lambda item: (item["requests"], item["sessions"]), reverse=True)
+
+        auxiliary_tasks = []
+        for task in model.pop("auxiliary_tasks_map").values():
+            task.pop("eligible_sessions_set")
+            task.pop("accepted_sessions_set")
+            task["sessions"] = len(task.pop("sessions_set"))
+            task["eligible_sessions"] = 0
+            task["accepted_sessions"] = 0
+            task["first_attempt_acceptance_rate"] = None
+            task["acceptance_basis"] = "auxiliary job; acceptance is not scored"
+            auxiliary_tasks.append(task)
+        auxiliary_tasks.sort(key=lambda item: (item["requests"], item["sessions"]), reverse=True)
 
         failure_counts_by_type = failures_by_model.get(model_id, Counter())
         observed_failures = sum(failure_counts_by_type.values())
@@ -2344,6 +2597,7 @@ def _ai_models_sync(
                 "retry_switch_samples": retry_switch_samples,
                 "retry_switch_rate": retry_switch_rate,
                 "task_types": task_types,
+                "auxiliary_tasks": auxiliary_tasks,
                 "failures": {
                     "rate": failure_rate,
                     "rate_limits": failure_counts_by_type.get("rate_limit", 0),
@@ -2399,10 +2653,14 @@ def _ai_models_sync(
         },
         "coverage": {
             "model_source": "all-time distinct model IDs from Hermes session_model_usage with session-row fallback; metrics honor the selected period",
-            "task_types": "derived from recorded Hermes tool names, session source, delegation links, and auxiliary task labels",
+            "task_types": (
+                "Session Lens classifies each session once as Orchestration, Coding, Writing, Analysis, or General, in that order, "
+                "from recorded tool calls, arguments, code-shaped commands, and artifact paths; sources are not task types and auxiliary jobs are separate"
+            ),
             "first_attempt_acceptance": (
                 "General and Analysis use the eligible-closed-session proxy; Coding requires a resolved session plus a recorded successful "
-                "saved or committed file change; Orchestration and other task types are unavailable"
+                "code-shaped save or commit; Writing requires a resolved session plus a recorded successful non-code artifact write; "
+                "Orchestration and auxiliary jobs are unavailable"
             ),
             "retry_switch": (
                 "rewinds, near-identical prompts resent to the same model within five minutes, or model changes within the same task role; "
