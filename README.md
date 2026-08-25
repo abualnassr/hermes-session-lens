@@ -22,9 +22,8 @@ It is a unified Hermes plugin—one install contains the native Desktop page and
 - Schedule status, next/last run, delivery errors, and failure streaks without exposing schedule prompts.
 - Shared Kanban task and run status with bounded failure evidence.
 - Overview, Operations, Tools, Skills, System, and AI Usage views.
-- Live account-level usage for OpenAI Codex, Anthropic Claude, Nous Research Portal, OpenRouter, and DeepSeek using credentials already configured in Hermes.
-- Experimental quota adapters for Grok, Kimi Code Plan, and Z.AI GLM Coding Plan, clearly separated from supported provider sources.
-- Five-minute in-memory provider cache, explicit partial/stale states, and a manual fresh refresh. Experimental providers are labelled because their private or evolving usage surfaces may change.
+- Live account-level usage for OpenAI Codex, Anthropic Claude, Nous Research Portal, OpenRouter, DeepSeek, Grok, Kimi Code Plan, and Z.AI GLM Coding Plan using credentials already configured in Hermes.
+- Five-minute in-memory provider cache, explicit partial/stale states, and a manual fresh refresh.
 - Ask Lens: builds a grounded analysis prompt locally, copies it, and opens a new Hermes chat.
 - Failure-first, recent, cost, token, and tool-call sorting; pagination grows to a 500-session safety limit.
 - Click-to-sort headers on every evidence table, with visible direction and keyboard-accessible controls.

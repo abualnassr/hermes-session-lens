@@ -208,9 +208,9 @@ The form language is compact and lightly softened. Native/select controls use re
 
 ### AI Usage
 
-- **Provider groups:** Supported sources—Codex, Anthropic Claude, Nous Portal, OpenRouter, and DeepSeek—lead. Experimental sources—Grok, Kimi Code Plan, and Z.AI GLM Coding Plan—follow under an explicit compatibility warning. Each provider uses a compact bordered section in a two-column wide layout and a one-column narrow layout; these are operational groupings, not decorative cards.
+- **Provider grid:** All configured sources—Codex, Anthropic Claude, Nous Portal, OpenRouter, DeepSeek, Grok, Kimi Code Plan, and Z.AI GLM Coding Plan—appear together under Supported providers. Each provider uses a compact bordered section in a two-column wide layout and a one-column narrow layout; these are operational groupings, not decorative cards.
 - **Quota windows:** Labels and tabular remaining values lead; progress bars carry `progressbar` semantics and never communicate state by color alone. Monetary balances retain their unit and never become a fabricated percentage when no denominator exists.
-- **Provider states:** Connected, not configured, expired or rejected, forbidden, unavailable, partial, and stale are stated in text. Grok, Kimi, and Z.AI carry an Experimental source pill, and stale data names the failed refresh while preserving the last successful reading.
+- **Provider states:** Connected, not configured, expired or rejected, forbidden, unavailable, partial, and stale are stated in text. Stale data names the failed refresh while preserving the last successful reading.
 - **Trust boundary:** The view states that credentials stay in the Python backend, browser cookies are not read, and only normalized account usage reaches JavaScript.
 
 ### Evidence tables and trace

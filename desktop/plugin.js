@@ -1798,15 +1798,9 @@ function UsageProvider({ provider }) {
               })
             ]
           }),
-          jsxs('div', {
-            style: { alignItems: 'flex-end', display: 'flex', flexDirection: 'column', gap: '0.3rem' },
-            children: [
-              jsx(Pill, {
-                tone: status.tone,
-                children: jsxs(Fragment, { children: [jsx(Codicon, { name: status.icon, size: '0.65rem' }), status.label] })
-              }),
-              provider.experimental ? jsx(Pill, { children: 'Experimental source' }) : null
-            ]
+          jsx(Pill, {
+            tone: status.tone,
+            children: jsxs(Fragment, { children: [jsx(Codicon, { name: status.icon, size: '0.65rem' }), status.label] })
           })
         ]
       }),
@@ -1919,8 +1913,6 @@ function AIUsageView({ query, narrow, refreshError }) {
   if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'AI usage is unavailable' })
   const data = query.data
   const providers = data?.providers || []
-  const supportedProviders = providers.filter(provider => !provider.experimental)
-  const experimentalProviders = providers.filter(provider => provider.experimental)
   return jsx('div', {
     style: { flex: 1, minHeight: 0, overflow: 'auto', padding: '1rem' },
     children: jsxs('div', {
@@ -1941,14 +1933,7 @@ function AIUsageView({ query, narrow, refreshError }) {
           id: 'supported-ai-usage',
           title: 'Supported providers',
           description: 'Provider-supported account limits and balances resolved through Hermes credentials.',
-          providers: supportedProviders,
-          narrow
-        }),
-        jsx(UsageProviderGroup, {
-          id: 'experimental-ai-usage',
-          title: 'Experimental providers',
-          description: 'Private or evolving quota surfaces. Values are live when available, but response compatibility may change.',
-          providers: experimentalProviders,
+          providers,
           narrow
         }),
         jsxs('div', {

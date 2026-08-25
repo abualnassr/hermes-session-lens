@@ -31,8 +31,7 @@ The plugin appears in Hermes Desktop's left sidebar as **Session Lens** and open
 - Native route `/session-lens` and `SIDEBAR_NAV_AREA` contribution; no iframe or standalone web server.
 - Session list and detail views for tokens, cost, model, provider, tools, skills, failures, files, and delegations.
 - Overview, Operations, Tools, Skills, System, and AI Usage views.
-- Current Codex, Anthropic Claude, Nous Portal, OpenRouter, and DeepSeek account allowances or balances through Hermes-resolved credentials.
-- Grok, Kimi Code Plan, and Z.AI GLM Coding Plan quota adapters are explicitly experimental and visually separated from supported sources.
+- Current Codex, Anthropic Claude, Nous Portal, OpenRouter, DeepSeek, Grok, Kimi Code Plan, and Z.AI GLM Coding Plan account allowances or balances through Hermes-resolved credentials.
 - Chronological, paginated session trace for active user, assistant, reasoning, tool-call, and tool-result rows; system prompts excluded.
 - Conservative session outcomes that preserve Hermes' recorded end reason.
 - Cached local-log telemetry for latency, cache efficiency, and tool duration.
@@ -59,7 +58,7 @@ The plugin appears in Hermes Desktop's left sidebar as **Session Lens** and open
 - Hermes Agent v0.20.5 database schema v26, verified on Windows on 2026-08-23.
 - Installed Hermes Desktop Plugin SDK and bundled `hermes-desktop-plugins` instructions.
 - Hermes `sessions`, `messages`, `session_model_usage`, FTS, and `async_delegations` tables.
-- TokenTelemetry and Hermes Session Analyzer are product-behavior references; Hermes LLM Quota Monitor informs the experimental Grok adapter. Compatibility claims remain bounded to verified Hermes versions and provider responses.
+- TokenTelemetry and Hermes Session Analyzer are product-behavior references; Hermes LLM Quota Monitor informs the Grok OAuth adapter. Compatibility claims remain bounded to verified Hermes versions and provider responses.
 
 ## Product Principles
 

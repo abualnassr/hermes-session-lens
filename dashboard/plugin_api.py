@@ -37,7 +37,7 @@ except ImportError:  # pragma: no cover - makes isolated editor/test imports cle
 
 router = APIRouter()
 
-PLUGIN_VERSION = "0.5.0"
+PLUGIN_VERSION = "0.5.1"
 MAX_SESSION_PAGE = 500
 MAX_ANALYSIS_EVENTS = 5000
 MAX_SEARCH_MATCHES = 2000
@@ -1892,14 +1892,14 @@ async def kanban() -> Dict[str, Any]:
 
 
 _AI_USAGE_PROVIDER_META = {
-    "codex": {"label": "OpenAI Codex", "auth_source": "Hermes OAuth", "experimental": False},
-    "anthropic": {"label": "Anthropic Claude", "auth_source": "Hermes OAuth", "experimental": False},
-    "nous": {"label": "Nous Research Portal", "auth_source": "Hermes OAuth", "experimental": False},
-    "openrouter": {"label": "OpenRouter", "auth_source": "Hermes API key", "experimental": False},
-    "deepseek": {"label": "DeepSeek", "auth_source": "Hermes API key", "experimental": False},
-    "grok": {"label": "Grok", "auth_source": "Hermes xAI OAuth", "experimental": True},
-    "kimi": {"label": "Kimi Code Plan", "auth_source": "Hermes API key", "experimental": True},
-    "zai": {"label": "Z.AI GLM Coding Plan", "auth_source": "Hermes API key", "experimental": True},
+    "codex": {"label": "OpenAI Codex", "auth_source": "Hermes OAuth"},
+    "anthropic": {"label": "Anthropic Claude", "auth_source": "Hermes OAuth"},
+    "nous": {"label": "Nous Research Portal", "auth_source": "Hermes OAuth"},
+    "openrouter": {"label": "OpenRouter", "auth_source": "Hermes API key"},
+    "deepseek": {"label": "DeepSeek", "auth_source": "Hermes API key"},
+    "grok": {"label": "Grok", "auth_source": "Hermes xAI OAuth"},
+    "kimi": {"label": "Kimi Code Plan", "auth_source": "Hermes API key"},
+    "zai": {"label": "Z.AI GLM Coding Plan", "auth_source": "Hermes API key"},
 }
 _AI_USAGE_PROVIDER_ORDER = tuple(_AI_USAGE_PROVIDER_META)
 
@@ -1971,7 +1971,6 @@ def _provider_payload(
         "label": meta["label"],
         "status": status,
         "auth_source": meta["auth_source"],
-        "experimental": meta["experimental"],
         "plan": _clean_text(plan, 120) or None,
         "windows": windows or [],
         "details": [_clean_text(item, 320) for item in (details or []) if _clean_text(item, 320)],
@@ -2322,7 +2321,7 @@ def _kimi_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
                 )
             )
 
-    details = ["Experimental Kimi usage surface; response compatibility may change."]
+    details = []
     parallel = payload.get("parallel")
     if isinstance(parallel, Mapping):
         limit = _usage_number(parallel.get("limit"))
@@ -2436,7 +2435,6 @@ def _zai_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
         "zai",
         status="ok",
         windows=windows,
-        details=["Experimental Z.AI monitoring surface; response compatibility may change."],
     )
 
 
