@@ -31,7 +31,8 @@ The plugin appears in Hermes Desktop's left sidebar as **Session Lens** and open
 - Native route `/session-lens` and `SIDEBAR_NAV_AREA` contribution; no iframe or standalone web server.
 - Session list and detail views for tokens, cost, model, provider, tools, skills, failures, files, and delegations.
 - Overview, Operations, Tools, Skills, System, and AI Usage views.
-- Current Codex, Grok, Nous Portal, and OpenRouter account allowances and balances through Hermes-resolved credentials; Grok is explicitly experimental.
+- Current Codex, Anthropic Claude, Nous Portal, OpenRouter, and DeepSeek account allowances or balances through Hermes-resolved credentials.
+- Grok, Kimi Code Plan, and Z.AI GLM Coding Plan quota adapters are explicitly experimental and visually separated from supported sources.
 - Chronological, paginated session trace for active user, assistant, reasoning, tool-call, and tool-result rows; system prompts excluded.
 - Conservative session outcomes that preserve Hermes' recorded end reason.
 - Cached local-log telemetry for latency, cache efficiency, and tool duration.

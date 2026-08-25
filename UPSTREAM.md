@@ -8,5 +8,7 @@ Its product behavior was informed by:
 - [Hermes Session Analyzer](https://github.com/tomatyss/session-analyzer), by Tom Mulkins, MIT licensed — native session inspection, failure-first workflows, file summaries, FTS search, pagination, and Ask AI behavior.
 - [Hermes Agent](https://github.com/NousResearch/hermes-agent), by Nous Research and contributors, MIT licensed — plugin API, database schema, UI components, accounting semantics, and skills telemetry conventions.
 - [Hermes LLM Quota Monitor](https://github.com/bnogalski/hermes-llm-quota), by Bartosz Nogalski, MIT licensed — behavior and response-shape reference for the experimental Grok OAuth billing adapter.
+- [CodexBar](https://github.com/steipete/CodexBar), by Peter Steinberger and contributors, MIT licensed — Kimi Code Plan response-shape and rolling-window behavior reference.
+- [Agentic Usage Meter](https://github.com/prime-radiant-inc/agentic-usage-meter), by Prime Radiant — provider-qualification reference for the experimental Kimi and Z.AI quota surfaces.
 
 No upstream logo is reused, and this project does not imply endorsement by any upstream author or Nous Research. Source code should carry file-level notices if a future change copies or substantially adapts an upstream implementation.

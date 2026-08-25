@@ -1678,9 +1678,13 @@ function OperationsView({ ctx, period }) {
 
 const usageProviderIcons = {
   codex: 'terminal',
+  anthropic: 'comment-discussion',
+  deepseek: 'search',
   grok: 'sparkle',
+  kimi: 'sparkle',
   nous: 'beaker',
-  openrouter: 'globe'
+  openrouter: 'globe',
+  zai: 'pulse'
 }
 
 function usageStatus(provider) {
@@ -1688,7 +1692,10 @@ function usageStatus(provider) {
   if (status === 'ok') return { label: 'Connected', tone: 'accent', icon: 'pass' }
   if (status === 'stale') return { label: 'Last known', tone: 'neutral', icon: 'history' }
   if (status === 'not_configured') return { label: 'Not configured', tone: 'neutral', icon: 'circle-slash' }
-  if (status === 'expired') return { label: 'Login expired', tone: 'danger', icon: 'key' }
+  if (status === 'expired') {
+    const oauth = String(provider?.auth_source || '').toLowerCase().includes('oauth')
+    return { label: oauth ? 'Login expired' : 'Key rejected', tone: 'danger', icon: 'key' }
+  }
   if (status === 'forbidden') return { label: 'Access denied', tone: 'danger', icon: 'lock' }
   return { label: 'Unavailable', tone: 'danger', icon: 'warning' }
 }
@@ -1696,11 +1703,14 @@ function usageStatus(provider) {
 function formatUsageAmount(value, unit) {
   if (value === null || value === undefined || !Number.isFinite(Number(value))) return null
   const amount = Number(value)
-  if (String(unit || '').toUpperCase() === 'USD') {
-    return new Intl.NumberFormat(undefined, { style: 'currency', currency: 'USD', maximumFractionDigits: 2 }).format(amount)
+  const normalisedUnit = String(unit || '')
+  const currency = normalisedUnit.toUpperCase()
+  if (['USD', 'CNY'].includes(currency)) {
+    return new Intl.NumberFormat(undefined, { style: 'currency', currency, maximumFractionDigits: 2 }).format(amount)
   }
   if (unit === 'credits') return `${amount.toLocaleString(undefined, { maximumFractionDigits: 2 })} credits`
-  return amount.toLocaleString(undefined, { maximumFractionDigits: 2 })
+  const formatted = amount.toLocaleString(undefined, { maximumFractionDigits: 2 })
+  return normalisedUnit ? `${formatted} ${normalisedUnit}` : formatted
 }
 
 function UsageWindow({ window }) {
@@ -1776,8 +1786,8 @@ function UsageProvider({ provider }) {
               jsxs('div', {
                 style: { minWidth: 0 },
                 children: [
-                  jsx('h3', {
-                    style: { color: color.primary, fontSize: '0.875rem', fontWeight: 650, lineHeight: 1.35, margin: 0 },
+                  jsx('h4', {
+                    style: { color: color.primary, fontSize: '0.75rem', fontWeight: 650, lineHeight: 1.35, margin: 0 },
                     children: provider.label
                   }),
                   jsx('div', {
@@ -1841,6 +1851,33 @@ function UsageProvider({ provider }) {
   })
 }
 
+function UsageProviderGroup({ title, description, providers, narrow, id }) {
+  if (!providers.length) return null
+  return jsxs('section', {
+    'aria-labelledby': id,
+    style: { display: 'grid', gap: '0.65rem' },
+    children: [
+      jsxs('div', {
+        children: [
+          jsx('h3', {
+            id,
+            style: { color: color.primary, fontSize: '0.9375rem', fontWeight: 650, lineHeight: 1.35, margin: 0 },
+            children: title
+          }),
+          jsx('p', {
+            style: { color: color.tertiary, fontSize: '0.6875rem', lineHeight: 1.5, margin: '0.15rem 0 0' },
+            children: description
+          })
+        ]
+      }),
+      jsx('div', {
+        style: { display: 'grid', gap: '0.85rem', gridTemplateColumns: narrow ? 'minmax(0, 1fr)' : 'repeat(2, minmax(0, 1fr))' },
+        children: providers.map(provider => jsx(UsageProvider, { provider }, provider.provider))
+      })
+    ]
+  })
+}
+
 function AIUsageStatStrip({ data }) {
   const summary = data?.summary || {}
   return jsx('div', {
@@ -1881,6 +1918,9 @@ function AIUsageView({ query, narrow, refreshError }) {
   if (query.isLoading) return jsx(LoadingBlock, { rows: 8 })
   if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'AI usage is unavailable' })
   const data = query.data
+  const providers = data?.providers || []
+  const supportedProviders = providers.filter(provider => !provider.experimental)
+  const experimentalProviders = providers.filter(provider => provider.experimental)
   return jsx('div', {
     style: { flex: 1, minHeight: 0, overflow: 'auto', padding: '1rem' },
     children: jsxs('div', {
@@ -1897,9 +1937,19 @@ function AIUsageView({ query, narrow, refreshError }) {
               children: `Manual refresh failed: ${refreshError}`
             })
           : null,
-        jsx('div', {
-          style: { display: 'grid', gap: '0.85rem', gridTemplateColumns: narrow ? 'minmax(0, 1fr)' : 'repeat(2, minmax(0, 1fr))' },
-          children: (data?.providers || []).map(provider => jsx(UsageProvider, { provider }, provider.provider))
+        jsx(UsageProviderGroup, {
+          id: 'supported-ai-usage',
+          title: 'Supported providers',
+          description: 'Provider-supported account limits and balances resolved through Hermes credentials.',
+          providers: supportedProviders,
+          narrow
+        }),
+        jsx(UsageProviderGroup, {
+          id: 'experimental-ai-usage',
+          title: 'Experimental providers',
+          description: 'Private or evolving quota surfaces. Values are live when available, but response compatibility may change.',
+          providers: experimentalProviders,
+          narrow
         }),
         jsxs('div', {
           style: { alignItems: 'flex-start', borderTop: border, color: color.tertiary, display: 'flex', fontSize: '0.6875rem', gap: '0.5rem', lineHeight: 1.5, paddingTop: '0.75rem' },

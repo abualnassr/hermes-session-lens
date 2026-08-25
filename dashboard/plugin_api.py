@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import datetime as dt
+import hashlib
 import json
 import math
 import os
@@ -36,7 +37,7 @@ except ImportError:  # pragma: no cover - makes isolated editor/test imports cle
 
 router = APIRouter()
 
-PLUGIN_VERSION = "0.4.0"
+PLUGIN_VERSION = "0.5.0"
 MAX_SESSION_PAGE = 500
 MAX_ANALYSIS_EVENTS = 5000
 MAX_SEARCH_MATCHES = 2000
@@ -1892,9 +1893,13 @@ async def kanban() -> Dict[str, Any]:
 
 _AI_USAGE_PROVIDER_META = {
     "codex": {"label": "OpenAI Codex", "auth_source": "Hermes OAuth", "experimental": False},
-    "grok": {"label": "Grok", "auth_source": "Hermes xAI OAuth", "experimental": True},
+    "anthropic": {"label": "Anthropic Claude", "auth_source": "Hermes OAuth", "experimental": False},
     "nous": {"label": "Nous Research Portal", "auth_source": "Hermes OAuth", "experimental": False},
     "openrouter": {"label": "OpenRouter", "auth_source": "Hermes API key", "experimental": False},
+    "deepseek": {"label": "DeepSeek", "auth_source": "Hermes API key", "experimental": False},
+    "grok": {"label": "Grok", "auth_source": "Hermes xAI OAuth", "experimental": True},
+    "kimi": {"label": "Kimi Code Plan", "auth_source": "Hermes API key", "experimental": True},
+    "zai": {"label": "Z.AI GLM Coding Plan", "auth_source": "Hermes API key", "experimental": True},
 }
 _AI_USAGE_PROVIDER_ORDER = tuple(_AI_USAGE_PROVIDER_META)
 
@@ -1922,11 +1927,24 @@ def _usage_iso(value: Any) -> Optional[str]:
         return moment.isoformat()
     if isinstance(value, (int, float)) and not isinstance(value, bool):
         try:
-            return dt.datetime.fromtimestamp(float(value), tz=dt.timezone.utc).isoformat()
+            timestamp = float(value)
+            if abs(timestamp) >= 10_000_000_000:
+                timestamp /= 1000.0
+            return dt.datetime.fromtimestamp(timestamp, tz=dt.timezone.utc).isoformat()
         except (OSError, OverflowError, ValueError):
             return None
     text = _clean_text(value, 120)
-    return text or None
+    if not text:
+        return None
+    if re.fullmatch(r"-?\d+(?:\.\d+)?", text):
+        return _usage_iso(float(text))
+    try:
+        moment = dt.datetime.fromisoformat(text.replace("Z", "+00:00"))
+        if moment.tzinfo is None:
+            moment = moment.replace(tzinfo=dt.timezone.utc)
+        return moment.isoformat()
+    except ValueError:
+        return text
 
 
 def _provider_message(error: BaseException) -> str:
@@ -2040,6 +2058,432 @@ def _collect_codex_usage() -> Dict[str, Any]:
         return _account_usage_payload("codex", fetch_account_usage("openai-codex"))
     except Exception as error:
         return _provider_payload("codex", status="unavailable", message=_provider_message(error))
+
+
+def _collect_anthropic_usage() -> Dict[str, Any]:
+    token = ""
+    try:
+        from agent.account_usage import fetch_account_usage
+        from agent.anthropic_adapter import _is_oauth_token, resolve_anthropic_token
+
+        token = str(resolve_anthropic_token() or "").strip()
+        if not token:
+            return _provider_payload(
+                "anthropic",
+                status="not_configured",
+                message="No Hermes Anthropic OAuth login was found.",
+            )
+        if not _is_oauth_token(token):
+            return _provider_payload(
+                "anthropic",
+                status="not_configured",
+                message="Anthropic account limits require an OAuth-backed Claude account, not an API key.",
+            )
+        snapshot = fetch_account_usage("anthropic")
+        if snapshot is None:
+            return _provider_payload(
+                "anthropic",
+                status="unavailable",
+                message="Anthropic did not return account-usage data for the current OAuth login.",
+            )
+        return _account_usage_payload("anthropic", snapshot)
+    except Exception as error:
+        return _provider_payload("anthropic", status="unavailable", message=_provider_message(error))
+    finally:
+        token = ""
+
+
+def _resolve_hermes_api_key(provider_id: str) -> Tuple[str, str]:
+    """Resolve a configured provider key without triggering inference probes."""
+    from hermes_cli import auth as hermes_auth
+
+    pconfig = hermes_auth.PROVIDER_REGISTRY.get(provider_id)
+    secret_resolver = getattr(hermes_auth, "_resolve_api_key_provider_secret", None)
+    if pconfig is None or not callable(secret_resolver):
+        raise RuntimeError("This Hermes version does not expose safe API-key resolution.")
+    token, _source = secret_resolver(provider_id, pconfig)
+    status = hermes_auth.get_api_key_provider_status(provider_id)
+    base_url = str(status.get("base_url") or pconfig.inference_base_url or "").strip().rstrip("/")
+
+    # Hermes' public Z.AI runtime resolver may issue model-completion probes.
+    # Reuse its cached endpoint decision when present, but never trigger a probe
+    # from this read-only usage surface.
+    if provider_id == "zai" and token:
+        try:
+            auth_store = hermes_auth._load_auth_store()
+            state = hermes_auth._load_provider_state(auth_store, "zai") or {}
+            detected = state.get("detected_endpoint") or {}
+            expected_hash = hashlib.sha256(str(token).encode()).hexdigest()[:16]
+            if detected.get("key_hash") == expected_hash and detected.get("base_url"):
+                base_url = str(detected["base_url"]).strip().rstrip("/")
+        except Exception:
+            pass
+    return str(token or "").strip(), base_url
+
+
+def _usage_field(values: Mapping[str, Any], *keys: str) -> Optional[float]:
+    for key in keys:
+        if key in values:
+            number = _usage_number(values.get(key))
+            if number is not None:
+                return number
+    return None
+
+
+def _amount_quota_window(
+    label: str,
+    values: Mapping[str, Any],
+    *,
+    unit: str,
+    limit_keys: Tuple[str, ...] = ("limit",),
+    used_keys: Tuple[str, ...] = ("used",),
+    remaining_keys: Tuple[str, ...] = ("remaining",),
+    percent_keys: Tuple[str, ...] = ("percentage", "usedPercent", "used_percent"),
+    reset_keys: Tuple[str, ...] = ("resetTime", "reset_at", "resets_at", "nextResetTime"),
+    detail: Optional[str] = None,
+) -> Optional[Dict[str, Any]]:
+    limit = _usage_field(values, *limit_keys)
+    used = _usage_field(values, *used_keys)
+    remaining = _usage_field(values, *remaining_keys)
+    if used is None and limit is not None and remaining is not None:
+        used = max(0.0, limit - remaining)
+    if remaining is None and limit is not None and used is not None:
+        remaining = max(0.0, limit - used)
+    used_percent = _usage_field(values, *percent_keys)
+    if used_percent is None and limit is not None and limit > 0 and used is not None:
+        used_percent = (used / limit) * 100.0
+    if used_percent is None and limit is None and used is None and remaining is None:
+        return None
+    reset_at = next((values.get(key) for key in reset_keys if values.get(key) not in (None, "")), None)
+    return _usage_window(
+        label,
+        used_percent=used_percent,
+        reset_at=reset_at,
+        detail=detail,
+        limit=limit,
+        used=used,
+        remaining=remaining,
+        unit=unit,
+    )
+
+
+def _deepseek_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    windows: List[Dict[str, Any]] = []
+    balances = payload.get("balance_infos")
+    if isinstance(balances, list):
+        for raw in balances:
+            if not isinstance(raw, Mapping):
+                continue
+            currency = (_clean_text(raw.get("currency"), 12) or "USD").upper()
+            total = _usage_number(raw.get("total_balance"))
+            if total is None:
+                continue
+            breakdown = []
+            granted = _usage_number(raw.get("granted_balance"))
+            topped_up = _usage_number(raw.get("topped_up_balance"))
+            if granted is not None:
+                breakdown.append(f"{granted:,.2f} {currency} granted")
+            if topped_up is not None:
+                breakdown.append(f"{topped_up:,.2f} {currency} topped up")
+            windows.append(
+                _usage_window(
+                    f"{currency} balance",
+                    kind="balance",
+                    remaining=total,
+                    unit=currency,
+                    detail=" · ".join(breakdown) or None,
+                )
+            )
+    if not windows:
+        return _provider_payload(
+            "deepseek",
+            status="unavailable",
+            message="DeepSeek returned no recognized balance fields.",
+        )
+    available = payload.get("is_available")
+    return _provider_payload(
+        "deepseek",
+        status="ok",
+        windows=windows,
+        message="DeepSeek reports insufficient balance for API calls." if available is False else None,
+    )
+
+
+def _collect_deepseek_usage() -> Dict[str, Any]:
+    token = ""
+    headers: Dict[str, str] = {}
+    try:
+        token, base_url = _resolve_hermes_api_key("deepseek")
+        if not token:
+            return _provider_payload(
+                "deepseek", status="not_configured", message="No Hermes DeepSeek API key was found."
+            )
+        parsed = urlparse(base_url)
+        if parsed.scheme != "https" or (parsed.hostname or "").lower() != "api.deepseek.com":
+            return _provider_payload(
+                "deepseek",
+                status="unavailable",
+                message="Balance checks require the official https://api.deepseek.com endpoint.",
+            )
+        import httpx
+
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        response = httpx.get(
+            "https://api.deepseek.com/user/balance",
+            headers=headers,
+            timeout=AI_USAGE_PROVIDER_TIMEOUT_SECONDS,
+        )
+        if response.status_code == 401:
+            return _provider_payload("deepseek", status="expired", message="DeepSeek rejected the configured API key.")
+        if response.status_code == 403:
+            return _provider_payload("deepseek", status="forbidden", message="DeepSeek denied balance access.")
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, Mapping):
+            return _provider_payload("deepseek", status="unavailable", message="DeepSeek returned an invalid response.")
+        return _deepseek_payload(payload)
+    except ImportError:
+        return _provider_payload("deepseek", status="unavailable", message="Hermes HTTP client is unavailable.")
+    except Exception as error:
+        return _provider_payload("deepseek", status="unavailable", message=_provider_message(error))
+    finally:
+        token = ""
+        headers.clear()
+
+
+def _kimi_plan_label(payload: Mapping[str, Any]) -> Optional[str]:
+    user = payload.get("user")
+    membership = user.get("membership") if isinstance(user, Mapping) else None
+    raw = membership.get("level") if isinstance(membership, Mapping) else None
+    label = _clean_text(raw, 80)
+    if not label:
+        return None
+    label = re.sub(r"^LEVEL_", "", label, flags=re.IGNORECASE)
+    return label.replace("_", " ").strip().title() or None
+
+
+def _kimi_window_label(raw: Mapping[str, Any], index: int) -> str:
+    name = _clean_text(raw.get("name"), 80)
+    if name:
+        return name
+    window = raw.get("window")
+    if isinstance(window, Mapping):
+        duration = _usage_number(window.get("duration"))
+        unit = _clean_text(window.get("timeUnit") or window.get("unit"), 40).upper()
+        if duration == 300 and "MINUTE" in unit:
+            return "5-hour rolling"
+        if duration == 5 and "HOUR" in unit:
+            return "5-hour rolling"
+        if (duration == 7 and "DAY" in unit) or (duration == 1 and "WEEK" in unit):
+            return "Weekly quota"
+        if duration is not None and unit:
+            readable_unit = unit.replace("TIME_UNIT_", "").replace("_", " ").lower()
+            return f"{duration:g}-{readable_unit} window"
+    return f"Quota window {index + 1}"
+
+
+def _kimi_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    windows: List[Dict[str, Any]] = []
+    weekly = payload.get("usage") or payload.get("summary")
+    if isinstance(weekly, Mapping):
+        window = _amount_quota_window("Weekly quota", weekly, unit="requests")
+        if window:
+            windows.append(window)
+
+    limits = payload.get("limits")
+    if isinstance(limits, list):
+        for index, raw in enumerate(limits):
+            if not isinstance(raw, Mapping):
+                continue
+            detail = raw.get("detail") if isinstance(raw.get("detail"), Mapping) else raw
+            window = _amount_quota_window(
+                _kimi_window_label(raw, index),
+                detail,
+                unit="requests",
+            )
+            if window and not any(
+                existing["label"] == window["label"]
+                and existing.get("reset_at") == window.get("reset_at")
+                for existing in windows
+            ):
+                windows.append(window)
+
+    extra = payload.get("extra_usage") or payload.get("extraUsage")
+    if isinstance(extra, Mapping):
+        balance_cents = _usage_number(_usage_field(extra, "balance_cents", "balanceCents"))
+        if balance_cents is not None:
+            currency = (_clean_text(extra.get("currency"), 12) or "USD").upper()
+            windows.append(
+                _usage_window(
+                    "Extra usage balance",
+                    kind="balance",
+                    remaining=balance_cents / 100.0,
+                    unit=currency,
+                )
+            )
+
+    details = ["Experimental Kimi usage surface; response compatibility may change."]
+    parallel = payload.get("parallel")
+    if isinstance(parallel, Mapping):
+        limit = _usage_number(parallel.get("limit"))
+        if limit is not None:
+            details.insert(0, f"Maximum parallel requests: {limit:g}")
+    if not windows:
+        return _provider_payload(
+            "kimi",
+            status="unavailable",
+            message="Kimi returned no recognized quota windows.",
+        )
+    return _provider_payload(
+        "kimi",
+        status="ok",
+        plan=_kimi_plan_label(payload),
+        windows=windows,
+        details=details,
+    )
+
+
+def _collect_kimi_usage() -> Dict[str, Any]:
+    token = ""
+    headers: Dict[str, str] = {}
+    try:
+        token, base_url = _resolve_hermes_api_key("kimi-coding")
+        if not token:
+            return _provider_payload(
+                "kimi", status="not_configured", message="No Hermes Kimi Code Plan API key was found."
+            )
+        parsed = urlparse(base_url)
+        if parsed.scheme != "https" or (parsed.hostname or "").lower() != "api.kimi.com":
+            return _provider_payload(
+                "kimi",
+                status="not_configured",
+                message="Kimi usage requires a Kimi Code Plan key configured for https://api.kimi.com.",
+            )
+        import httpx
+
+        headers = {"Authorization": f"Bearer {token}", "Accept": "application/json"}
+        response = httpx.get(
+            "https://api.kimi.com/coding/v1/usages",
+            headers=headers,
+            timeout=AI_USAGE_PROVIDER_TIMEOUT_SECONDS,
+        )
+        if response.status_code == 401:
+            return _provider_payload("kimi", status="expired", message="Kimi rejected the configured Code Plan key.")
+        if response.status_code == 403:
+            return _provider_payload("kimi", status="forbidden", message="Kimi denied access to Code Plan usage.")
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, Mapping):
+            return _provider_payload("kimi", status="unavailable", message="Kimi returned an invalid response.")
+        return _kimi_payload(payload)
+    except ImportError:
+        return _provider_payload("kimi", status="unavailable", message="Hermes HTTP client is unavailable.")
+    except Exception as error:
+        return _provider_payload("kimi", status="unavailable", message=_provider_message(error))
+    finally:
+        token = ""
+        headers.clear()
+
+
+def _zai_limits(payload: Mapping[str, Any]) -> List[Mapping[str, Any]]:
+    candidates: List[Any] = [payload, payload.get("data")]
+    data = payload.get("data")
+    if isinstance(data, list):
+        candidates.extend(data)
+    for candidate in candidates:
+        if not isinstance(candidate, Mapping):
+            continue
+        limits = candidate.get("limits")
+        if isinstance(limits, list):
+            return [item for item in limits if isinstance(item, Mapping)]
+    return []
+
+
+def _zai_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
+    code = _usage_number(payload.get("code"))
+    if code is not None and code != 200:
+        return _provider_payload(
+            "zai", status="unavailable", message=f"Z.AI usage service returned code {code:g}."
+        )
+    windows: List[Dict[str, Any]] = []
+    for raw in _zai_limits(payload):
+        if str(raw.get("type") or "").upper() != "TOKENS_LIMIT":
+            continue
+        unit = _usage_number(raw.get("unit"))
+        number = _usage_number(raw.get("number"))
+        if unit == 3 and number == 5:
+            label = "5-hour rolling"
+        elif unit == 6 and number == 1:
+            label = "Weekly quota"
+        else:
+            continue
+        window = _amount_quota_window(
+            label,
+            raw,
+            unit="tokens",
+            limit_keys=("usage", "limit"),
+            used_keys=("currentValue", "used"),
+        )
+        if window:
+            windows.append(window)
+    if not windows:
+        return _provider_payload(
+            "zai",
+            status="unavailable",
+            message="Z.AI returned no recognized five-hour or weekly token windows.",
+        )
+    return _provider_payload(
+        "zai",
+        status="ok",
+        windows=windows,
+        details=["Experimental Z.AI monitoring surface; response compatibility may change."],
+    )
+
+
+def _collect_zai_usage() -> Dict[str, Any]:
+    token = ""
+    headers: Dict[str, str] = {}
+    try:
+        token, base_url = _resolve_hermes_api_key("zai")
+        if not token:
+            return _provider_payload(
+                "zai", status="not_configured", message="No Hermes Z.AI API key was found."
+            )
+        parsed = urlparse(base_url)
+        if parsed.scheme != "https" or (parsed.hostname or "").lower() != "api.z.ai":
+            return _provider_payload(
+                "zai",
+                status="not_configured",
+                message="Session Lens currently supports only international Z.AI Coding Plan keys on api.z.ai.",
+            )
+        import httpx
+
+        url = "https://api.z.ai/api/monitor/usage/quota/limit"
+        response = None
+        with httpx.Client(timeout=AI_USAGE_PROVIDER_TIMEOUT_SECONDS) as client:
+            for authorization in (token, f"Bearer {token}"):
+                headers = {"Authorization": authorization, "Accept": "application/json"}
+                response = client.get(url, headers=headers)
+                if response.status_code not in {401, 403}:
+                    break
+        if response is None:
+            return _provider_payload("zai", status="unavailable", message="Z.AI usage did not return a response.")
+        if response.status_code == 401:
+            return _provider_payload("zai", status="expired", message="Z.AI rejected the configured API key.")
+        if response.status_code == 403:
+            return _provider_payload("zai", status="forbidden", message="Z.AI denied access to Coding Plan usage.")
+        response.raise_for_status()
+        payload = response.json()
+        if not isinstance(payload, Mapping):
+            return _provider_payload("zai", status="unavailable", message="Z.AI returned an invalid response.")
+        return _zai_payload(payload)
+    except ImportError:
+        return _provider_payload("zai", status="unavailable", message="Hermes HTTP client is unavailable.")
+    except Exception as error:
+        return _provider_payload("zai", status="unavailable", message=_provider_message(error))
+    finally:
+        token = ""
+        headers.clear()
 
 
 def _grok_windows_from_payloads(
@@ -2359,9 +2803,13 @@ def _ai_usage_sync(fresh: bool = False) -> Dict[str, Any]:
 
     collectors = {
         "codex": _collect_codex_usage,
-        "grok": _collect_grok_usage,
+        "anthropic": _collect_anthropic_usage,
         "nous": _collect_nous_usage,
         "openrouter": _collect_openrouter_usage,
+        "deepseek": _collect_deepseek_usage,
+        "grok": _collect_grok_usage,
+        "kimi": _collect_kimi_usage,
+        "zai": _collect_zai_usage,
     }
     results: Dict[str, Dict[str, Any]] = {}
     with ThreadPoolExecutor(max_workers=len(collectors), thread_name_prefix="session-lens-usage") as pool:

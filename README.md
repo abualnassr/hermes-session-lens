@@ -22,8 +22,9 @@ It is a unified Hermes plugin—one install contains the native Desktop page and
 - Schedule status, next/last run, delivery errors, and failure streaks without exposing schedule prompts.
 - Shared Kanban task and run status with bounded failure evidence.
 - Overview, Operations, Tools, Skills, System, and AI Usage views.
-- Live account-level usage for OpenAI Codex, Grok, Nous Research Portal, and OpenRouter using credentials already configured in Hermes.
-- Five-minute in-memory provider cache, explicit partial/stale states, and a manual fresh refresh. Grok is labelled experimental because its billing surface is private and may change.
+- Live account-level usage for OpenAI Codex, Anthropic Claude, Nous Research Portal, OpenRouter, and DeepSeek using credentials already configured in Hermes.
+- Experimental quota adapters for Grok, Kimi Code Plan, and Z.AI GLM Coding Plan, clearly separated from supported provider sources.
+- Five-minute in-memory provider cache, explicit partial/stale states, and a manual fresh refresh. Experimental providers are labelled because their private or evolving usage surfaces may change.
 - Ask Lens: builds a grounded analysis prompt locally, copies it, and opens a new Hermes chat.
 - Failure-first, recent, cost, token, and tool-call sorting; pagination grows to a 500-session safety limit.
 - Click-to-sort headers on every evidence table, with visible direction and keyboard-accessible controls.
@@ -76,8 +77,9 @@ Hermes Agent updates do not remove this plugin because it lives under `$HERMES_H
 - Schedule and system prompts are never returned by the API.
 - Runtime logs are parsed locally with per-file memory caching; no new cache file is written.
 - Session content, prompts, and local telemetry are never sent to a third-party analytics service.
-- The AI Usage tab makes direct authenticated quota requests only to OpenAI, xAI, Nous Research, and OpenRouter. Credentials remain in the Python backend and are never returned to the Desktop plugin.
-- Provider checks do not read browser cookies. Grok reuses Hermes `xai-oauth`; no Grok CLI is required.
+- The AI Usage tab makes direct authenticated quota requests only to OpenAI, Anthropic, xAI, Nous Research, OpenRouter, DeepSeek, Kimi, and Z.AI. Credentials remain in the Python backend and are never returned to the Desktop plugin.
+- Provider checks do not read browser cookies. Anthropic reuses Hermes OAuth, Grok reuses Hermes `xai-oauth`, and Kimi/Z.AI reuse Hermes API keys; no provider CLI needs to remain running.
+- Usage checks accept provider credentials only when Hermes resolves them for the official provider host. Z.AI credential resolution deliberately avoids Hermes inference probes.
 - Ask Lens copies a locally generated prompt; the user decides whether to paste and submit it in Hermes.
 
 Failure detection combines Hermes' recorded finish/effect states with conservative signatures in tool results. The evidence is shown so users can verify it. File paths are observed evidence, not a guaranteed audit of every filesystem operation.

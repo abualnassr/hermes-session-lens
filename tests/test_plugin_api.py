@@ -471,6 +471,94 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertEqual(payload["windows"][0]["percentage_remaining"], 74.5)
         self.assertIn("$25.50 this month", payload["details"][0])
 
+    def test_deepseek_balance_keeps_currency_and_breakdown(self):
+        payload = api._deepseek_payload(
+            {
+                "is_available": True,
+                "balance_infos": [
+                    {
+                        "currency": "CNY",
+                        "total_balance": "110.00",
+                        "granted_balance": "10.00",
+                        "topped_up_balance": "100.00",
+                    }
+                ],
+            }
+        )
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["windows"][0]["remaining"], 110.0)
+        self.assertEqual(payload["windows"][0]["unit"], "CNY")
+        self.assertIn("10.00 CNY granted", payload["windows"][0]["detail"])
+
+    def test_kimi_maps_weekly_rolling_and_parallel_limits(self):
+        payload = api._kimi_payload(
+            {
+                "user": {"membership": {"level": "LEVEL_ADVANCED"}},
+                "usage": {
+                    "limit": "2048",
+                    "used": "214",
+                    "remaining": "1834",
+                    "resetTime": "2027-01-09T15:23:13.716839300Z",
+                },
+                "limits": [
+                    {
+                        "window": {"duration": 300, "timeUnit": "TIME_UNIT_MINUTE"},
+                        "detail": {
+                            "limit": "200",
+                            "used": "139",
+                            "remaining": "61",
+                            "resetTime": "2027-01-06T13:33:02.717479433Z",
+                        },
+                    }
+                ],
+                "parallel": {"limit": 20},
+            }
+        )
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(payload["plan"], "Advanced")
+        self.assertEqual([item["label"] for item in payload["windows"]], ["Weekly quota", "5-hour rolling"])
+        self.assertAlmostEqual(payload["windows"][1]["percentage_remaining"], 30.5)
+        self.assertIn("Maximum parallel requests: 20", payload["details"])
+        self.assertTrue(payload["windows"][0]["reset_at"].endswith("+00:00"))
+
+    def test_zai_maps_only_five_hour_and_weekly_token_windows(self):
+        payload = api._zai_payload(
+            {
+                "code": 200,
+                "success": True,
+                "data": {
+                    "limits": [
+                        {
+                            "type": "TOKENS_LIMIT",
+                            "unit": 3,
+                            "number": 5,
+                            "usage": 800_000_000,
+                            "currentValue": 120_000_000,
+                            "remaining": 680_000_000,
+                            "percentage": 15,
+                            "nextResetTime": 1_800_000_000_000,
+                        },
+                        {
+                            "type": "TOKENS_LIMIT",
+                            "unit": 6,
+                            "number": 1,
+                            "usage": 1_000_000_000,
+                            "currentValue": 420_000_000,
+                            "remaining": 580_000_000,
+                            "percentage": 42,
+                            "nextResetTime": 1_800_500_000_000,
+                        },
+                        {"type": "TIME_LIMIT", "unit": 5, "number": 1, "usage": 4000},
+                    ]
+                },
+            }
+        )
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual([item["label"] for item in payload["windows"]], ["5-hour rolling", "Weekly quota"])
+        self.assertEqual(payload["windows"][0]["percentage_remaining"], 85.0)
+        self.assertEqual(payload["windows"][0]["unit"], "tokens")
+        self.assertIn("2027", payload["windows"][0]["reset_at"])
+
     def test_ai_usage_cache_preserves_last_success_as_stale(self):
         def ok(provider):
             return api._provider_payload(
@@ -481,27 +569,35 @@ class SessionLensApiTests(unittest.TestCase):
 
         first = {
             "_collect_codex_usage": Mock(return_value=ok("codex")),
-            "_collect_grok_usage": Mock(return_value=ok("grok")),
+            "_collect_anthropic_usage": Mock(return_value=ok("anthropic")),
             "_collect_nous_usage": Mock(return_value=ok("nous")),
             "_collect_openrouter_usage": Mock(return_value=ok("openrouter")),
+            "_collect_deepseek_usage": Mock(return_value=ok("deepseek")),
+            "_collect_grok_usage": Mock(return_value=ok("grok")),
+            "_collect_kimi_usage": Mock(return_value=ok("kimi")),
+            "_collect_zai_usage": Mock(return_value=ok("zai")),
         }
         with patch.multiple(api, **first):
             fresh = api._ai_usage_sync(True)
             cached = api._ai_usage_sync(False)
-        self.assertEqual(fresh["summary"]["connected"], 4)
+        self.assertEqual(fresh["summary"]["connected"], 8)
         self.assertTrue(cached["cached"])
         for collector in first.values():
             collector.assert_called_once()
 
         failing = {
             "_collect_codex_usage": Mock(return_value=ok("codex")),
+            "_collect_anthropic_usage": Mock(return_value=ok("anthropic")),
+            "_collect_nous_usage": Mock(return_value=ok("nous")),
+            "_collect_openrouter_usage": Mock(return_value=ok("openrouter")),
+            "_collect_deepseek_usage": Mock(return_value=ok("deepseek")),
             "_collect_grok_usage": Mock(
                 return_value=api._provider_payload(
                     "grok", status="unavailable", message="temporary failure"
                 )
             ),
-            "_collect_nous_usage": Mock(return_value=ok("nous")),
-            "_collect_openrouter_usage": Mock(return_value=ok("openrouter")),
+            "_collect_kimi_usage": Mock(return_value=ok("kimi")),
+            "_collect_zai_usage": Mock(return_value=ok("zai")),
         }
         with patch.multiple(api, **failing):
             refreshed = api._ai_usage_sync(True)
@@ -510,7 +606,7 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertTrue(grok["stale"])
         self.assertEqual(grok["last_error_status"], "unavailable")
         self.assertEqual(grok["windows"][0]["percentage_remaining"], 75.0)
-        self.assertEqual(refreshed["summary"]["connected"], 3)
+        self.assertEqual(refreshed["summary"]["connected"], 7)
         self.assertEqual(refreshed["summary"]["needs_attention"], 1)
 
     def test_ai_usage_expired_login_does_not_reuse_stale_reading(self):
@@ -521,11 +617,15 @@ class SessionLensApiTests(unittest.TestCase):
         )
         collectors = {
             "_collect_codex_usage": Mock(return_value=api._provider_payload("codex", status="not_configured")),
-            "_collect_grok_usage": Mock(return_value=api._provider_payload("grok", status="expired")),
+            "_collect_anthropic_usage": Mock(return_value=api._provider_payload("anthropic", status="not_configured")),
             "_collect_nous_usage": Mock(return_value=api._provider_payload("nous", status="not_configured")),
             "_collect_openrouter_usage": Mock(
                 return_value=api._provider_payload("openrouter", status="not_configured")
             ),
+            "_collect_deepseek_usage": Mock(return_value=api._provider_payload("deepseek", status="not_configured")),
+            "_collect_grok_usage": Mock(return_value=api._provider_payload("grok", status="expired")),
+            "_collect_kimi_usage": Mock(return_value=api._provider_payload("kimi", status="not_configured")),
+            "_collect_zai_usage": Mock(return_value=api._provider_payload("zai", status="not_configured")),
         }
         with patch.multiple(api, **collectors):
             payload = api._ai_usage_sync(True)
@@ -541,11 +641,19 @@ class SessionLensApiTests(unittest.TestCase):
         with patch.multiple(
             api,
             _collect_codex_usage=explode,
-            _collect_grok_usage=Mock(return_value=api._provider_payload("grok", status="not_configured")),
+            _collect_anthropic_usage=Mock(
+                return_value=api._provider_payload("anthropic", status="not_configured")
+            ),
             _collect_nous_usage=Mock(return_value=api._provider_payload("nous", status="not_configured")),
             _collect_openrouter_usage=Mock(
                 return_value=api._provider_payload("openrouter", status="not_configured")
             ),
+            _collect_deepseek_usage=Mock(
+                return_value=api._provider_payload("deepseek", status="not_configured")
+            ),
+            _collect_grok_usage=Mock(return_value=api._provider_payload("grok", status="not_configured")),
+            _collect_kimi_usage=Mock(return_value=api._provider_payload("kimi", status="not_configured")),
+            _collect_zai_usage=Mock(return_value=api._provider_payload("zai", status="not_configured")),
         ):
             payload = api._ai_usage_sync(True)
         codex = next(item for item in payload["providers"] if item["provider"] == "codex")
