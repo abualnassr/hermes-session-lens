@@ -695,6 +695,9 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertEqual(model["task_types"][0]["task_type"], "Coding")
         self.assertEqual(model["failures"]["rate_limits"], 1)
         self.assertEqual(model["failures"]["rate"], 0.5)
+        self.assertEqual(model["failures"]["tool_failures"], 1)
+        self.assertEqual(model["task_types"][0]["first_attempt_acceptance_rate"], 0)
+        self.assertEqual(model["acceptance_samples"], 1)
         self.assertIsNone(model["latency"]["ttft_p50_seconds"])
         self.assertEqual(model["latency"]["total_p50_seconds"], 2.5)
         self.assertFalse(payload["coverage"]["ttft_available"])
@@ -731,6 +734,134 @@ class SessionLensApiTests(unittest.TestCase):
             connection.close()
         session_fallback = api._ai_models_sync(0, 1_800_001_000, 1_800_002_000)
         self.assertEqual(session_fallback["models"][0]["last_used_at"], 1_800_000_120)
+
+    def test_ai_model_acceptance_is_task_specific_and_requires_coding_change_evidence(self):
+        connection = sqlite3.connect(self.db_path)
+        try:
+            sessions = [
+                ("coding-success", "provider/model-a", 1_800_000_200, "completed"),
+                ("orchestration", "provider/model-b", 1_800_000_400, "completed"),
+            ]
+            for session_id, model, started_at, reason in sessions:
+                connection.execute(
+                    """
+                    INSERT INTO sessions (
+                        id,source,model,started_at,ended_at,end_reason,billing_provider,
+                        billing_mode,last_activity_at,api_call_count
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (session_id, "desktop", model, started_at, started_at + 60, reason, "provider", "metered", started_at + 60, 1),
+                )
+                connection.execute(
+                    "INSERT INTO session_model_usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (session_id, model, "provider", "metered", "", 1, 100, 20, 0, 0, 0, 0.001, 0, "estimated", "test", started_at, started_at + 50),
+                )
+
+            patch_call = [{
+                "id": "call-patch",
+                "type": "function",
+                "function": {"name": "apply_patch", "arguments": json.dumps({"path": "app.py", "patch": "+ok"})},
+            }]
+            connection.execute(
+                "INSERT INTO messages (session_id,role,tool_calls,timestamp,active) VALUES (?,?,?,?,1)",
+                ("coding-success", "assistant", json.dumps(patch_call), 1_800_000_210),
+            )
+            connection.execute(
+                """
+                INSERT INTO messages (session_id,role,content,tool_call_id,tool_name,timestamp,active)
+                VALUES (?,?,?,?,?,?,1)
+                """,
+                ("coding-success", "tool", "Done!", "call-patch", "apply_patch", 1_800_000_211),
+            )
+            connection.execute(
+                "INSERT INTO async_delegations VALUES (?,?,?,?,?,?,?,?)",
+                ("delegation-2", "orchestration", None, "completed", 1_800_000_401, 1_800_000_450, 1_800_000_450, "delivered"),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        payload = api._ai_models_sync(0)
+        models = {item["model_id"]: item for item in payload["models"]}
+        coding = next(item for item in models["provider/model-a"]["task_types"] if item["task_type"] == "Coding")
+        orchestration = models["provider/model-b"]["task_types"][0]
+        self.assertEqual(coding["eligible_sessions"], 2)
+        self.assertEqual(coding["accepted_sessions"], 1)
+        self.assertEqual(coding["first_attempt_acceptance_rate"], 0.5)
+        self.assertEqual(models["provider/model-a"]["accepted_tasks"], 1)
+        self.assertEqual(orchestration["task_type"], "Orchestration")
+        self.assertIsNone(orchestration["first_attempt_acceptance_rate"])
+        self.assertEqual(orchestration["acceptance_basis"], "unavailable for this task type")
+
+    def test_ai_model_retry_switch_respects_roles_and_same_model_prompt_resends(self):
+        connection = sqlite3.connect(self.db_path)
+        try:
+            rows = [
+                ("different-roles", "provider/model-a", "", 1_800_001_000),
+                ("different-roles", "provider/model-b", "approval", 1_800_001_000),
+                ("same-role-switch", "provider/model-c", "", 1_800_001_200),
+                ("same-role-switch", "provider/model-d", "", 1_800_001_200),
+                ("prompt-resend", "provider/model-e", "", 1_800_001_400),
+            ]
+            for session_id in {row[0] for row in rows}:
+                started_at = next(row[3] for row in rows if row[0] == session_id)
+                connection.execute(
+                    """
+                    INSERT INTO sessions (
+                        id,source,model,started_at,ended_at,end_reason,billing_provider,
+                        billing_mode,last_activity_at,api_call_count
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (session_id, "desktop", "provider/model-a", started_at, started_at + 100, "completed", "provider", "metered", started_at + 100, 1),
+                )
+            for session_id, model, task, started_at in rows:
+                connection.execute(
+                    "INSERT INTO session_model_usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    (session_id, model, "provider", "metered", task, 1, 100, 20, 0, 0, 0, 0.001, 0, "estimated", "test", started_at + 5, started_at + 90),
+                )
+            repeated = "Please inspect the provider configuration and explain the result"
+            connection.execute(
+                "INSERT INTO messages (session_id,role,content,timestamp,active) VALUES (?,?,?,?,1)",
+                ("prompt-resend", "user", repeated, 1_800_001_401),
+            )
+            connection.execute(
+                "INSERT INTO messages (session_id,role,content,timestamp,active) VALUES (?,?,?,?,1)",
+                ("prompt-resend", "user", repeated + ".", 1_800_001_500),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        models = {item["model_id"]: item for item in api._ai_models_sync(0)["models"]}
+        self.assertEqual(models["provider/model-b"]["retry_switch_rate"], 0)
+        self.assertEqual(models["provider/model-c"]["retry_switch_rate"], 1)
+        self.assertEqual(models["provider/model-d"]["retry_switch_rate"], 1)
+        self.assertEqual(models["provider/model-e"]["retry_switch_rate"], 1)
+
+    def test_ai_model_failures_include_attempt_errors_but_keep_tool_failures_separate(self):
+        log_path = self.home / "logs" / "agent.log"
+        log_path.write_text(
+            log_path.read_text(encoding="utf-8")
+            + "2027-01-15 08:00:05,000 WARNING [session-1] agent.conversation_loop: "
+            + "API call failed (attempt 1/1) error_type=APITimeout provider=provider "
+            + "base_url=https://example.test model=provider/model-a summary=timeout\n",
+            encoding="utf-8",
+        )
+        api._log_file_cache.clear()
+        model = api._ai_models_sync(0)["models"][0]
+        self.assertEqual(model["failures"]["rate_limits"], 1)
+        self.assertEqual(model["failures"]["timeouts"], 1)
+        self.assertEqual(model["failures"]["errors"], 0)
+        self.assertEqual(model["failures"]["tool_failures"], 1)
+        self.assertAlmostEqual(model["failures"]["rate"], 2 / 3)
+
+    def test_ai_models_ui_keeps_early_quota_neutral_and_enforces_sample_floor(self):
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("elapsed !== null && elapsed < 10", source)
+        self.assertIn("early in period", source)
+        self.assertIn("Number(model.accepted_tasks) >= 10", source)
+        self.assertIn("insufficient data", source)
+        self.assertIn("Tool failures", source)
 
     def test_custom_period_is_inclusive_by_start_and_exclusive_by_end(self):
         start = 1_799_999_999

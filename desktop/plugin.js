@@ -1999,6 +1999,10 @@ function formatModelCost(model) {
   return '—'
 }
 
+function distinctValues(values) {
+  return [...new Set((values || []).filter(value => value !== null && value !== undefined && String(value).trim() !== ''))]
+}
+
 function quotaWindowDurationSeconds(label) {
   const text = String(label || '').toLowerCase()
   if (text.includes('week')) return 7 * 86400
@@ -2036,8 +2040,9 @@ function modelQuota(model, quotaData, allModels) {
     const startedAt = reset.getTime() - duration * 1000
     elapsed = Math.max(0, Math.min(100, ((Date.now() - startedAt) / (duration * 1000)) * 100))
   }
+  const earlyPeriod = elapsed !== null && elapsed < 10
   let tone = 'neutral'
-  if (elapsed !== null) tone = burn <= elapsed ? 'success' : burn - elapsed <= 10 ? 'warning' : 'danger'
+  if (elapsed !== null && !earlyPeriod) tone = burn <= elapsed ? 'success' : burn - elapsed <= 10 ? 'warning' : 'danger'
   const providerRequests = (allModels || []).reduce((sum, candidate) =>
     sum + (candidate.routes || [])
       .filter(item => item.quota_provider === route.quota_provider && item.oauth && item.subscription)
@@ -2046,7 +2051,7 @@ function modelQuota(model, quotaData, allModels) {
     .filter(item => item.quota_provider === route.quota_provider)
     .reduce((sum, item) => sum + (Number(item.requests) || 0), 0)
   const accepted = Number(model.accepted_tasks) || 0
-  const capPerAcceptedTask = providerRequests > 0 && accepted > 0
+  const capPerAcceptedTask = providerRequests > 0 && accepted >= 10
     ? burn * (modelRequests / providerRequests) / accepted
     : null
   return {
@@ -2054,6 +2059,7 @@ function modelQuota(model, quotaData, allModels) {
     available: true,
     burn,
     elapsed,
+    earlyPeriod,
     tone,
     window,
     provider,
@@ -2084,7 +2090,7 @@ function QuotaBurn({ quota }) {
       children: quota.inactive ? 'sub. · no use' : 'sub. · —'
     })
   }
-  const paceLabel = quota.tone === 'success' ? 'on pace' : quota.tone === 'warning' ? 'watch' : quota.tone === 'danger' ? 'over pace' : ''
+  const paceLabel = quota.earlyPeriod ? 'early in period' : quota.tone === 'success' ? 'on pace' : quota.tone === 'warning' ? 'watch' : quota.tone === 'danger' ? 'over pace' : ''
   const label = quota.elapsed === null
     ? `${Math.round(quota.burn)}% used`
     : `${Math.round(quota.burn)}% / ${Math.round(quota.elapsed)}% elapsed${paceLabel ? ` · ${paceLabel}` : ''}`
@@ -2171,7 +2177,8 @@ function TaskTypeBreakdown({ rows }) {
               jsx('span', { style: { color: color.secondary, fontSize: '0.75rem', fontWeight: 600 }, children: row.task_type }),
               jsx('span', {
                 style: { ...tabular, color: color.tertiary, fontSize: '0.6875rem' },
-                children: `${formatCount(row.requests)} requests · ${acceptance === null || acceptance === undefined ? '—' : `${width.toFixed(0)}%`} accepted first attempt`
+                title: row.acceptance_basis,
+                children: `${formatCount(row.requests)} requests · ${acceptance === null || acceptance === undefined ? 'n/a' : `${width.toFixed(0)}%`} accepted first attempt`
               })
             ]
           }),
@@ -2194,15 +2201,26 @@ function TaskTypeBreakdown({ rows }) {
 
 function ModelExpanded({ model, quota, coverage, narrow }) {
   const failures = model.failures || {}
-  const costPerAccepted = quota.kind === 'subscription'
-    ? (quota.capPerAcceptedTask === null || quota.capPerAcceptedTask === undefined ? '—' : `~${quota.capPerAcceptedTask.toFixed(2)}% of cap`)
-    : model.accepted_tasks > 0 && ['actual', 'estimated', 'free', 'mixed'].includes(model.cost_kind)
-      ? formatCost((Number(model.cost_usd) || 0) / model.accepted_tasks, model.cost_kind === 'free' ? 'actual' : 'actual')
-      : '—'
-  const quotaInsight = quota.available && quota.elapsed !== null && quota.burn > quota.elapsed
+  const hasEnoughAcceptedTasks = Number(model.accepted_tasks) >= 10
+  const costPerAccepted = !hasEnoughAcceptedTasks
+    ? 'insufficient data'
+    : quota.kind === 'subscription'
+      ? (quota.capPerAcceptedTask === null || quota.capPerAcceptedTask === undefined ? '—' : `~${quota.capPerAcceptedTask.toFixed(2)}% of cap`)
+      : ['actual', 'estimated', 'free', 'mixed'].includes(model.cost_kind)
+        ? formatCost((Number(model.cost_usd) || 0) / model.accepted_tasks, model.cost_kind === 'free' ? 'actual' : 'actual')
+        : '—'
+  const quotaInsight = quota.available && !quota.earlyPeriod && quota.elapsed !== null && quota.burn > quota.elapsed
     ? `${quota.window.label} is burning ${Math.round(quota.burn - quota.elapsed)} percentage points faster than the billing period is elapsing.`
     : null
   const insight = quotaInsight || model.insight
+  const routeLabels = distinctValues((model.routes || []).map(route => route.label))
+  const footnotes = distinctValues([
+    `Routes: ${routeLabels.join(' · ') || 'Unknown'}`,
+    `Failure and total-latency samples come from bounded logs${coverage?.log_start_at ? ` (${formatShortDate(coverage.log_start_at)}–${formatShortDate(coverage.log_end_at)})` : ''}; time-to-first-token is not recorded by Hermes.`,
+    'Counts API errors, timeouts, and rate limits; tool-call failures are shown separately.',
+    'Retry/switch counts rewinds, near-identical prompts resent to the same model within five minutes, and model changes within the same task role; models on different roles are not switches.',
+    'Acceptance uses the existing proxy only for General and Analysis; Coding requires a resolved session with a recorded saved or committed file change; Orchestration and unsupported task types are n/a.'
+  ])
   return jsxs('div', {
     style: {
       background: color.surface,
@@ -2230,11 +2248,12 @@ function ModelExpanded({ model, quota, coverage, narrow }) {
             children: [
               jsx('h3', { style: { color: color.primary, fontSize: '0.8125rem', fontWeight: 650, margin: '0 0 0.65rem' }, children: 'Reliability and efficiency' }),
               jsx('div', {
-                style: { borderTop: border, display: 'grid', gridTemplateColumns: 'repeat(3, minmax(5rem, 1fr))' },
+                style: { borderTop: border, display: 'grid', gridTemplateColumns: 'repeat(4, minmax(5rem, 1fr))' },
                 children: [
                   ['Rate limits', failures.rate_limits],
                   ['Timeouts', failures.timeouts],
-                  ['Errors', failures.errors]
+                  ['Errors', failures.errors],
+                  ['Tool failures', failures.tool_failures]
                 ].map(([label, value]) => jsxs('div', {
                   style: { borderBottom: border, padding: '0.55rem 0.45rem' },
                   children: [
@@ -2250,7 +2269,7 @@ function ModelExpanded({ model, quota, coverage, narrow }) {
                   jsx('span', { style: { ...tabular, color: color.primary, fontSize: '0.75rem', fontWeight: 650 }, children: costPerAccepted })
                 ]
               }),
-              quota.kind === 'subscription' && quota.capPerAcceptedTask !== null && quota.capPerAcceptedTask !== undefined
+              hasEnoughAcceptedTasks && quota.kind === 'subscription' && quota.capPerAcceptedTask !== null && quota.capPerAcceptedTask !== undefined
                 ? jsx('div', { style: { color: color.quaternary, fontSize: '0.625rem', lineHeight: 1.45, marginTop: '0.25rem' }, children: 'Estimate allocated by this model’s share of recorded OAuth requests in the selected period; provider quota is account-level.' })
                 : null
             ]
@@ -2275,11 +2294,7 @@ function ModelExpanded({ model, quota, coverage, narrow }) {
         : null,
       jsxs('div', {
         style: { borderTop: border, color: color.quaternary, display: 'grid', fontSize: '0.625rem', gap: '0.25rem', lineHeight: 1.45, paddingTop: '0.65rem' },
-        children: [
-          jsx('span', { children: `Routes: ${(model.routes || []).map(route => route.label).join(' · ') || 'Unknown'}` }),
-          jsx('span', { children: `Failure and total-latency samples come from bounded logs${coverage?.log_start_at ? ` (${formatShortDate(coverage.log_start_at)}–${formatShortDate(coverage.log_end_at)})` : ''}; time-to-first-token is not recorded by Hermes.` }),
-          jsx('span', { children: 'First-attempt acceptance is a derived proxy for eligible closed sessions without a rewind, model switch, or detected recorded failure.' })
-        ]
+        children: footnotes.map(note => jsx('span', { children: note }, note))
       })
     ]
   })
@@ -2406,8 +2421,8 @@ function AIModelsTable({ models, quotaData, coverage, narrow }) {
               jsx('td', { title: model.cache_coverage === 'partial' ? 'Cached-token coverage is partial across routes.' : model.cache_coverage === 'unavailable' ? 'This route has not demonstrated cached-token reporting in the selected period.' : undefined, style: { ...tabular, borderBottom: isExpanded ? 'none' : border, minWidth: '11rem', padding: '0.62rem 0.65rem', textAlign: 'right', verticalAlign: 'top' }, children: `${formatCount(model.input_tokens)} / ${formatCount(model.output_tokens)} / ${model.cache_tokens === null || model.cache_tokens === undefined ? '–' : formatCount(model.cache_tokens)}` }, 'tokens'),
               jsx('td', { style: { ...tabular, borderBottom: isExpanded ? 'none' : border, padding: '0.62rem 0.65rem', textAlign: 'right', verticalAlign: 'top' }, children: formatModelCost(model) }, 'cost'),
               jsx('td', { style: { borderBottom: isExpanded ? 'none' : border, padding: '0.58rem 0.65rem', verticalAlign: 'top' }, children: jsx(QuotaBurn, { quota: item.quota }) }, 'quota'),
-              jsx('td', { style: { borderBottom: isExpanded ? 'none' : border, padding: '0.62rem 0.65rem', textAlign: 'right', verticalAlign: 'top' }, children: jsx(RateValue, { value: model.failures?.rate, label: 'Observed request failure rate' }) }, 'failure'),
-              jsx('td', { style: { borderBottom: isExpanded ? 'none' : border, padding: '0.62rem 0.65rem', textAlign: 'right', verticalAlign: 'top' }, children: jsx(RateValue, { value: model.retry_switch_rate, label: 'Retry or model-switch session rate' }) }, 'retry'),
+              jsx('td', { style: { borderBottom: isExpanded ? 'none' : border, padding: '0.62rem 0.65rem', textAlign: 'right', verticalAlign: 'top' }, children: jsx(RateValue, { value: model.failures?.rate, label: 'API error, timeout, or rate-limit response rate' }) }, 'failure'),
+              jsx('td', { style: { borderBottom: isExpanded ? 'none' : border, padding: '0.62rem 0.65rem', textAlign: 'right', verticalAlign: 'top' }, children: jsx(RateValue, { value: model.retry_switch_rate, label: 'Rewind, same-model prompt resend, or same-role model-switch session rate' }) }, 'retry'),
               jsx('td', { title: `${model.latency?.samples || 0} bounded-log samples. Hermes does not record time-to-first-token.`, style: { ...tabular, borderBottom: isExpanded ? 'none' : border, minWidth: '7rem', padding: '0.62rem 0.65rem', textAlign: 'right', verticalAlign: 'top' }, children: `– / ${formatSeconds(model.latency?.total_p50_seconds)}` }, 'latency'),
               jsx('td', { style: { borderBottom: isExpanded ? 'none' : border, padding: '0.54rem 0.65rem', verticalAlign: 'top' }, children: jsx(TrendBars, { rows: model.trend }) }, 'trend')
             ]
@@ -2471,7 +2486,9 @@ function AIModelsView({ query, quotaQuery, narrow, refreshError }) {
           style: { alignItems: 'flex-start', borderTop: border, color: color.tertiary, display: 'flex', fontSize: '0.6875rem', gap: '0.5rem', lineHeight: 1.5, paddingTop: '0.75rem' },
           children: [
             jsx(Codicon, { name: 'info', size: '0.75rem', style: { marginTop: '0.15rem' } }),
-            jsx('span', { children: 'Requests, tokens, routes, and cost come from Hermes session accounting. Retry/switch and first-attempt acceptance are derived session proxies. Failure rate and total latency cover only bounded local agent logs; time-to-first-token is not recorded.' })
+            jsx('span', {
+              children: `Requests, tokens, routes, and cost come from Hermes session accounting. Retry/switch counts rewinds, same-model near-identical prompt resends within five minutes, and same-role model changes. Acceptance is available for General and Analysis, plus Coding when saved/committed file-change evidence is recorded. Fail rate counts API errors, timeouts, and rate limits from bounded local logs; time-to-first-token is not recorded. Session records contain ${formatCount(data.coverage?.recorded_failure_events)} failure events in this period; ${formatCount(data.coverage?.recorded_tool_failures)} are tool-call failures (${formatCount(data.coverage?.attributed_tool_failures)} attributed to a model, ${formatCount(data.coverage?.unattributed_tool_failures)} unattributed).`
+            })
           ]
         })
       ]

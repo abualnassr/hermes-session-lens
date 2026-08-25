@@ -21,6 +21,7 @@ import time
 from collections import Counter, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
 from urllib.parse import urlparse
@@ -37,7 +38,7 @@ except ImportError:  # pragma: no cover - makes isolated editor/test imports cle
 
 router = APIRouter()
 
-PLUGIN_VERSION = "0.6.0"
+PLUGIN_VERSION = "0.6.1"
 MAX_SESSION_PAGE = 500
 MAX_ANALYSIS_EVENTS = 5000
 MAX_SEARCH_MATCHES = 2000
@@ -127,9 +128,19 @@ _API_ERROR_RE = re.compile(
     r"|Outer loop error in API call) #(?P<call>\d+)(?::\s*(?P<detail>.*))?",
     re.IGNORECASE,
 )
+_API_ATTEMPT_ERROR_RE = re.compile(
+    r"API call failed\s*\(attempt\s+\d+/\d+\).*?provider=(?P<provider>\S+)"
+    r".*?model=(?P<model>\S+)(?:\s+summary=(?P<detail>.*))?",
+    re.IGNORECASE,
+)
 _TOOL_METRIC_RE = re.compile(
     r"tool (?P<tool>[\w.:-]+) (?P<status>completed|failed|cancelled) "
     r"\((?P<duration>[\d.]+)s(?:, (?P<chars>\d+) chars)?\)"
+)
+_GIT_COMMIT_RE = re.compile(r"\bgit(?:\.exe)?\s+(?:-[^\s]+\s+)*commit\b", re.IGNORECASE)
+_NO_FILE_CHANGE_RE = re.compile(
+    r"\bnothing to commit\b|\bno changes?\b|\bpatch did not apply\b",
+    re.IGNORECASE,
 )
 
 _log_file_cache: Dict[str, Tuple[Tuple[int, int], Dict[str, Any]]] = {}
@@ -1010,6 +1021,26 @@ def _timestamp_from_log(value: str) -> float:
         return 0.0
 
 
+def _api_failure_category(detail: Any) -> str:
+    text = str(detail or "").lower()
+    if any(marker in text for marker in ("rate limit", "rate_limit", "http 429", "status 429", " 429")):
+        return "rate_limit"
+    if any(
+        marker in text
+        for marker in (
+            "timed out",
+            "timeout",
+            "apitimeout",
+            "http 408",
+            "status 408",
+            "http 504",
+            "status 504",
+        )
+    ):
+        return "timeout"
+    return "error"
+
+
 def _parse_log_file(path: Path) -> Dict[str, Any]:
     stat = path.stat()
     signature = (stat.st_size, stat.st_mtime_ns)
@@ -1051,17 +1082,12 @@ def _parse_log_file(path: Path) -> Dict[str, Any]:
             )
             continue
         error_match = _API_ERROR_RE.search(message)
-        if error_match:
-            detail = str(error_match.group("detail") or message)
-            detail_lower = detail.lower()
-            if any(marker in detail_lower for marker in ("rate limit", "rate_limit", "http 429", "status 429", " 429")):
-                category = "rate_limit"
-            elif any(marker in detail_lower for marker in ("timed out", "timeout", "http 408", "status 408", "http 504", "status 504")):
-                category = "timeout"
-            else:
-                category = "error"
+        attempt_error_match = _API_ATTEMPT_ERROR_RE.search(message)
+        if error_match or attempt_error_match:
+            match = error_match or attempt_error_match
+            detail = str(match.groupdict().get("detail") or message)
             session_id = envelope.group("session") or ""
-            call_number = _integer(error_match.group("call"))
+            call_number = _integer(match.groupdict().get("call"))
             signature_key = (session_id, call_number, round(timestamp))
             if signature_key not in seen_api_errors:
                 seen_api_errors.add(signature_key)
@@ -1070,7 +1096,9 @@ def _parse_log_file(path: Path) -> Dict[str, Any]:
                         "timestamp": timestamp,
                         "session_id": session_id or None,
                         "call": call_number,
-                        "category": category,
+                        "category": _api_failure_category(f"{message} {detail}"),
+                        "model": match.groupdict().get("model"),
+                        "provider": match.groupdict().get("provider"),
                     }
                 )
             continue
@@ -1540,6 +1568,112 @@ def _session_task_type(tool_names: Iterable[str], source: Any, delegated: bool) 
     return "General"
 
 
+def _task_role(value: Any) -> str:
+    return str(value or "").strip().lower() or "main"
+
+
+def _normalised_retry_prompt(value: Any) -> str:
+    text = _clean_text(value, 12000).strip().lower()
+    if not text or text.startswith("[important: you are running as a scheduled cron job."):
+        return ""
+    return " ".join(re.findall(r"[\w]+", text, flags=re.UNICODE))
+
+
+def _has_near_identical_prompt_retry(rows: Iterable[Mapping[str, Any]]) -> bool:
+    prompts = sorted(
+        (
+            (_number(row.get("timestamp")), _normalised_retry_prompt(row.get("content")))
+            for row in rows
+            if str(row.get("role") or "").lower() == "user"
+        ),
+        key=lambda item: item[0],
+    )
+    prompts = [(timestamp, prompt) for timestamp, prompt in prompts if len(prompt) >= 12]
+    for index, (timestamp, prompt) in enumerate(prompts):
+        for prior_timestamp, prior_prompt in reversed(prompts[:index]):
+            age = timestamp - prior_timestamp
+            if age > 300:
+                break
+            if age <= 0:
+                continue
+            if prompt == prior_prompt or SequenceMatcher(None, prior_prompt, prompt).ratio() >= 0.90:
+                return True
+    return False
+
+
+def _coding_change_evidence(rows: Iterable[Mapping[str, Any]]) -> Optional[bool]:
+    material = [dict(row) for row in rows]
+    results_by_call: Dict[str, Mapping[str, Any]] = {}
+    for row in material:
+        if str(row.get("role") or "").lower() == "tool" and row.get("tool_call_id"):
+            results_by_call[str(row.get("tool_call_id"))] = row
+
+    detected_results = 0
+    for row in material:
+        if str(row.get("role") or "").lower() != "assistant" or not row.get("tool_calls"):
+            continue
+        for call in _iter_tool_calls(row.get("tool_calls")):
+            name = str(call.get("name") or "").lower()
+            arguments = call.get("arguments") or {}
+            command = str(arguments.get("command") or arguments.get("code") or "")
+            mutates_file = any(marker in name for marker in ("apply_patch", "write_file", "edit_file", "replace_in_file"))
+            commits_change = bool(_GIT_COMMIT_RE.search(command))
+            if not mutates_file and not commits_change:
+                continue
+            result = results_by_call.get(str(call.get("call_id") or ""))
+            if not result:
+                continue
+            detected_results += 1
+            failed = _is_failure(
+                role="tool",
+                content=result.get("content"),
+                finish_reason=result.get("finish_reason"),
+                effect_disposition=result.get("effect_disposition"),
+            )
+            if not failed and not _NO_FILE_CHANGE_RE.search(str(result.get("content") or "")):
+                return True
+    return False if detected_results else None
+
+
+def _acceptance_for_task(task_type: str, facts: Mapping[str, Any]) -> Tuple[bool, bool]:
+    if task_type in {"General", "Analysis"}:
+        valid = bool(facts.get("eligible_proxy"))
+        return valid, bool(valid and facts.get("proxy_accepted"))
+    if task_type == "Coding":
+        valid = bool(facts.get("closed")) and facts.get("coding_change") is not None
+        accepted = bool(valid and facts.get("resolved") and facts.get("coding_change"))
+        return valid, accepted
+    return False, False
+
+
+def _model_for_session_event(
+    rows: Iterable[Mapping[str, Any]],
+    timestamp: float,
+    role: str = "main",
+) -> Optional[str]:
+    candidates = [row for row in rows if _task_role(row.get("task")) == role]
+    models = {str(row.get("model") or "unknown") for row in candidates}
+    if len(models) == 1:
+        return next(iter(models))
+    if not candidates:
+        return None
+
+    def distance(row: Mapping[str, Any]) -> float:
+        first = _number(row.get("first_seen"), 0)
+        last = _number(row.get("last_seen"), first)
+        if first and first <= timestamp <= max(first, last) + 300:
+            return 0.0
+        points = [point for point in (first, last) if point]
+        return min((abs(timestamp - point) for point in points), default=float("inf"))
+
+    ordered = sorted(candidates, key=lambda row: (distance(row), -_number(row.get("first_seen"))))
+    if not ordered or not math.isfinite(distance(ordered[0])):
+        return None
+    if len(ordered) > 1 and distance(ordered[0]) == distance(ordered[1]):
+        return None
+    return str(ordered[0].get("model") or "unknown")
+
+
 def _model_match(raw_model: Any, known_models: Iterable[str]) -> Optional[str]:
     raw = str(raw_model or "").strip()
     if not raw:
@@ -1696,24 +1830,38 @@ def _ai_models_sync(
             ).fetchall():
                 failure_counts[str(row["session_id"])] = _integer(row["failures"])
 
+        message_rows_by_session: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        tool_failure_rows: List[Dict[str, Any]] = []
         tools_by_session: Dict[str, set[str]] = defaultdict(set)
         if session_rows:
             for row in connection.execute(
                 f"""
-                SELECT m.session_id, m.tool_name, m.tool_calls
+                SELECT m.id, m.session_id, m.role, m.content, m.tool_call_id,
+                       m.tool_calls, m.tool_name, m.effect_disposition,
+                       m.timestamp, m.finish_reason
                 FROM messages m
                 JOIN sessions s ON s.id=m.session_id
                 WHERE {period_sql} AND coalesce(s.hidden,0)=0
                   AND coalesce(m.active,1)=1
-                  AND (m.tool_name IS NOT NULL OR m.tool_calls IS NOT NULL)
+                  AND (m.role IN ('user','tool') OR m.tool_calls IS NOT NULL)
+                ORDER BY m.timestamp ASC, m.id ASC
                 """,
                 tuple(period_params),
             ).fetchall():
-                session_id = str(row["session_id"])
-                if row["tool_name"]:
-                    tools_by_session[session_id].add(str(row["tool_name"]))
-                for call in _iter_tool_calls(row["tool_calls"]):
+                material = _row_dict(row)
+                session_id = str(material.get("session_id") or "")
+                message_rows_by_session[session_id].append(material)
+                if material.get("tool_name"):
+                    tools_by_session[session_id].add(str(material.get("tool_name")))
+                for call in _iter_tool_calls(material.get("tool_calls")):
                     tools_by_session[session_id].add(str(call.get("name") or ""))
+                if str(material.get("role") or "").lower() == "tool" and _is_failure(
+                    role="tool",
+                    content=material.get("content"),
+                    finish_reason=material.get("finish_reason"),
+                    effect_disposition=material.get("effect_disposition"),
+                ):
+                    tool_failure_rows.append(material)
 
         delegated_sessions: set[str] = set()
         if _table_columns(connection, "async_delegations"):
@@ -1724,33 +1872,71 @@ def _ai_models_sync(
                     if key and str(key) in sessions_by_id:
                         delegated_sessions.add(str(key))
 
-    main_models_by_session: Dict[str, set[str]] = defaultdict(set)
+    role_models_by_session: Dict[str, Dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
     usage_by_session: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
     cache_reporting_providers: set[str] = set()
     for usage in usage_rows:
         session_id = str(usage.get("session_id") or "")
         usage_by_session[session_id].append(usage)
-        if not str(usage.get("task") or "").strip():
-            main_models_by_session[session_id].add(str(usage.get("model") or "unknown"))
+        role_models_by_session[session_id][_task_role(usage.get("task"))].add(
+            str(usage.get("model") or "unknown")
+        )
         if _integer(usage.get("cache_read_tokens")) or _integer(usage.get("cache_write_tokens")):
             cache_reporting_providers.add(str(usage.get("billing_provider") or "").strip().lower())
+
+    retry_switch_models_by_session: Dict[str, set[str]] = defaultdict(set)
+    for session_id, roles in role_models_by_session.items():
+        for role, role_models in roles.items():
+            if len(role_models) > 1:
+                retry_switch_models_by_session[session_id].update(role_models)
+        main_models = roles.get("main", set())
+        session = sessions_by_id.get(session_id, {})
+        if _integer(session.get("rewind_count")) > 0:
+            retry_switch_models_by_session[session_id].update(main_models)
+        elif len(main_models) == 1 and _has_near_identical_prompt_retry(
+            message_rows_by_session.get(session_id, [])
+        ):
+            retry_switch_models_by_session[session_id].update(main_models)
 
     session_facts: Dict[str, Dict[str, Any]] = {}
     for session_id, session in sessions_by_id.items():
         outcome = _session_outcome(session)["outcome"]
-        retry_or_switch = _integer(session.get("rewind_count")) > 0 or len(main_models_by_session.get(session_id, set())) > 1
-        eligible = session.get("ended_at") is not None and outcome not in {"failed", "cancelled", "open", "running"}
-        accepted = eligible and not retry_or_switch and failure_counts.get(session_id, 0) == 0
+        task_type = _session_task_type(
+            tools_by_session.get(session_id, set()),
+            session.get("source"),
+            session_id in delegated_sessions,
+        )
+        closed = session.get("ended_at") is not None and outcome not in {"open", "running"}
+        resolved = closed and outcome not in {"failed", "cancelled"}
+        eligible_proxy = resolved
+        proxy_accepted = (
+            eligible_proxy
+            and not retry_switch_models_by_session.get(session_id)
+            and failure_counts.get(session_id, 0) == 0
+        )
         session_facts[session_id] = {
-            "retry_or_switch": retry_or_switch,
-            "eligible": eligible,
-            "accepted": accepted,
-            "task_type": _session_task_type(
-                tools_by_session.get(session_id, set()),
-                session.get("source"),
-                session_id in delegated_sessions,
-            ),
+            "closed": closed,
+            "resolved": resolved,
+            "eligible_proxy": eligible_proxy,
+            "proxy_accepted": proxy_accepted,
+            "coding_change": _coding_change_evidence(message_rows_by_session.get(session_id, []))
+            if task_type == "Coding"
+            else None,
+            "task_type": task_type,
         }
+
+    tool_failures_by_model: Counter[str] = Counter()
+    unattributed_tool_failures = 0
+    for failure in tool_failure_rows:
+        session_id = str(failure.get("session_id") or "")
+        model_id = _model_for_session_event(
+            usage_by_session.get(session_id, []),
+            _number(failure.get("timestamp")),
+        )
+        if model_id:
+            tool_failures_by_model[model_id] += 1
+        else:
+            unattributed_tool_failures += 1
 
     models: Dict[str, Dict[str, Any]] = {}
     for usage in usage_rows:
@@ -1789,6 +1975,7 @@ def _ai_models_sync(
                 "included_cost": False,
                 "free_api_cost": False,
                 "sessions_set": set(),
+                "acceptance_sessions_set": set(),
                 "accepted_sessions_set": set(),
                 "retry_sessions_set": set(),
                 "routes_map": {},
@@ -1813,9 +2000,12 @@ def _ai_models_sync(
         )
         model["sessions_set"].add(session_id)
         facts = session_facts.get(session_id, {})
-        if facts.get("accepted"):
+        acceptance_valid, accepted = _acceptance_for_task(task_type, facts)
+        if acceptance_valid:
+            model["acceptance_sessions_set"].add(session_id)
+        if accepted:
             model["accepted_sessions_set"].add(session_id)
-        if facts.get("retry_or_switch"):
+        if model_id in retry_switch_models_by_session.get(session_id, set()):
             model["retry_sessions_set"].add(session_id)
 
         route_row = model["routes_map"].setdefault(
@@ -1831,13 +2021,19 @@ def _ai_models_sync(
 
         task = model["task_types_map"].setdefault(
             task_type,
-            {"task_type": task_type, "requests": 0, "sessions_set": set(), "eligible_sessions_set": set(), "accepted_sessions_set": set()},
+            {
+                "task_type": task_type,
+                "requests": 0,
+                "sessions_set": set(),
+                "eligible_sessions_set": set(),
+                "accepted_sessions_set": set(),
+            },
         )
         task["requests"] += requests
         task["sessions_set"].add(session_id)
-        if facts.get("eligible"):
+        if acceptance_valid:
             task["eligible_sessions_set"].add(session_id)
-        if facts.get("accepted"):
+        if accepted:
             task["accepted_sessions_set"].add(session_id)
 
         if last_used:
@@ -1872,6 +2068,7 @@ def _ai_models_sync(
                 "included_cost": False,
                 "free_api_cost": False,
                 "sessions_set": set(),
+                "acceptance_sessions_set": set(),
                 "accepted_sessions_set": set(),
                 "retry_sessions_set": set(),
                 "routes_map": {},
@@ -1910,21 +2107,11 @@ def _ai_models_sync(
             continue
         session_id = str(event.get("session_id") or "")
         candidates = [row for row in usage_by_session.get(session_id, []) if not str(row.get("task") or "").strip()]
-        model_id: Optional[str] = None
+        model_id: Optional[str] = _model_match(event.get("model"), known_models)
         if len({str(row.get("model") or "unknown") for row in candidates}) == 1 and candidates:
-            model_id = str(candidates[0].get("model") or "unknown")
-        elif candidates:
-            def distance(row: Mapping[str, Any]) -> float:
-                first = _number(row.get("first_seen"), 0)
-                last = _number(row.get("last_seen"), first)
-                if first and first <= timestamp <= max(first, last) + 300:
-                    return 0.0
-                points = [point for point in (first, last) if point]
-                return min((abs(timestamp - point) for point in points), default=float("inf"))
-
-            closest = min(candidates, key=distance)
-            if math.isfinite(distance(closest)):
-                model_id = str(closest.get("model") or "unknown")
+            model_id = model_id or str(candidates[0].get("model") or "unknown")
+        elif candidates and not model_id:
+            model_id = _model_for_session_event(candidates, timestamp)
         if model_id not in known_models:
             unattributed_failures += 1
             continue
@@ -1963,6 +2150,7 @@ def _ai_models_sync(
             cost_kind = "unpriced"
 
         sessions_set = model.pop("sessions_set")
+        acceptance_sessions = model.pop("acceptance_sessions_set")
         accepted_sessions = model.pop("accepted_sessions_set")
         retry_sessions = model.pop("retry_sessions_set")
         retry_switch_rate = len(retry_sessions) / len(sessions_set) if sessions_set else None
@@ -1976,6 +2164,12 @@ def _ai_models_sync(
             task["first_attempt_acceptance_rate"] = (
                 len(accepted_task_sessions) / len(eligible_sessions) if eligible_sessions else None
             )
+            if task["task_type"] == "Coding":
+                task["acceptance_basis"] = "resolved session with a recorded successful saved or committed file change"
+            elif task["task_type"] in {"General", "Analysis"}:
+                task["acceptance_basis"] = "eligible closed session without a retry, same-role switch, or detected recorded failure"
+            else:
+                task["acceptance_basis"] = "unavailable for this task type"
             task_types.append(task)
         task_types.sort(key=lambda item: (item["requests"], item["sessions"]), reverse=True)
 
@@ -1986,9 +2180,12 @@ def _ai_models_sync(
         latencies = latency_by_model.get(model_id, [])
         latency_p50 = _percentile(latencies, 0.50)
         if failure_rate is not None and failure_rate > 0.05:
-            insight = f"Observed request failures reached {failure_rate * 100:.1f}% in the bounded log window."
+            insight = f"Observed API/request failures reached {failure_rate * 100:.1f}% in the bounded log window."
         elif retry_switch_rate is not None and retry_switch_rate > 0.05:
-            insight = f"{retry_switch_rate * 100:.1f}% of recorded sessions used a rewind or another model."
+            insight = (
+                f"{retry_switch_rate * 100:.1f}% of recorded sessions used a rewind, resent a near-identical prompt "
+                "within five minutes, or switched models within the same task role."
+            )
         elif latency_p50 is not None and latency_p50 > 10:
             insight = f"Median recorded response latency is {latency_p50:.1f}s."
         else:
@@ -2004,6 +2201,7 @@ def _ai_models_sync(
                 "cache_coverage": cache_coverage,
                 "cost_kind": cost_kind,
                 "sessions": len(sessions_set),
+                "acceptance_samples": len(acceptance_sessions),
                 "accepted_tasks": len(accepted_sessions),
                 "retry_switch_sessions": len(retry_sessions),
                 "retry_switch_rate": retry_switch_rate,
@@ -2013,6 +2211,7 @@ def _ai_models_sync(
                     "rate_limits": failure_counts_by_type.get("rate_limit", 0),
                     "timeouts": failure_counts_by_type.get("timeout", 0),
                     "errors": failure_counts_by_type.get("error", 0),
+                    "tool_failures": tool_failures_by_model.get(model_id, 0),
                     "observed_successes": observed_successes,
                     "observed_failures": observed_failures,
                     "coverage": "bounded_logs" if observed_successes + observed_failures else "unavailable",
@@ -2062,14 +2261,27 @@ def _ai_models_sync(
         "coverage": {
             "model_source": "all-time distinct model IDs from Hermes session_model_usage with session-row fallback; metrics honor the selected period",
             "task_types": "derived from recorded Hermes tool names, session source, delegation links, and auxiliary task labels",
-            "first_attempt_acceptance": "derived proxy: eligible closed sessions without a rewind, model switch, or detected recorded failure",
-            "retry_switch": "sessions with rewind_count > 0 or more than one recorded main-loop model",
-            "failure_latency": "bounded local Hermes agent logs; percentages describe observed log events, not complete historical coverage",
+            "first_attempt_acceptance": (
+                "General and Analysis use the eligible-closed-session proxy; Coding requires a resolved session plus a recorded successful "
+                "saved or committed file change; Orchestration and other task types are unavailable"
+            ),
+            "retry_switch": (
+                "rewinds, near-identical prompts resent to the same model within five minutes, or model changes within the same task role; "
+                "different models on different roles are excluded"
+            ),
+            "failure_latency": (
+                "fail rate counts API/request errors, timeouts, and rate limits from bounded local Hermes agent logs; "
+                "tool-call failures are counted separately from session records"
+            ),
             "ttft_available": False,
             "cache": "a zero is shown only when the route has demonstrated cache reporting in the selected period; otherwise unavailable is returned",
             "log_start_at": min(observed_timestamps) if observed_timestamps else None,
             "log_end_at": max(observed_timestamps) if observed_timestamps else None,
             "unattributed_log_failures": unattributed_failures,
+            "recorded_failure_events": sum(failure_counts.values()),
+            "recorded_tool_failures": len(tool_failure_rows),
+            "attributed_tool_failures": sum(tool_failures_by_model.values()),
+            "unattributed_tool_failures": unattributed_tool_failures,
         },
         "generated_at": time.time(),
     }
