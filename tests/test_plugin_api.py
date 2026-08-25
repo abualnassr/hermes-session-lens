@@ -425,6 +425,44 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertEqual(telemetry["summary"]["cache_hit_ratio"], 0.5)
         self.assertEqual(telemetry["tools"][0]["failed"], 1)
 
+    def test_custom_period_is_inclusive_by_start_and_exclusive_by_end(self):
+        start = 1_799_999_999
+        end = 1_800_000_001
+        sessions = api._list_sessions_sync(
+            days=0,
+            start_at=start,
+            end_at=end,
+            query="",
+            sort="recent",
+            failures_only=False,
+            include_archived=False,
+            limit=50,
+            offset=0,
+        )
+        self.assertEqual(sessions["pagination"]["total"], 1)
+        self.assertEqual(api._overview_sync(0, start, end)["totals"]["sessions"], 1)
+        self.assertEqual(len(api._tools_sync(0, start, end)["tools"]), 2)
+        self.assertEqual(len(api._skills_sync(0, start, end)["skills"]), 1)
+        self.assertEqual(api._profiles_sync(0, start, end)["totals"]["sessions"], 1)
+
+        outside_start = 1_800_000_001
+        outside_end = 1_800_001_000
+        self.assertEqual(api._overview_sync(0, outside_start, outside_end)["totals"]["sessions"], 0)
+        self.assertEqual(api._tools_sync(0, outside_start, outside_end)["tools"], [])
+        self.assertEqual(api._skills_sync(0, outside_start, outside_end)["skills"], [])
+        self.assertEqual(api._profiles_sync(0, outside_start, outside_end)["totals"]["sessions"], 0)
+
+    def test_custom_period_filters_runtime_logs_and_rejects_reverse_ranges(self):
+        log_time = api._timestamp_from_log("2027-01-15 08:00:00,000")
+        included = api._telemetry_sync(0, "session-1", log_time, log_time + 4)
+        excluded = api._telemetry_sync(0, "session-1", log_time + 4, log_time + 8)
+        self.assertEqual(included["summary"]["api_calls"], 1)
+        self.assertEqual(included["summary"]["tool_runs"], 1)
+        self.assertEqual(excluded["summary"]["api_calls"], 0)
+        with self.assertRaises(api.HTTPException) as context:
+            api._period_bounds(0, 20, 10)
+        self.assertEqual(context.exception.status_code, 422)
+
     def test_outcomes_do_not_label_stale_unended_sessions_as_running(self):
         stale = api._session_outcome({"ended_at": None, "last_activity_at": 1})
         active = api._session_outcome({"ended_at": None, "last_activity_at": api.time.time()})

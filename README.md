@@ -24,6 +24,8 @@ It is a unified Hermes plugin—one install contains the native Desktop page and
 - Overview, Operations, Tools, Skills, and System views.
 - Ask Lens: builds a grounded analysis prompt locally, copies it, and opens a new Hermes chat.
 - Failure-first, recent, cost, token, and tool-call sorting; pagination grows to a 500-session safety limit.
+- Click-to-sort headers on every evidence table, with visible direction and keyboard-accessible controls.
+- Persistent 7/30/90-day, all-time, or custom inclusive start/end date filtering for historical analytics.
 
 ## Compatibility
 

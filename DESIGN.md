@@ -191,7 +191,7 @@ The form language is compact and lightly softened. Native/select controls use re
 
 ### Header and signals
 
-- **Header:** Compact title and grounding sentence on the left; time range and explicit refresh on the right.
+- **Header:** Compact title and grounding sentence on the left; preset/custom time range and explicit refresh on the right. Custom ranges expose labelled native start/end date fields and treat the end date as inclusive.
 - **Signal strip:** Four equal accounting cells—Recorded cost, Tokens, Sessions, and Failures detected—with a small provenance/detail line below each value.
 - **Partial-known cost:** When some sessions are unpriced, preserve the sum of known cost and show the unpriced session count; do not replace known accounting with a false zero.
 
@@ -208,7 +208,7 @@ The form language is compact and lightly softened. Native/select controls use re
 
 ### Evidence tables and trace
 
-- **Tables:** Secondary-surface headers, one-pixel row separators, right-aligned numeric columns, and horizontal overflow preserve dense comparisons.
+- **Tables:** Secondary-surface headers, one-pixel row separators, right-aligned numeric columns, and horizontal overflow preserve dense comparisons. Every header is a keyboard-accessible sort control with a Codicon direction indicator and `aria-sort` state; sorting is local and stable.
 - **Trace:** Chronological user, assistant, reasoning, tool-call, and tool-result rows. Reasoning is collapsed by default; tool results use bounded, scrollable monospace blocks.
 - **Failure inspector:** Begins with a destructive-wash notice stating how many failures are shown versus detected and directs the user to review recorded evidence before concluding.
 - **Trust note:** Trace copy explicitly excludes system and scheduled-job scaffold prompts and states that content is secret-redacted and bounded to 6,000 characters per event.

@@ -31,7 +31,7 @@ except ImportError:  # pragma: no cover - makes isolated editor/test imports cle
 
 router = APIRouter()
 
-PLUGIN_VERSION = "0.2.0"
+PLUGIN_VERSION = "0.3.0"
 MAX_SESSION_PAGE = 500
 MAX_ANALYSIS_EVENTS = 5000
 MAX_SEARCH_MATCHES = 2000
@@ -158,6 +158,46 @@ def _integer(value: Any, default: int = 0) -> int:
         return int(value if value is not None else default)
     except (TypeError, ValueError):
         return default
+
+
+def _period_bounds(
+    days: int,
+    start_at: Optional[float] = None,
+    end_at: Optional[float] = None,
+) -> Tuple[float, Optional[float]]:
+    if start_at is None and end_at is None:
+        return (time.time() - days * 86400 if days > 0 else 0), None
+    start = max(0, _number(start_at, 0))
+    end = _number(end_at) if end_at is not None else None
+    if end is not None and end <= start:
+        raise HTTPException(status_code=422, detail="end_at must be later than start_at")
+    return start, end
+
+
+def _period_sql(
+    column: str,
+    start_at: float,
+    end_at: Optional[float],
+) -> Tuple[str, List[float]]:
+    clauses = [f"{column} >= ?"]
+    params = [start_at]
+    if end_at is not None:
+        clauses.append(f"{column} < ?")
+        params.append(end_at)
+    return " AND ".join(clauses), params
+
+
+def _period_payload(
+    days: int,
+    start_at: float,
+    end_at: Optional[float],
+) -> Dict[str, Any]:
+    return {
+        "days": days,
+        "start_at": start_at or None,
+        "end_at": end_at,
+        "custom": end_at is not None,
+    }
 
 
 def _clean_text(value: Any, limit: int = MAX_SNIPPET_CHARS) -> str:
@@ -590,6 +630,8 @@ def _search_hits(db: Any, query: str) -> Dict[str, str]:
 def _list_sessions_sync(
     *,
     days: int,
+    start_at: Optional[float] = None,
+    end_at: Optional[float] = None,
     query: str,
     sort: str,
     failures_only: bool,
@@ -597,16 +639,14 @@ def _list_sessions_sync(
     limit: int,
     offset: int,
 ) -> Dict[str, Any]:
-    cutoff = time.time() - days * 86400 if days > 0 else None
+    period_start, period_end = _period_bounds(days, start_at, end_at)
+    period_sql, period_params = _period_sql("s.started_at", period_start, period_end)
     with _database() as db:
         snippets = _search_hits(db, query) if query else {}
-        params: List[Any] = []
-        where = ["coalesce(s.hidden, 0) = 0"]
+        params: List[Any] = list(period_params)
+        where = [period_sql, "coalesce(s.hidden, 0) = 0"]
         if not include_archived:
             where.append("coalesce(s.archived, 0) = 0")
-        if cutoff is not None:
-            where.append("s.started_at >= ?")
-            params.append(cutoff)
         if failures_only:
             where.append("coalesce(f.failure_count, 0) > 0")
         if query:
@@ -681,6 +721,8 @@ def _list_sessions_sync(
             },
             "filters": {
                 "days": days,
+                "start_at": period_start or None,
+                "end_at": period_end,
                 "query": query,
                 "sort": sort,
                 "failures_only": failures_only,
@@ -709,6 +751,8 @@ async def health() -> Dict[str, Any]:
 @router.get("/sessions")
 async def sessions(
     days: int = Query(30, ge=0, le=3650),
+    start_at: Optional[float] = Query(None, ge=0),
+    end_at: Optional[float] = Query(None, ge=0),
     q: str = Query("", max_length=240),
     sort: str = Query("failures"),
     failures_only: bool = False,
@@ -719,6 +763,8 @@ async def sessions(
     return await asyncio.to_thread(
         _list_sessions_sync,
         days=days,
+        start_at=start_at,
+        end_at=end_at,
         query=q.strip(),
         sort=sort,
         failures_only=failures_only,
@@ -1061,16 +1107,24 @@ def _metric_groups(rows: List[Dict[str, Any]], key: str) -> List[Dict[str, Any]]
     return result
 
 
-def _telemetry_sync(days: int, session_id: str = "") -> Dict[str, Any]:
+def _telemetry_sync(
+    days: int,
+    session_id: str = "",
+    start_at: Optional[float] = None,
+    end_at: Optional[float] = None,
+) -> Dict[str, Any]:
     runtime = _runtime_events()
-    cutoff = time.time() - days * 86400 if days > 0 else 0
+    period_start, period_end = _period_bounds(days, start_at, end_at)
+    in_period = lambda row: row["timestamp"] >= period_start and (
+        period_end is None or row["timestamp"] < period_end
+    )
     api_rows = [
         row for row in runtime["api"]
-        if row["timestamp"] >= cutoff and (not session_id or row.get("session_id") == session_id)
+        if in_period(row) and (not session_id or row.get("session_id") == session_id)
     ]
     tool_rows = [
         row for row in runtime["tools"]
-        if row["timestamp"] >= cutoff and (not session_id or row.get("session_id") == session_id)
+        if in_period(row) and (not session_id or row.get("session_id") == session_id)
     ]
     latencies = [row["latency_seconds"] for row in api_rows]
     prompt_tokens = sum(_integer(row.get("prompt_tokens")) for row in api_rows)
@@ -1096,6 +1150,7 @@ def _telemetry_sync(days: int, session_id: str = "") -> Dict[str, Any]:
     tools.sort(key=lambda item: (item["failed"], item["runs"]), reverse=True)
     return {
         "period_days": days,
+        "period": _period_payload(days, period_start, period_end),
         "session_id": session_id or None,
         "summary": {
             "api_calls": len(api_rows),
@@ -1122,13 +1177,34 @@ def _telemetry_sync(days: int, session_id: str = "") -> Dict[str, Any]:
 @router.get("/telemetry")
 async def telemetry(
     days: int = Query(30, ge=0, le=3650),
+    start_at: Optional[float] = Query(None, ge=0),
+    end_at: Optional[float] = Query(None, ge=0),
     session_id: str = Query("", max_length=240),
 ) -> Dict[str, Any]:
-    return await asyncio.to_thread(_telemetry_sync, days, session_id.strip())
+    return await asyncio.to_thread(
+        _telemetry_sync,
+        days,
+        session_id.strip(),
+        start_at,
+        end_at,
+    )
 
 
-def _overview_sync(days: int) -> Dict[str, Any]:
-    cutoff = time.time() - days * 86400 if days > 0 else 0
+def _overview_sync(
+    days: int,
+    start_at: Optional[float] = None,
+    end_at: Optional[float] = None,
+) -> Dict[str, Any]:
+    period_start, period_end = _period_bounds(days, start_at, end_at)
+    session_period_sql, session_period_params = _period_sql(
+        "started_at", period_start, period_end
+    )
+    joined_period_sql, joined_period_params = _period_sql(
+        "s.started_at", period_start, period_end
+    )
+    failure_period_sql, failure_period_params = _period_sql(
+        "sx.started_at", period_start, period_end
+    )
     with _database() as db:
         totals_row = db._conn.execute(
             f"""
@@ -1152,11 +1228,11 @@ def _overview_sync(days: int) -> Dict[str, Any]:
                    coalesce(SUM(CASE WHEN coalesce(actual_cost_usd,0) <= 0 AND coalesce(estimated_cost_usd,0) <= 0 AND lower(coalesce(cost_status,'')) NOT IN ('included','subscription','free') THEN 1 ELSE 0 END),0) AS unpriced_sessions,
                    (SELECT COUNT(*) FROM messages m
                     JOIN sessions sx ON sx.id=m.session_id
-                    WHERE sx.started_at >= ? AND coalesce(sx.hidden,0)=0 AND {_failure_sql('m')}) AS failures
+                     WHERE {failure_period_sql} AND coalesce(sx.hidden,0)=0 AND {_failure_sql('m')}) AS failures
             FROM sessions
-            WHERE started_at >= ? AND coalesce(hidden,0)=0
+            WHERE {session_period_sql} AND coalesce(hidden,0)=0
             """,
-            (cutoff, cutoff),
+            tuple(failure_period_params + session_period_params),
         ).fetchone()
         totals = _row_dict(totals_row)
         totals["total_tokens"] = sum(
@@ -1177,7 +1253,7 @@ def _overview_sync(days: int) -> Dict[str, Any]:
         daily = [
             _row_dict(row)
             for row in db._conn.execute(
-                """
+                f"""
                 SELECT date(started_at, 'unixepoch', 'localtime') AS day,
                        COUNT(*) AS sessions,
                        coalesce(SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens),0) AS total_tokens,
@@ -1187,16 +1263,16 @@ def _overview_sync(days: int) -> Dict[str, Any]:
                            WHEN estimated_cost_usd > 0 THEN estimated_cost_usd
                            ELSE 0 END),0) AS cost_usd
                 FROM sessions
-                WHERE started_at >= ? AND coalesce(hidden,0)=0
+                WHERE {session_period_sql} AND coalesce(hidden,0)=0
                 GROUP BY day ORDER BY day
                 """,
-                (cutoff,),
+                tuple(session_period_params),
             ).fetchall()
         ]
         models = [
             _row_dict(row)
             for row in db._conn.execute(
-                """
+                f"""
                 SELECT u.model, u.billing_provider, COUNT(DISTINCT u.session_id) AS sessions,
                        SUM(u.api_call_count) AS api_calls,
                        SUM(u.input_tokens) AS input_tokens,
@@ -1209,11 +1285,11 @@ def _overview_sync(days: int) -> Dict[str, Any]:
                        SUM(CASE WHEN lower(coalesce(u.cost_status,'')) IN ('included','subscription','free') THEN 1 ELSE 0 END) AS included_rows
                 FROM session_model_usage u
                 JOIN sessions s ON s.id = u.session_id
-                WHERE s.started_at >= ? AND coalesce(s.hidden,0)=0
+                WHERE {joined_period_sql} AND coalesce(s.hidden,0)=0
                 GROUP BY u.model, u.billing_provider
                 ORDER BY total_tokens DESC LIMIT 30
                 """,
-                (cutoff,),
+                tuple(joined_period_params),
             ).fetchall()
         ]
         for model in models:
@@ -1225,29 +1301,30 @@ def _overview_sync(days: int) -> Dict[str, Any]:
         sources = [
             _row_dict(row)
             for row in db._conn.execute(
-                """
+                f"""
                 SELECT coalesce(source,'unknown') AS source, COUNT(*) AS sessions,
                        SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens) AS total_tokens,
                        SUM(tool_call_count) AS tool_calls
                 FROM sessions
-                WHERE started_at >= ? AND coalesce(hidden,0)=0
+                WHERE {session_period_sql} AND coalesce(hidden,0)=0
                 GROUP BY source ORDER BY sessions DESC
                 """,
-                (cutoff,),
+                tuple(session_period_params),
             ).fetchall()
         ]
         outcome_counts: Counter[str] = Counter()
         for row in db._conn.execute(
-            """
+            f"""
             SELECT end_reason, ended_at, last_activity_at, started_at
             FROM sessions
-            WHERE started_at >= ? AND coalesce(hidden,0)=0
+            WHERE {session_period_sql} AND coalesce(hidden,0)=0
             """,
-            (cutoff,),
+            tuple(session_period_params),
         ).fetchall():
             outcome_counts[_session_outcome(_row_dict(row))["outcome"]] += 1
         return {
             "period_days": days,
+            "period": _period_payload(days, period_start, period_end),
             "totals": totals,
             "daily": daily,
             "models": models,
@@ -1261,12 +1338,21 @@ def _overview_sync(days: int) -> Dict[str, Any]:
 
 
 @router.get("/overview")
-async def overview(days: int = Query(30, ge=0, le=3650)) -> Dict[str, Any]:
-    return await asyncio.to_thread(_overview_sync, days)
+async def overview(
+    days: int = Query(30, ge=0, le=3650),
+    start_at: Optional[float] = Query(None, ge=0),
+    end_at: Optional[float] = Query(None, ge=0),
+) -> Dict[str, Any]:
+    return await asyncio.to_thread(_overview_sync, days, start_at, end_at)
 
 
-def _tools_sync(days: int) -> Dict[str, Any]:
-    cutoff = time.time() - days * 86400 if days > 0 else 0
+def _tools_sync(
+    days: int,
+    start_at: Optional[float] = None,
+    end_at: Optional[float] = None,
+) -> Dict[str, Any]:
+    period_start, period_end = _period_bounds(days, start_at, end_at)
+    period_sql, period_params = _period_sql("s.started_at", period_start, period_end)
     with _database() as db:
         # Match Hermes Insights' double-count protection: calls may be
         # represented on both the assistant envelope and the tool-result row,
@@ -1274,15 +1360,15 @@ def _tools_sync(days: int) -> Dict[str, Any]:
         # Parsing only the compact JSON envelope is cheap; result bodies never
         # leave SQLite for this aggregate view.
         assistant_rows = db._conn.execute(
-            """
+            f"""
             SELECT m.session_id, m.tool_calls, m.timestamp
             FROM messages m
             JOIN sessions s ON s.id=m.session_id
-            WHERE s.started_at>=? AND coalesce(s.hidden,0)=0
+            WHERE {period_sql} AND coalesce(s.hidden,0)=0
               AND coalesce(m.active,1)=1 AND m.role='assistant'
               AND m.tool_calls IS NOT NULL
             """,
-            (cutoff,),
+            tuple(period_params),
         ).fetchall()
         assistant: Dict[str, Dict[str, Any]] = {}
         for row in assistant_rows:
@@ -1307,12 +1393,12 @@ def _tools_sync(days: int) -> Dict[str, Any]:
                    MAX(m.timestamp) AS last_used_at
             FROM messages m
             JOIN sessions s ON s.id=m.session_id
-            WHERE s.started_at>=? AND coalesce(s.hidden,0)=0
+            WHERE {period_sql} AND coalesce(s.hidden,0)=0
               AND coalesce(m.active,1)=1 AND m.role='tool'
               AND m.tool_name IS NOT NULL
             GROUP BY m.tool_name
             """,
-            (cutoff,),
+            tuple(period_params),
         ).fetchall()
         results = {row["name"]: _row_dict(row) for row in result_rows}
 
@@ -1344,6 +1430,7 @@ def _tools_sync(days: int) -> Dict[str, Any]:
         tools.sort(key=lambda item: (item["failures"], item["calls"], item["name"]), reverse=True)
         return {
             "period_days": days,
+            "period": _period_payload(days, period_start, period_end),
             "tools": tools,
             "totals": {
                 "calls": sum(item["calls"] for item in tools),
@@ -1356,24 +1443,33 @@ def _tools_sync(days: int) -> Dict[str, Any]:
 
 
 @router.get("/tools")
-async def tools(days: int = Query(30, ge=0, le=3650)) -> Dict[str, Any]:
-    return await asyncio.to_thread(_tools_sync, days)
+async def tools(
+    days: int = Query(30, ge=0, le=3650),
+    start_at: Optional[float] = Query(None, ge=0),
+    end_at: Optional[float] = Query(None, ge=0),
+) -> Dict[str, Any]:
+    return await asyncio.to_thread(_tools_sync, days, start_at, end_at)
 
 
-def _skills_sync(days: int) -> Dict[str, Any]:
-    cutoff = time.time() - days * 86400 if days > 0 else 0
+def _skills_sync(
+    days: int,
+    start_at: Optional[float] = None,
+    end_at: Optional[float] = None,
+) -> Dict[str, Any]:
+    period_start, period_end = _period_bounds(days, start_at, end_at)
+    period_sql, period_params = _period_sql("s.started_at", period_start, period_end)
     with _database() as db:
         rows = db._conn.execute(
-            """
+            f"""
             SELECT m.session_id, m.tool_calls, m.timestamp
             FROM messages m
             JOIN sessions s ON s.id=m.session_id
-            WHERE s.started_at >= ? AND coalesce(s.hidden,0)=0
+            WHERE {period_sql} AND coalesce(s.hidden,0)=0
               AND m.role='assistant' AND m.tool_calls IS NOT NULL
               AND (instr(m.tool_calls,'skill_view') > 0 OR instr(m.tool_calls,'skill_manage') > 0)
             ORDER BY m.timestamp DESC
             """,
-            (cutoff,),
+            tuple(period_params),
         ).fetchall()
         skills: Dict[str, Dict[str, Any]] = {}
         for row in rows:
@@ -1408,6 +1504,7 @@ def _skills_sync(days: int) -> Dict[str, Any]:
         result.sort(key=lambda item: (item["total_actions"], item["name"]), reverse=True)
         return {
             "period_days": days,
+            "period": _period_payload(days, period_start, period_end),
             "skills": result,
             "totals": {
                 "loads": sum(item["view_count"] for item in result),
@@ -1420,8 +1517,12 @@ def _skills_sync(days: int) -> Dict[str, Any]:
 
 
 @router.get("/skills")
-async def skills(days: int = Query(30, ge=0, le=3650)) -> Dict[str, Any]:
-    return await asyncio.to_thread(_skills_sync, days)
+async def skills(
+    days: int = Query(30, ge=0, le=3650),
+    start_at: Optional[float] = Query(None, ge=0),
+    end_at: Optional[float] = Query(None, ge=0),
+) -> Dict[str, Any]:
+    return await asyncio.to_thread(_skills_sync, days, start_at, end_at)
 
 
 def _profile_db_paths(home: Path) -> List[Tuple[str, Path]]:
@@ -1438,11 +1539,18 @@ def _profile_db_paths(home: Path) -> List[Tuple[str, Path]]:
     return paths
 
 
-def _profile_summary(name: str, path: Path, cutoff: float) -> Dict[str, Any]:
+def _profile_summary(
+    name: str,
+    path: Path,
+    start_at: float,
+    end_at: Optional[float],
+) -> Dict[str, Any]:
+    period_sql, period_params = _period_sql("started_at", start_at, end_at)
+
     def read(connection: sqlite3.Connection) -> Dict[str, Any]:
         totals = _row_dict(
             connection.execute(
-                """
+                f"""
                 SELECT COUNT(*) AS sessions,
                        coalesce(SUM(message_count),0) AS messages,
                        coalesce(SUM(tool_call_count),0) AS tool_calls,
@@ -1452,29 +1560,29 @@ def _profile_summary(name: str, path: Path, cutoff: float) -> Dict[str, Any]:
                            WHEN estimated_cost_usd > 0 THEN estimated_cost_usd
                            ELSE 0 END),0) AS recorded_cost_usd,
                        MAX(coalesce(last_activity_at, started_at)) AS last_activity_at
-                FROM sessions WHERE started_at>=? AND coalesce(hidden,0)=0
+                FROM sessions WHERE {period_sql} AND coalesce(hidden,0)=0
                 """,
-                (cutoff,),
+                tuple(period_params),
             ).fetchone()
         )
         outcomes: Counter[str] = Counter()
         for row in connection.execute(
-            """
+            f"""
             SELECT end_reason, ended_at, last_activity_at, started_at
-            FROM sessions WHERE started_at>=? AND coalesce(hidden,0)=0
+            FROM sessions WHERE {period_sql} AND coalesce(hidden,0)=0
             """,
-            (cutoff,),
+            tuple(period_params),
         ).fetchall():
             outcomes[_session_outcome(_row_dict(row))["outcome"]] += 1
         models = [
             {"model": row["model"] or "unknown", "sessions": _integer(row["sessions"])}
             for row in connection.execute(
-                """
+                f"""
                 SELECT model, COUNT(*) AS sessions FROM sessions
-                WHERE started_at>=? AND coalesce(hidden,0)=0
+                WHERE {period_sql} AND coalesce(hidden,0)=0
                 GROUP BY model ORDER BY sessions DESC LIMIT 5
                 """,
-                (cutoff,),
+                tuple(period_params),
             ).fetchall()
         ]
         return {"totals": totals, "outcomes": outcomes, "models": models}
@@ -1514,18 +1622,23 @@ def _profile_summary(name: str, path: Path, cutoff: float) -> Dict[str, Any]:
     }
 
 
-def _profiles_sync(days: int) -> Dict[str, Any]:
-    cutoff = time.time() - days * 86400 if days > 0 else 0
+def _profiles_sync(
+    days: int,
+    start_at: Optional[float] = None,
+    end_at: Optional[float] = None,
+) -> Dict[str, Any]:
+    period_start, period_end = _period_bounds(days, start_at, end_at)
     profiles = []
     errors = []
     for name, path in _profile_db_paths(_hermes_home()):
         try:
-            profiles.append(_profile_summary(name, path, cutoff))
+            profiles.append(_profile_summary(name, path, period_start, period_end))
         except Exception as error:
             errors.append({"profile": name, "error": _clean_text(error, 240)})
     profiles.sort(key=lambda item: _number(item.get("last_activity_at")), reverse=True)
     return {
         "period_days": days,
+        "period": _period_payload(days, period_start, period_end),
         "profiles": profiles,
         "totals": {
             "profiles": len(profiles),
@@ -1539,8 +1652,12 @@ def _profiles_sync(days: int) -> Dict[str, Any]:
 
 
 @router.get("/profiles")
-async def profiles(days: int = Query(30, ge=0, le=3650)) -> Dict[str, Any]:
-    return await asyncio.to_thread(_profiles_sync, days)
+async def profiles(
+    days: int = Query(30, ge=0, le=3650),
+    start_at: Optional[float] = Query(None, ge=0),
+    end_at: Optional[float] = Query(None, ge=0),
+) -> Dict[str, Any]:
+    return await asyncio.to_thread(_profiles_sync, days, start_at, end_at)
 
 
 def _read_json_file(path: Path, max_bytes: int = 2 * 1024 * 1024) -> Any:

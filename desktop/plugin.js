@@ -50,7 +50,8 @@ const timeOptions = [
   { id: '7', label: '7d' },
   { id: '30', label: '30d' },
   { id: '90', label: '90d' },
-  { id: '0', label: 'All' }
+  { id: '0', label: 'All' },
+  { id: 'custom', label: 'Custom' }
 ]
 const pageTabs = [
   { id: 'sessions', label: 'Sessions', codicon: 'list-tree' },
@@ -67,6 +68,37 @@ function apiPath(path, params = {}) {
     .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`)
     .join('&')
   return query ? `${path}?${query}` : path
+}
+
+function dateInputValue(date) {
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
+}
+
+function dateDaysAgo(days) {
+  const date = new Date()
+  date.setHours(12, 0, 0, 0)
+  date.setDate(date.getDate() - days)
+  return dateInputValue(date)
+}
+
+function normaliseDateInput(value, fallback) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(value || ''))) return fallback
+  const parsed = new Date(`${value}T00:00:00`)
+  return Number.isNaN(parsed.getTime()) ? fallback : String(value)
+}
+
+function periodParams(range, customStart, customEnd) {
+  if (range !== 'custom') return { days: Number(range) || 0 }
+  const start = new Date(`${customStart}T00:00:00`)
+  const end = new Date(`${customEnd}T00:00:00`)
+  end.setDate(end.getDate() + 1)
+  return {
+    start_at: Math.floor(start.getTime() / 1000),
+    end_at: Math.floor(end.getTime() / 1000)
+  }
 }
 
 function timestampDate(timestamp) {
@@ -319,6 +351,25 @@ function NativeSelect({ value, onChange, label, children }) {
   })
 }
 
+function DateField({ label, value, onChange, min, max }) {
+  return jsxs('label', {
+    style: { alignItems: 'center', color: color.tertiary, display: 'inline-flex', fontSize: '0.6875rem', gap: '0.35rem' },
+    children: [
+      jsx('span', { children: label }),
+      jsx(Input, {
+        type: 'date',
+        value,
+        min,
+        max,
+        required: true,
+        onChange: event => onChange(event.target.value),
+        'aria-label': `${label} date`,
+        style: { fontVariantNumeric: 'tabular-nums', width: '8.6rem' }
+      })
+    ]
+  })
+}
+
 function CostLabel({ session }) {
   const kind = session.cost_kind || 'unpriced'
   return jsx(Pill, {
@@ -443,7 +494,47 @@ function DetailMetricGrid({ session }) {
   })
 }
 
+function tableSortValue(column, row) {
+  const value = column.sortValue ? column.sortValue(row) : row[column.key]
+  if (value === null || value === undefined || value === '') return null
+  if (typeof value === 'boolean') return value ? 1 : 0
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null
+  return String(value).toLocaleLowerCase()
+}
+
+function tableRowKey(row, index, columns) {
+  const signature = columns.map(column => {
+    const value = row[column.key]
+    return value === null || value === undefined || typeof value === 'object' ? '' : String(value)
+  }).join('\u001f')
+  return `${signature}\u001e${index}`
+}
+
 function SimpleTable({ columns, rows, emptyTitle = 'Nothing recorded', emptyDescription }) {
+  const [sortState, setSortState] = useState(null)
+  const sortedRows = useMemo(() => {
+    const materialRows = (rows || []).map((row, index) => ({
+      row,
+      index,
+      key: tableRowKey(row, index, columns)
+    }))
+    if (!sortState) return materialRows
+    const column = columns.find(item => item.key === sortState.key)
+    if (!column) return materialRows
+    const direction = sortState.direction === 'desc' ? -1 : 1
+    return materialRows
+      .map(item => ({ ...item, value: tableSortValue(column, item.row) }))
+      .sort((left, right) => {
+        if (left.value === null && right.value === null) return left.index - right.index
+        if (left.value === null) return 1
+        if (right.value === null) return -1
+        const comparison = typeof left.value === 'number' && typeof right.value === 'number'
+          ? left.value - right.value
+          : String(left.value).localeCompare(String(right.value), undefined, { numeric: true, sensitivity: 'base' })
+        return comparison === 0 ? left.index - right.index : comparison * direction
+      })
+  }, [columns, rows, sortState])
+
   if (!rows?.length) {
     return jsx(EmptyState, { title: emptyTitle, description: emptyDescription })
   }
@@ -457,29 +548,65 @@ function SimpleTable({ columns, rows, emptyTitle = 'Nothing recorded', emptyDesc
             children: columns.map(column =>
               jsx('th', {
                 scope: 'col',
+                'aria-sort': sortState?.key === column.key
+                  ? (sortState.direction === 'asc' ? 'ascending' : 'descending')
+                  : 'none',
                 style: {
                   background: color.surface,
                   borderBottom: border,
-                  color: color.tertiary,
-                  fontSize: '0.6875rem',
-                  fontWeight: 600,
-                  padding: '0.5rem 0.65rem',
-                  textAlign: column.align || 'left',
+                  padding: 0,
                   whiteSpace: 'nowrap'
                 },
-                children: column.label
+                children: jsx('button', {
+                  type: 'button',
+                  onClick: () => setSortState(current => ({
+                    key: column.key,
+                    direction: current?.key === column.key && current.direction === 'asc' ? 'desc' : 'asc'
+                  })),
+                  'aria-label': `Sort by ${column.label}${sortState?.key === column.key ? `, currently ${sortState.direction === 'asc' ? 'ascending' : 'descending'}` : ''}`,
+                  title: `Sort by ${column.label}`,
+                  style: {
+                    alignItems: 'center',
+                    background: 'transparent',
+                    border: 'none',
+                    color: sortState?.key === column.key ? color.primary : color.tertiary,
+                    cursor: 'pointer',
+                    display: 'flex',
+                    font: 'inherit',
+                    fontSize: '0.6875rem',
+                    fontWeight: sortState?.key === column.key ? 650 : 600,
+                    gap: '0.3rem',
+                    justifyContent: column.align === 'right' ? 'flex-end' : 'flex-start',
+                    outlineColor: color.accent,
+                    padding: '0.5rem 0.65rem',
+                    textAlign: column.align || 'left',
+                    width: '100%'
+                  },
+                  children: [
+                    jsx('span', { children: column.label }),
+                    jsx(Codicon, {
+                      name: sortState?.key === column.key
+                        ? (sortState.direction === 'asc' ? 'arrow-small-up' : 'arrow-small-down')
+                        : 'arrow-swap',
+                      size: '0.7rem',
+                      style: { color: sortState?.key === column.key ? color.accent : color.quaternary },
+                      'aria-hidden': true
+                    })
+                  ]
+                })
               }, column.key)
             )
           })
         }),
         jsx('tbody', {
-          children: rows.map((row, rowIndex) =>
-            jsx('tr', {
+          children: sortedRows.map((item, rowIndex) => {
+            const row = item.row
+            return jsx('tr', {
               children: columns.map(column =>
                 jsx('td', {
                   style: {
                     ...tabular,
-                    borderBottom: rowIndex === rows.length - 1 ? 'none' : border,
+                    borderBottom: rowIndex === sortedRows.length - 1 ? 'none' : border,
                     color: column.muted ? color.tertiary : color.primary,
                     padding: '0.58rem 0.65rem',
                     textAlign: column.align || 'left',
@@ -488,8 +615,8 @@ function SimpleTable({ columns, rows, emptyTitle = 'Nothing recorded', emptyDesc
                   children: column.render ? column.render(row) : row[column.key]
                 }, column.key)
               )
-            }, row.id || row.name || row.model || rowIndex)
-          )
+            }, item.key)
+          })
         })
       ]
     })
@@ -508,10 +635,10 @@ function SessionSummary({ detail }) {
           jsx(SimpleTable, {
             columns: [
               { key: 'model', label: 'Model' },
-              { key: 'task', label: 'Task', muted: true, render: row => row.task || 'main' },
+              { key: 'task', label: 'Task', muted: true, sortValue: row => row.task || 'main', render: row => row.task || 'main' },
               { key: 'total_tokens', label: 'Tokens', align: 'right', render: row => formatCount(row.total_tokens) },
               { key: 'api_call_count', label: 'Calls', align: 'right', render: row => formatCount(row.api_call_count) },
-              { key: 'cost', label: 'Cost', align: 'right', render: row => formatCost(row.display_cost_usd, row.cost_kind) }
+              { key: 'cost', label: 'Cost', align: 'right', sortValue: row => row.display_cost_usd, render: row => formatCost(row.display_cost_usd, row.cost_kind) }
             ],
             rows: detail.models,
             emptyTitle: 'No per-model accounting rows',
@@ -799,7 +926,7 @@ function AskLens({ detail, ctx }) {
   })
 }
 
-function TraceView({ ctx, sessionId, days }) {
+function TraceView({ ctx, sessionId, period }) {
   const [limit, setLimit] = useState(100)
   useEffect(() => setLimit(100), [sessionId])
   const traceQuery = useQuery({
@@ -809,8 +936,8 @@ function TraceView({ ctx, sessionId, days }) {
     placeholderData: previous => previous
   })
   const telemetryQuery = useQuery({
-    queryKey: [PLUGIN_ID, 'session-telemetry', sessionId, days],
-    queryFn: () => ctx.rest(apiPath('/telemetry', { days, session_id: sessionId })),
+    queryKey: [PLUGIN_ID, 'session-telemetry', sessionId, period.days, period.start_at, period.end_at],
+    queryFn: () => ctx.rest(apiPath('/telemetry', { ...period, session_id: sessionId })),
     enabled: Boolean(sessionId),
     refetchInterval: 60_000
   })
@@ -915,7 +1042,7 @@ function TraceView({ ctx, sessionId, days }) {
   })
 }
 
-function SessionDetail({ query, detailTab, setDetailTab, ctx, days, onBack }) {
+function SessionDetail({ query, detailTab, setDetailTab, ctx, period, onBack }) {
   if (!query) {
     return jsx(EmptyState, { title: 'Choose a session', description: 'Select a session to inspect its recorded evidence.' })
   }
@@ -932,7 +1059,7 @@ function SessionDetail({ query, detailTab, setDetailTab, ctx, days, onBack }) {
     { id: 'ask', label: 'Ask Lens' }
   ]
   let content = jsx(SessionSummary, { detail })
-  if (detailTab === 'trace') content = jsx(TraceView, { ctx, sessionId: session.id, days })
+  if (detailTab === 'trace') content = jsx(TraceView, { ctx, sessionId: session.id, period })
   if (detailTab === 'tools') content = jsx(ToolEvents, { events: detail.tools })
   if (detailTab === 'failures') content = jsx(FailureInspector, { failures: detail.failures, detectedTotal: session.failure_count })
   if (detailTab === 'files') content = jsx(FilesView, { files: detail.files, truncated: detail.analysis?.truncated })
@@ -990,7 +1117,7 @@ function SessionDetail({ query, detailTab, setDetailTab, ctx, days, onBack }) {
   })
 }
 
-function SessionsView({ ctx, days, narrow }) {
+function SessionsView({ ctx, period, narrow }) {
   const [search, setSearch] = useState('')
   const [sort, setSort] = useState('failures')
   const [failuresOnly, setFailuresOnly] = useState(false)
@@ -1000,16 +1127,16 @@ function SessionsView({ ctx, days, narrow }) {
   const [narrowPane, setNarrowPane] = useState('list')
   const debouncedSearch = useDebounced(search, 250)
 
-  useEffect(() => setLimit(50), [debouncedSearch, sort, failuresOnly, days])
+  useEffect(() => setLimit(50), [debouncedSearch, sort, failuresOnly, period.days, period.start_at, period.end_at])
   useEffect(() => {
     if (narrow) setNarrowPane('list')
   }, [narrow])
 
   const listQuery = useQuery({
-    queryKey: [PLUGIN_ID, 'sessions', days, debouncedSearch, sort, failuresOnly, limit],
+    queryKey: [PLUGIN_ID, 'sessions', period.days, period.start_at, period.end_at, debouncedSearch, sort, failuresOnly, limit],
     queryFn: () =>
       ctx.rest(apiPath('/sessions', {
-        days,
+        ...period,
         q: debouncedSearch,
         sort,
         failures_only: failuresOnly,
@@ -1141,9 +1268,9 @@ function SessionsView({ ctx, days, narrow }) {
                   ? jsx(SessionDetail, {
                       query: detailQuery,
                       detailTab,
-                      setDetailTab,
-                      ctx,
-                      days,
+                       setDetailTab,
+                       ctx,
+                       period,
                       onBack: narrow ? () => setNarrowPane('list') : undefined
                     })
                   : jsx(EmptyState, { title: 'Choose a session', description: 'Session evidence will appear here.' })
@@ -1208,7 +1335,7 @@ function OverviewView({ query }) {
             jsx(SimpleTable, {
               columns: [
                 { key: 'model', label: 'Model' },
-                { key: 'billing_provider', label: 'Provider', muted: true, render: row => row.billing_provider || 'unknown' },
+                { key: 'billing_provider', label: 'Provider', muted: true, sortValue: row => row.billing_provider || 'unknown', render: row => row.billing_provider || 'unknown' },
                 { key: 'sessions', label: 'Sessions', align: 'right', render: row => formatCount(row.sessions) },
                 { key: 'total_tokens', label: 'Tokens', align: 'right', render: row => formatCount(row.total_tokens) },
                 { key: 'cost_usd', label: 'Recorded cost', align: 'right', render: row => formatCost(row.cost_usd, row.cost_kind) }
@@ -1251,10 +1378,10 @@ function OverviewView({ query }) {
   })
 }
 
-function ToolsView({ ctx, days }) {
+function ToolsView({ ctx, period }) {
   const query = useQuery({
-    queryKey: [PLUGIN_ID, 'tools', days],
-    queryFn: () => ctx.rest(apiPath('/tools', { days })),
+    queryKey: [PLUGIN_ID, 'tools', period.days, period.start_at, period.end_at],
+    queryFn: () => ctx.rest(apiPath('/tools', period)),
     refetchInterval: 60_000
   })
   if (query.isLoading) return jsx(LoadingBlock, { rows: 8 })
@@ -1295,10 +1422,10 @@ function ToolsView({ ctx, days }) {
   })
 }
 
-function SkillsViewPanel({ ctx, days }) {
+function SkillsViewPanel({ ctx, period }) {
   const query = useQuery({
-    queryKey: [PLUGIN_ID, 'skills', days],
-    queryFn: () => ctx.rest(apiPath('/skills', { days })),
+    queryKey: [PLUGIN_ID, 'skills', period.days, period.start_at, period.end_at],
+    queryFn: () => ctx.rest(apiPath('/skills', period)),
     refetchInterval: 60_000
   })
   if (query.isLoading) return jsx(LoadingBlock, { rows: 8 })
@@ -1330,10 +1457,10 @@ function SkillsViewPanel({ ctx, days }) {
   })
 }
 
-function RuntimeHealth({ ctx, days }) {
+function RuntimeHealth({ ctx, period }) {
   const telemetryQuery = useQuery({
-    queryKey: [PLUGIN_ID, 'telemetry', days],
-    queryFn: () => ctx.rest(apiPath('/telemetry', { days })),
+    queryKey: [PLUGIN_ID, 'telemetry', period.days, period.start_at, period.end_at],
+    queryFn: () => ctx.rest(apiPath('/telemetry', period)),
     refetchInterval: 60_000
   })
   const gatewayQuery = useQuery({
@@ -1366,7 +1493,7 @@ function RuntimeHealth({ ctx, days }) {
             columns: [
               { key: 'profile', label: 'Profile' },
               { key: 'state', label: 'Gateway', render: row => jsx(Pill, { tone: row.state === 'running' ? 'accent' : 'neutral', children: row.state }) },
-              { key: 'platforms', label: 'Platforms', render: row => row.platforms?.length ? row.platforms.map(item => `${item.name}: ${item.state}`).join(' · ') : 'None recorded' },
+              { key: 'platforms', label: 'Platforms', sortValue: row => row.platforms?.length ? row.platforms.map(item => `${item.name}: ${item.state}`).join(' · ') : 'None recorded', render: row => row.platforms?.length ? row.platforms.map(item => `${item.name}: ${item.state}`).join(' · ') : 'None recorded' },
               { key: 'active_agents', label: 'Agents', align: 'right', render: row => formatCount(row.active_agents) },
               { key: 'updated_at', label: 'Updated', render: row => formatShortDate(row.updated_at), muted: true }
             ],
@@ -1415,10 +1542,10 @@ function RuntimeHealth({ ctx, days }) {
   })
 }
 
-function ProfilesView({ ctx, days }) {
+function ProfilesView({ ctx, period }) {
   const query = useQuery({
-    queryKey: [PLUGIN_ID, 'profiles', days],
-    queryFn: () => ctx.rest(apiPath('/profiles', { days })),
+    queryKey: [PLUGIN_ID, 'profiles', period.days, period.start_at, period.end_at],
+    queryFn: () => ctx.rest(apiPath('/profiles', period)),
     refetchInterval: 60_000
   })
   if (query.isLoading) return jsx(LoadingBlock, { rows: 8 })
@@ -1437,9 +1564,9 @@ function ProfilesView({ ctx, days }) {
           { key: 'sessions', label: 'Sessions', align: 'right', render: row => formatCount(row.sessions) },
           { key: 'total_tokens', label: 'Tokens', align: 'right', render: row => formatCount(row.total_tokens) },
           { key: 'recorded_cost_usd', label: 'Recorded cost', align: 'right', render: row => formatCost(row.recorded_cost_usd, 'estimated') },
-          { key: 'running', label: 'Running', align: 'right', render: row => formatCount(row.outcomes?.running) },
-          { key: 'open', label: 'Open', align: 'right', render: row => formatCount(row.outcomes?.open) },
-          { key: 'failed', label: 'Failed', align: 'right', render: row => row.outcomes?.failed ? jsx(Pill, { tone: 'danger', children: formatCount(row.outcomes.failed) }) : '0' },
+          { key: 'running', label: 'Running', align: 'right', sortValue: row => row.outcomes?.running || 0, render: row => formatCount(row.outcomes?.running) },
+          { key: 'open', label: 'Open', align: 'right', sortValue: row => row.outcomes?.open || 0, render: row => formatCount(row.outcomes?.open) },
+          { key: 'failed', label: 'Failed', align: 'right', sortValue: row => row.outcomes?.failed || 0, render: row => row.outcomes?.failed ? jsx(Pill, { tone: 'danger', children: formatCount(row.outcomes.failed) }) : '0' },
           { key: 'last_activity_at', label: 'Last activity', render: row => formatShortDate(row.last_activity_at), muted: true }
         ],
         rows: data.profiles,
@@ -1472,7 +1599,7 @@ function SchedulesView({ ctx }) {
           { key: 'enabled', label: 'State', render: row => jsx(Pill, { tone: row.enabled ? 'accent' : 'neutral', children: row.enabled ? 'Enabled' : 'Disabled' }) },
           { key: 'schedule', label: 'Schedule' },
           { key: 'next_run_at', label: 'Next run', render: row => formatShortDate(row.next_run_at) },
-          { key: 'last_status', label: 'Last status', render: row => row.last_error ? jsx(Pill, { tone: 'danger', title: row.last_error, children: row.last_status || 'Error' }) : row.last_status || '—' },
+          { key: 'last_status', label: 'Last status', sortValue: row => row.last_status || (row.last_error ? 'Error' : ''), render: row => row.last_error ? jsx(Pill, { tone: 'danger', title: row.last_error, children: row.last_status || 'Error' }) : row.last_status || '—' },
           { key: 'failure_streak', label: 'Failures', align: 'right', render: row => formatCount(row.failure_streak) }
         ],
         rows: data.schedules,
@@ -1505,10 +1632,10 @@ function KanbanView({ ctx }) {
           { key: 'title', label: 'Task' },
           { key: 'board', label: 'Board', muted: true },
           { key: 'status', label: 'Status', render: row => jsx(Pill, { tone: row.status === 'done' || row.status === 'completed' ? 'accent' : row.consecutive_failures ? 'danger' : 'neutral', children: row.status }) },
-          { key: 'assignee', label: 'Assignee', render: row => row.assignee || '—' },
+          { key: 'assignee', label: 'Assignee', sortValue: row => row.assignee || '', render: row => row.assignee || '—' },
           { key: 'priority', label: 'Priority', align: 'right' },
           { key: 'consecutive_failures', label: 'Failures', align: 'right', render: row => row.consecutive_failures ? jsx(Pill, { tone: 'danger', title: row.last_failure_error, children: formatCount(row.consecutive_failures) }) : '0' },
-          { key: 'completed_at', label: 'Updated', render: row => formatShortDate(row.completed_at || row.started_at || row.created_at), muted: true }
+          { key: 'completed_at', label: 'Updated', sortValue: row => row.completed_at || row.started_at || row.created_at, render: row => formatShortDate(row.completed_at || row.started_at || row.created_at), muted: true }
         ],
         rows: tasks,
         emptyTitle: 'No Kanban tasks',
@@ -1518,7 +1645,7 @@ function KanbanView({ ctx }) {
   })
 }
 
-function OperationsView({ ctx, days }) {
+function OperationsView({ ctx, period }) {
   const [section, setSection] = useState('health')
   const options = [
     { id: 'health', label: 'Health' },
@@ -1526,8 +1653,8 @@ function OperationsView({ ctx, days }) {
     { id: 'schedules', label: 'Schedules' },
     { id: 'kanban', label: 'Kanban' }
   ]
-  let content = jsx(RuntimeHealth, { ctx, days })
-  if (section === 'profiles') content = jsx(ProfilesView, { ctx, days })
+  let content = jsx(RuntimeHealth, { ctx, period })
+  if (section === 'profiles') content = jsx(ProfilesView, { ctx, period })
   if (section === 'schedules') content = jsx(SchedulesView, { ctx })
   if (section === 'kanban') content = jsx(KanbanView, { ctx })
   return jsx('div', {
@@ -1633,30 +1760,50 @@ function SessionLensPage({ ctx }) {
   const viewport = useValue(host.state.viewport)
   const queryClient = useQueryClient()
   const [tab, setTab] = useState(() => ctx.storage.get('activeTab', 'sessions'))
-  const [daysText, setDaysText] = useState(() => String(ctx.storage.get('days', 30)))
-  const days = Number(daysText) || 0
+  const [daysText, setDaysText] = useState(() => {
+    const stored = String(ctx.storage.get('timeRange', ctx.storage.get('days', 30)))
+    return timeOptions.some(option => option.id === stored) ? stored : '30'
+  })
+  const [customStart, setCustomStart] = useState(() => normaliseDateInput(ctx.storage.get('customStart'), dateDaysAgo(29)))
+  const [customEnd, setCustomEnd] = useState(() => normaliseDateInput(ctx.storage.get('customEnd'), dateDaysAgo(0)))
+  const period = useMemo(() => periodParams(daysText, customStart, customEnd), [daysText, customStart, customEnd])
   const overviewQuery = useQuery({
-    queryKey: [PLUGIN_ID, 'overview', days],
-    queryFn: () => ctx.rest(apiPath('/overview', { days })),
+    queryKey: [PLUGIN_ID, 'overview', period.days, period.start_at, period.end_at],
+    queryFn: () => ctx.rest(apiPath('/overview', period)),
     refetchInterval: 60_000
   })
 
   useEffect(() => ctx.storage.set('activeTab', tab), [ctx, tab])
-  useEffect(() => ctx.storage.set('days', days), [ctx, days])
+  useEffect(() => {
+    ctx.storage.set('timeRange', daysText)
+    if (daysText !== 'custom') ctx.storage.set('days', Number(daysText) || 0)
+  }, [ctx, daysText])
+  useEffect(() => ctx.storage.set('customStart', customStart), [ctx, customStart])
+  useEffect(() => ctx.storage.set('customEnd', customEnd), [ctx, customEnd])
 
   const refresh = () => queryClient.invalidateQueries({ queryKey: [PLUGIN_ID] })
-  let content = jsx(SessionsView, { ctx, days, narrow: Boolean(viewport?.narrow) })
+  const updateCustomStart = value => {
+    if (!value) return
+    setCustomStart(value)
+    if (value > customEnd) setCustomEnd(value)
+  }
+  const updateCustomEnd = value => {
+    if (!value) return
+    setCustomEnd(value)
+    if (value < customStart) setCustomStart(value)
+  }
+  let content = jsx(SessionsView, { ctx, period, narrow: Boolean(viewport?.narrow) })
   if (tab === 'overview') content = jsx(OverviewView, { query: overviewQuery })
-  if (tab === 'operations') content = jsx(OperationsView, { ctx, days })
-  if (tab === 'tools') content = jsx(ToolsView, { ctx, days })
-  if (tab === 'skills') content = jsx(SkillsViewPanel, { ctx, days })
+  if (tab === 'operations') content = jsx(OperationsView, { ctx, period })
+  if (tab === 'tools') content = jsx(ToolsView, { ctx, period })
+  if (tab === 'skills') content = jsx(SkillsViewPanel, { ctx, period })
   if (tab === 'system') content = jsx(SystemView, { ctx })
 
   return jsxs('div', {
     style: { color: color.primary, display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, minWidth: 0 },
     children: [
       jsxs('header', {
-        style: { alignItems: 'center', display: 'flex', gap: '1rem', justifyContent: 'space-between', padding: '0.75rem 1rem' },
+        style: { alignItems: 'center', display: 'flex', flexWrap: 'wrap', gap: '0.75rem 1rem', justifyContent: 'space-between', padding: '0.75rem 1rem' },
         children: [
           jsxs('div', {
             style: { minWidth: 0 },
@@ -1672,9 +1819,19 @@ function SessionLensPage({ ctx }) {
             ]
           }),
           jsxs('div', {
-            style: { alignItems: 'center', display: 'flex', flexWrap: 'wrap', gap: '0.5rem', justifyContent: 'flex-end' },
+            style: { alignItems: 'center', display: 'flex', flex: '1 1 auto', flexWrap: 'wrap', gap: '0.5rem', justifyContent: 'flex-end' },
             children: [
               jsx(SegmentedControl, { options: timeOptions, value: daysText, onChange: setDaysText }),
+              daysText === 'custom'
+                ? jsxs('div', {
+                    'aria-label': 'Custom date range',
+                    style: { alignItems: 'center', display: 'flex', flexWrap: 'wrap', gap: '0.45rem' },
+                    children: [
+                      jsx(DateField, { label: 'Start', value: customStart, max: customEnd, onChange: updateCustomStart }),
+                      jsx(DateField, { label: 'End', value: customEnd, min: customStart, onChange: updateCustomEnd })
+                    ]
+                  })
+                : null,
               jsx(Button, {
                 variant: 'outline',
                 size: 'icon-xs',
