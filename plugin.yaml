@@ -2,7 +2,7 @@ manifest_version: 2
 api_version: 1
 name: session-lens
 label: Hermes Session Lens
-version: 0.6.1
+version: 0.6.2
 description: "Native Hermes Desktop observability: session trace, cost, provider usage, runtime health, profiles, schedules, and Kanban."
 author: "Hermes Session Lens contributors"
 kind: standalone
@@ -12,3 +12,12 @@ tags:
   - analytics
   - observability
   - sessions
+config_schema:
+  rate_sample_threshold:
+    type: int
+    default: 20
+    description: "Minimum sample count before fail and retry/switch rates receive threshold colors or percentage sorting rank."
+  model_route_mappings:
+    type: dict
+    default: {}
+    description: "Optional model-id glob to route-label overrides; for example, gpt-5.6-*: OpenAI OAuth."

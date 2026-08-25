@@ -104,7 +104,7 @@ components:
 
 Hermes Session Lens is an **Operate** surface inside Hermes Desktop: one native observatory connecting provider capacity and session evidence to accounting and operational health. It inherits Hermes typography, controls, codicons, focus behavior, and light/dark theme roles; it does not establish a separate brand skin.
 
-This design document describes Hermes Session Lens `0.6.1`.
+This design document describes Hermes Session Lens `0.6.2`.
 
 The interface is compact, quiet, and evidence-first. A user finds a session, verifies trace and accounting, then inspects runtime, profile, schedule, or Kanban state without leaving Hermes. Progressive disclosure carries the density, while explicit provenance, bounded excerpts, and read-only language make the trust boundary visible.
 
@@ -222,10 +222,10 @@ The form language is compact and lightly softened. Native/select controls use re
 ### AI Models
 
 - **Automatic inventory:** One row per all-time distinct model ID from `session_model_usage`, with a session-row fallback for older accounting. No model list is hardcoded, so first-time routes appear automatically; requests, tokens, cost, reliability, latency, task mix, and trend values honor the selected period.
-- **Comparison table:** All ten headers—Model, Route, Requests, Tokens in/out/cached, Cost, Quota burn, Fail rate, Retry/switch, Latency (TTFT/total), and Trend—are keyboard-sortable. The default is total tokens descending; the wide evidence table scrolls horizontally and retains input/output/cached token alignment.
+- **Comparison table:** All ten headers—Model, Route, Requests, Tokens in/out/cached, Cost, Quota burn, Fail rate, Retry/switch, Latency (TTFT/total), and Trend—are keyboard-sortable. The default is total tokens descending; the wide evidence table scrolls horizontally and retains input/output/cached token alignment. Fail and retry/switch percentages include `n`; samples below the configurable confidence floor use neutral text and sort after adequately sampled rows regardless of percentage.
 - **Expandable evidence:** Clicking any row reveals task-type request counts with valid acceptance bars, rate-limit/timeout/API-error/tool-failure counts, per-accepted-task efficiency after a ten-acceptance floor, a threshold insight, deduplicated route provenance, and coverage notes. General and Analysis use the conservative first-attempt proxy; Coding requires a resolved session with recorded successful saved or committed file-change evidence; Orchestration and unsupported types say `n/a`.
 - **Quota burn:** OAuth subscription routes reuse provider-account quota windows. The fill states cap used and a one-pixel tick marks inferred period elapsed; the first 10% of a period is labelled `early in period` without a pace judgment, then text labels accompany success, warning, and destructive theme roles. Pay-as-you-go routes say `pay-go`.
-- **Honest gaps:** Cached tokens become a dash when the route has not demonstrated cache reporting. Retry/switch includes rewinds, same-model near-identical prompt resends within five minutes, and same-role model changes while excluding cross-role routing. Failure rate counts bounded-log API errors, timeouts, and rate limits; recorded tool-call failures are shown separately for reconciliation. Total latency remains a bounded-log observation, and TTFT remains a dash because Hermes does not record it.
+- **Honest gaps:** Cached tokens become a dash when the route has not demonstrated cache reporting. Retry/switch includes rewinds, same-model near-identical prompt resends within five minutes, and same-role model changes while excluding cross-role routing. Failure rate counts bounded-log API errors, timeouts, and rate limits; recorded tool-call failures are shown separately for reconciliation. A row with no selected-period requests suppresses bounded-log fail rate and latency with an explanatory tooltip. Unknown routes use configured model-id globs, then distinct historical model/family routes, and finally the actionable `Unmapped (edit in config)` state. Total latency remains a bounded-log observation, and TTFT remains a dash because Hermes does not record it.
 
 ### Evidence tables and trace
 

@@ -4,7 +4,7 @@ Hermes Session Lens is a native observability page for Hermes Desktop. It appear
 
 It is a unified Hermes plugin—one install contains the native Desktop page and its namespaced Python API. There is no iframe, separate dashboard, Node server, or third-party telemetry service.
 
-This documentation describes Hermes Session Lens `0.6.1`.
+This documentation describes Hermes Session Lens `0.6.2`.
 
 ## What it includes
 
@@ -71,6 +71,18 @@ Replace `OWNER` with the repository owner. Hermes shows the source and component
 
 Hermes Agent updates do not remove this plugin because it lives under `$HERMES_HOME/plugins/session-lens`, outside the Hermes Agent source checkout. Update Session Lens separately by replacing that folder with a newer release, then restart Hermes Desktop.
 
+AI Models settings live under the plugin's namespaced Hermes configuration. The sample threshold defaults to 20. Route fallback starts with distinct historical routes already recorded for the same model or model family; explicit model-id glob mappings override those inferred defaults:
+
+```yaml
+plugins:
+  entries:
+    session-lens:
+      settings:
+        rate_sample_threshold: 20
+        model_route_mappings:
+          "gpt-5.6-*": "OpenAI OAuth"
+```
+
 ## Privacy and safety
 
 - Session stores use Hermes' `SessionDB(read_only=True)` contract. Kanban stores use SQLite `mode=ro`; dormant profile stores may use SQLite immutable mode only when no WAL exists.
@@ -80,7 +92,7 @@ Hermes Agent updates do not remove this plugin because it lives under `$HERMES_H
 - Runtime logs are parsed locally with per-file memory caching; no new cache file is written.
 - Session content, prompts, and local telemetry are never sent to a third-party analytics service.
 - The AI Usage tab makes direct authenticated quota requests only to OpenAI, Anthropic, xAI, Nous Research, OpenRouter, DeepSeek, Kimi, and Z.AI. Credentials remain in the Python backend and are never returned to the Desktop plugin.
-- AI Models reads model IDs, routes, accounting, and session evidence locally. OAuth quota is shared at provider-account level, suppresses pace judgments during the first 10% of a billing period, and only shows per-accepted-task efficiency after ten valid accepted tasks. General and Analysis retain the conservative first-attempt proxy; Coding requires a resolved session with a recorded successful saved or committed file change; Orchestration and unsupported task types show `n/a`. Retry/switch counts rewinds, near-identical same-model prompt resends within five minutes, and same-role model changes. Failure percentages count bounded-log API errors, timeouts, and rate limits; recorded tool-call failures are reconciled separately. Cost preserves recorded actual, estimated, free, subscription, mixed, or unpriced state; cached tokens show zero only after the route demonstrates cache reporting. TTFT is unavailable because Hermes does not record it.
+- AI Models reads model IDs, routes, accounting, and session evidence locally. OAuth quota is shared at provider-account level, suppresses pace judgments during the first 10% of a billing period, and only shows per-accepted-task efficiency after ten valid accepted tasks. General and Analysis retain the conservative first-attempt proxy; Coding requires a resolved session with a recorded successful saved or committed file change; Orchestration and unsupported task types show `n/a`. Retry/switch counts rewinds, near-identical same-model prompt resends within five minutes, and same-role model changes. Fail and retry/switch percentages display their sample size; samples below the configurable threshold are neutral and sort after adequately sampled rows. Zero-request rows suppress bounded-log failure and latency values to avoid mixing windows. Failure percentages count bounded-log API errors, timeouts, and rate limits; recorded tool-call failures are reconciled separately. Unknown routes first use explicit mappings, then distinct historical routes for the model or family, and otherwise become actionable `Unmapped (edit in config)` labels. Cost preserves recorded actual, estimated, free, subscription, mixed, or unpriced state; cached tokens show zero only after the route demonstrates cache reporting. TTFT is unavailable because Hermes does not record it.
 - Provider checks do not read browser cookies. Anthropic reuses Hermes OAuth, Grok reuses Hermes `xai-oauth`, and Kimi/Z.AI reuse Hermes API keys; no provider CLI needs to remain running.
 - Usage checks accept provider credentials only when Hermes resolves them for the official provider host. Z.AI credential resolution deliberately avoids Hermes inference probes.
 - Ask Lens copies a locally generated prompt; the user decides whether to paste and submit it in Hermes.

@@ -2068,12 +2068,24 @@ function modelQuota(model, quotaData, allModels) {
   }
 }
 
-function RateValue({ value, label }) {
-  const tone = metricTone(value)
+function RateValue({ value, label, sampleCount = 0, sampleThreshold = 20, unavailableReason }) {
+  if (unavailableReason) {
+    return jsx('span', {
+      title: unavailableReason,
+      style: { ...tabular, color: color.tertiary, fontWeight: 400 },
+      children: '–'
+    })
+  }
+  const samples = Math.max(0, Number(sampleCount) || 0)
+  const lowSample = samples < sampleThreshold
+  const tone = lowSample ? 'neutral' : metricTone(value)
+  const available = value !== null && value !== undefined
   return jsx('span', {
-    title: value === null || value === undefined ? `${label} is unavailable` : `${label}: ${(Number(value) * 100).toFixed(1)}%`,
-    style: { ...tabular, color: toneColor(tone), fontWeight: value !== null && value !== undefined ? 650 : 400 },
-    children: value === null || value === undefined ? '—' : `${(Number(value) * 100).toFixed(1)}%`
+    title: available
+      ? `${label}: ${(Number(value) * 100).toFixed(1)}% across ${formatCount(samples)} samples${lowSample ? `; below the configured ${formatCount(sampleThreshold)}-sample confidence threshold` : ''}`
+      : `${label} is unavailable; ${formatCount(samples)} samples`,
+    style: { ...tabular, color: lowSample ? color.tertiary : toneColor(tone), fontWeight: available ? 650 : 400 },
+    children: `${available ? `${(Number(value) * 100).toFixed(1)}%` : '–'} (n=${formatCount(samples)})`
   })
 }
 
@@ -2214,8 +2226,16 @@ function ModelExpanded({ model, quota, coverage, narrow }) {
     : null
   const insight = quotaInsight || model.insight
   const routeLabels = distinctValues((model.routes || []).map(route => route.label))
+  const routeMappingNote = model.route_mapping_source === 'unmapped'
+    ? `Route mapping: add a model-id glob under ${coverage?.route_mapping_config_path || 'plugins.entries.session-lens.settings.model_route_mappings'}.`
+    : model.route_mapping_source === 'historical'
+      ? `Route mapping: inferred from recorded routes using ${model.route_mapping_pattern}.`
+      : model.route_mapping_source === 'config'
+        ? `Route mapping: matched config pattern ${model.route_mapping_pattern}.`
+        : null
   const footnotes = distinctValues([
     `Routes: ${routeLabels.join(' · ') || 'Unknown'}`,
+    routeMappingNote,
     `Failure and total-latency samples come from bounded logs${coverage?.log_start_at ? ` (${formatShortDate(coverage.log_start_at)}–${formatShortDate(coverage.log_end_at)})` : ''}; time-to-first-token is not recorded by Hermes.`,
     'Counts API errors, timeouts, and rate limits; tool-call failures are shown separately.',
     'Retry/switch counts rewinds, near-identical prompts resent to the same model within five minutes, and model changes within the same task role; models on different roles are not switches.',
@@ -2303,6 +2323,7 @@ function ModelExpanded({ model, quota, coverage, narrow }) {
 function AIModelsTable({ models, quotaData, coverage, narrow }) {
   const [sortState, setSortState] = useState({ key: 'total_tokens', direction: 'desc' })
   const [expanded, setExpanded] = useState(() => new Set())
+  const rateSampleThreshold = Math.max(1, Number(coverage?.rate_sample_threshold) || 20)
   const rows = useMemo(() => (models || []).map((model, index) => ({
     model,
     index,
@@ -2315,9 +2336,9 @@ function AIModelsTable({ models, quotaData, coverage, narrow }) {
     { key: 'total_tokens', label: 'Tokens in / out / cached', align: 'right', value: item => item.model.total_tokens },
     { key: 'cost', label: 'Cost', align: 'right', value: item => ['actual', 'estimated', 'free', 'mixed'].includes(item.model.cost_kind) ? item.model.cost_usd : null },
     { key: 'quota', label: 'Quota burn', value: item => item.quota.available ? item.quota.burn : null },
-    { key: 'failure', label: 'Fail rate', align: 'right', value: item => item.model.failures?.rate },
-    { key: 'retry', label: 'Retry / switch', align: 'right', value: item => item.model.retry_switch_rate },
-    { key: 'latency', label: 'Latency (TTFT / total)', align: 'right', value: item => item.model.latency?.total_p50_seconds },
+    { key: 'failure', label: 'Fail rate', align: 'right', value: item => Number(item.model.requests) > 0 ? item.model.failures?.rate : null, sample: item => item.model.failures?.samples },
+    { key: 'retry', label: 'Retry / switch', align: 'right', value: item => item.model.retry_switch_rate, sample: item => item.model.retry_switch_samples },
+    { key: 'latency', label: 'Latency (TTFT / total)', align: 'right', value: item => Number(item.model.requests) > 0 ? item.model.latency?.total_p50_seconds : null },
     { key: 'trend', label: 'Trend', align: 'right', value: item => (item.model.trend || []).reduce((sum, row) => sum + (Number(row.requests) || 0), 0) }
   ]
   const sortedRows = useMemo(() => {
@@ -2326,6 +2347,12 @@ function AIModelsTable({ models, quotaData, coverage, narrow }) {
     return [...rows].sort((left, right) => {
       const leftValue = column.value(left)
       const rightValue = column.value(right)
+      if (column.sample) {
+        const leftAdequate = leftValue !== null && leftValue !== undefined && Number(column.sample(left) || 0) >= rateSampleThreshold
+        const rightAdequate = rightValue !== null && rightValue !== undefined && Number(column.sample(right) || 0) >= rateSampleThreshold
+        if (leftAdequate !== rightAdequate) return leftAdequate ? -1 : 1
+        if (!leftAdequate) return left.index - right.index
+      }
       if (leftValue === null || leftValue === undefined) return rightValue === null || rightValue === undefined ? left.index - right.index : 1
       if (rightValue === null || rightValue === undefined) return -1
       const comparison = typeof leftValue === 'number' && typeof rightValue === 'number'
@@ -2333,7 +2360,7 @@ function AIModelsTable({ models, quotaData, coverage, narrow }) {
         : String(leftValue).localeCompare(String(rightValue), undefined, { numeric: true, sensitivity: 'base' })
       return comparison === 0 ? left.index - right.index : comparison * direction
     })
-  }, [rows, sortState])
+  }, [rows, sortState, rateSampleThreshold])
   const toggle = modelId => setExpanded(current => {
     const next = new Set(current)
     if (next.has(modelId)) next.delete(modelId)
@@ -2416,14 +2443,14 @@ function AIModelsTable({ models, quotaData, coverage, narrow }) {
                   ]
                 })
               }, 'model'),
-              jsx('td', { style: { borderBottom: isExpanded ? 'none' : border, color: color.secondary, minWidth: '9rem', padding: '0.62rem 0.65rem', verticalAlign: 'top' }, children: jsxs('span', { children: [model.route_label || 'Unknown route', model.route_count > 1 ? jsx('span', { style: { color: color.quaternary, display: 'block', fontSize: '0.625rem', marginTop: '0.12rem' }, children: `+${model.route_count - 1} more` }) : null] }) }, 'route'),
+              jsx('td', { title: model.route_mapping_source === 'unmapped' ? `Add a model-id glob under ${coverage?.route_mapping_config_path || 'plugins.entries.session-lens.settings.model_route_mappings'}.` : model.route_mapping_source === 'historical' ? `Inferred from recorded routes using ${model.route_mapping_pattern}.` : model.route_mapping_source === 'config' ? `Mapped by config pattern ${model.route_mapping_pattern}.` : undefined, style: { borderBottom: isExpanded ? 'none' : border, color: color.secondary, minWidth: '9rem', padding: '0.62rem 0.65rem', verticalAlign: 'top' }, children: jsxs('span', { children: [model.route_label || 'Unmapped (edit in config)', model.route_count > 1 ? jsx('span', { style: { color: color.quaternary, display: 'block', fontSize: '0.625rem', marginTop: '0.12rem' }, children: `+${model.route_count - 1} more` }) : null] }) }, 'route'),
               jsx('td', { style: { ...tabular, borderBottom: isExpanded ? 'none' : border, padding: '0.62rem 0.65rem', textAlign: 'right', verticalAlign: 'top' }, children: formatCount(model.requests) }, 'requests'),
               jsx('td', { title: model.cache_coverage === 'partial' ? 'Cached-token coverage is partial across routes.' : model.cache_coverage === 'unavailable' ? 'This route has not demonstrated cached-token reporting in the selected period.' : undefined, style: { ...tabular, borderBottom: isExpanded ? 'none' : border, minWidth: '11rem', padding: '0.62rem 0.65rem', textAlign: 'right', verticalAlign: 'top' }, children: `${formatCount(model.input_tokens)} / ${formatCount(model.output_tokens)} / ${model.cache_tokens === null || model.cache_tokens === undefined ? '–' : formatCount(model.cache_tokens)}` }, 'tokens'),
               jsx('td', { style: { ...tabular, borderBottom: isExpanded ? 'none' : border, padding: '0.62rem 0.65rem', textAlign: 'right', verticalAlign: 'top' }, children: formatModelCost(model) }, 'cost'),
               jsx('td', { style: { borderBottom: isExpanded ? 'none' : border, padding: '0.58rem 0.65rem', verticalAlign: 'top' }, children: jsx(QuotaBurn, { quota: item.quota }) }, 'quota'),
-              jsx('td', { style: { borderBottom: isExpanded ? 'none' : border, padding: '0.62rem 0.65rem', textAlign: 'right', verticalAlign: 'top' }, children: jsx(RateValue, { value: model.failures?.rate, label: 'API error, timeout, or rate-limit response rate' }) }, 'failure'),
-              jsx('td', { style: { borderBottom: isExpanded ? 'none' : border, padding: '0.62rem 0.65rem', textAlign: 'right', verticalAlign: 'top' }, children: jsx(RateValue, { value: model.retry_switch_rate, label: 'Rewind, same-model prompt resend, or same-role model-switch session rate' }) }, 'retry'),
-              jsx('td', { title: `${model.latency?.samples || 0} bounded-log samples. Hermes does not record time-to-first-token.`, style: { ...tabular, borderBottom: isExpanded ? 'none' : border, minWidth: '7rem', padding: '0.62rem 0.65rem', textAlign: 'right', verticalAlign: 'top' }, children: `– / ${formatSeconds(model.latency?.total_p50_seconds)}` }, 'latency'),
+              jsx('td', { style: { borderBottom: isExpanded ? 'none' : border, padding: '0.62rem 0.65rem', textAlign: 'right', verticalAlign: 'top' }, children: jsx(RateValue, { value: model.failures?.rate, sampleCount: model.failures?.samples, sampleThreshold: rateSampleThreshold, unavailableReason: Number(model.requests) === 0 ? 'activity outside selected period; see bounded log note' : undefined, label: 'API error, timeout, or rate-limit response rate' }) }, 'failure'),
+              jsx('td', { style: { borderBottom: isExpanded ? 'none' : border, padding: '0.62rem 0.65rem', textAlign: 'right', verticalAlign: 'top' }, children: jsx(RateValue, { value: model.retry_switch_rate, sampleCount: model.retry_switch_samples, sampleThreshold: rateSampleThreshold, label: 'Rewind, same-model prompt resend, or same-role model-switch session rate' }) }, 'retry'),
+              jsx('td', { title: Number(model.requests) === 0 ? 'activity outside selected period; see bounded log note' : `${model.latency?.samples || 0} bounded-log samples. Hermes does not record time-to-first-token.`, style: { ...tabular, borderBottom: isExpanded ? 'none' : border, minWidth: '7rem', padding: '0.62rem 0.65rem', textAlign: 'right', verticalAlign: 'top' }, children: Number(model.requests) === 0 ? '–' : `– / ${formatSeconds(model.latency?.total_p50_seconds)}` }, 'latency'),
               jsx('td', { style: { borderBottom: isExpanded ? 'none' : border, padding: '0.54rem 0.65rem', verticalAlign: 'top' }, children: jsx(TrendBars, { rows: model.trend }) }, 'trend')
             ]
             const detail = isExpanded
@@ -2487,7 +2514,7 @@ function AIModelsView({ query, quotaQuery, narrow, refreshError }) {
           children: [
             jsx(Codicon, { name: 'info', size: '0.75rem', style: { marginTop: '0.15rem' } }),
             jsx('span', {
-              children: `Requests, tokens, routes, and cost come from Hermes session accounting. Retry/switch counts rewinds, same-model near-identical prompt resends within five minutes, and same-role model changes. Acceptance is available for General and Analysis, plus Coding when saved/committed file-change evidence is recorded. Fail rate counts API errors, timeouts, and rate limits from bounded local logs; time-to-first-token is not recorded. Session records contain ${formatCount(data.coverage?.recorded_failure_events)} failure events in this period; ${formatCount(data.coverage?.recorded_tool_failures)} are tool-call failures (${formatCount(data.coverage?.attributed_tool_failures)} attributed to a model, ${formatCount(data.coverage?.unattributed_tool_failures)} unattributed).`
+              children: `Requests, tokens, routes, and cost come from Hermes session accounting. Retry/switch counts rewinds, same-model near-identical prompt resends within five minutes, and same-role model changes. Acceptance is available for General and Analysis, plus Coding when saved/committed file-change evidence is recorded. Fail rate counts API errors, timeouts, and rate limits from bounded local logs; time-to-first-token is not recorded. Rate samples below n=${formatCount(data.coverage?.rate_sample_threshold || 20)} are neutral and sort below adequately sampled rows. Session records contain ${formatCount(data.coverage?.recorded_failure_events)} failure events in this period; ${formatCount(data.coverage?.recorded_tool_failures)} are tool-call failures (${formatCount(data.coverage?.attributed_tool_failures)} attributed to a model, ${formatCount(data.coverage?.unattributed_tool_failures)} unattributed).`
             })
           ]
         })

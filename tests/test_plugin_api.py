@@ -695,7 +695,9 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertEqual(model["task_types"][0]["task_type"], "Coding")
         self.assertEqual(model["failures"]["rate_limits"], 1)
         self.assertEqual(model["failures"]["rate"], 0.5)
+        self.assertEqual(model["failures"]["samples"], 2)
         self.assertEqual(model["failures"]["tool_failures"], 1)
+        self.assertEqual(model["retry_switch_samples"], 1)
         self.assertEqual(model["task_types"][0]["first_attempt_acceptance_rate"], 0)
         self.assertEqual(model["acceptance_samples"], 1)
         self.assertIsNone(model["latency"]["ttft_p50_seconds"])
@@ -862,6 +864,53 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertIn("Number(model.accepted_tasks) >= 10", source)
         self.assertIn("insufficient data", source)
         self.assertIn("Tool failures", source)
+
+    def test_ai_model_rate_threshold_and_route_mapping_are_configurable(self):
+        with patch.object(api, "_plugin_settings", return_value={"rate_sample_threshold": 7}):
+            payload = api._ai_models_sync(0)
+        self.assertEqual(payload["coverage"]["rate_sample_threshold"], 7)
+
+        historical = api._historical_route_mappings(
+            {
+                "gpt-5.6-luna": {
+                    "routes_map": {
+                        "recorded": {"provider": "openai-codex", "label": "OpenAI OAuth"}
+                    }
+                },
+                "gpt-5.6-terra-pro": {
+                    "routes_map": {
+                        "unknown": {"provider": "unknown", "label": "Unknown API"}
+                    }
+                },
+            }
+        )
+        self.assertEqual(historical["gpt-5.6-*"], "OpenAI OAuth")
+        unknown = {"provider": "unknown", "label": "Unknown API"}
+        inferred = api._apply_route_mapping("gpt-5.6-terra-pro", unknown, {}, historical)
+        configured = api._apply_route_mapping(
+            "gpt-5.6-terra-pro",
+            unknown,
+            {"gpt-5.6-*": "Custom route"},
+            historical,
+        )
+        unmapped = api._apply_route_mapping("other-model", unknown, {}, historical)
+        self.assertEqual(inferred["label"], "OpenAI OAuth")
+        self.assertEqual(inferred["mapping_source"], "historical")
+        self.assertEqual(inferred["provider"], "openai-codex")
+        self.assertTrue(inferred["oauth"])
+        self.assertTrue(inferred["subscription"])
+        self.assertEqual(inferred["quota_provider"], "codex")
+        self.assertEqual(configured["label"], "Custom route")
+        self.assertEqual(configured["mapping_source"], "config")
+        self.assertEqual(unmapped["label"], "Unmapped (edit in config)")
+
+    def test_ai_models_ui_guards_rate_samples_and_zero_request_log_metrics(self):
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("(n=${formatCount(samples)})", source)
+        self.assertIn("leftAdequate ? -1 : 1", source)
+        self.assertIn("if (!leftAdequate) return left.index - right.index", source)
+        self.assertIn("activity outside selected period; see bounded log note", source)
+        self.assertIn("Unmapped (edit in config)", source)
 
     def test_custom_period_is_inclusive_by_start_and_exclusive_by_end(self):
         start = 1_799_999_999

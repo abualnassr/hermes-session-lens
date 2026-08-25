@@ -41,7 +41,7 @@ The plugin appears in Hermes Desktop's left sidebar as **Session Lens** and open
 - An Ask Lens workflow that produces a privacy-conscious, session-grounded prompt for analysis in Hermes.
 - Read-only database access. The plugin must not mutate, archive, delete, or rewrite sessions.
 - Cost precedence: recorded actual cost, then recorded estimate, then a clearly labelled included or unpriced state.
-- AI Models treats OAuth quota as a shared provider-account limit, delays pace judgments until 10% of the billing period has elapsed, requires ten valid accepted tasks before showing per-task efficiency, distinguishes unavailable cache reporting from a recorded zero, separates bounded-log API failures from recorded tool-call failures, and does not estimate unavailable TTFT. Acceptance is task-specific, and retry/switch excludes cross-role model routing.
+- AI Models treats OAuth quota as a shared provider-account limit, delays pace judgments until 10% of the billing period has elapsed, requires ten valid accepted tasks before showing per-task efficiency, distinguishes unavailable cache reporting from a recorded zero, separates bounded-log API failures from recorded tool-call failures, and does not estimate unavailable TTFT. Acceptance is task-specific, and retry/switch excludes cross-role model routing. Rate metrics expose sample sizes, neutralize and demote samples below a configurable confidence floor, and suppress bounded-log failure/latency values on zero-request rows. Unknown routes resolve through explicit model-id globs and distinct historical model/family routes before becoming actionable unmapped states.
 - Skills must distinguish recorded invocation from merely available capabilities.
 - Local-first operation with no third-party telemetry upload. AI Usage makes direct authenticated quota requests only to the configured providers and never returns credentials to JavaScript.
 - Operational readers load only when their view is opened and never poll faster than every 30 seconds.
@@ -52,7 +52,7 @@ The plugin appears in Hermes Desktop's left sidebar as **Session Lens** and open
 - Sidebar label: **Session Lens**.
 - Repository name: `hermes-session-lens`.
 - Plugin id: `session-lens`.
-- Current documented release: `0.6.1`.
+- Current documented release: `0.6.2`.
 - The interface inherits Hermes Desktop's native components, typography, spacing, and theme variables.
 - Upstream inspiration is credited transparently; no upstream logo or endorsement is implied.
 

@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import datetime as dt
+import fnmatch
 import hashlib
 import json
 import math
@@ -38,7 +39,7 @@ except ImportError:  # pragma: no cover - makes isolated editor/test imports cle
 
 router = APIRouter()
 
-PLUGIN_VERSION = "0.6.1"
+PLUGIN_VERSION = "0.6.2"
 MAX_SESSION_PAGE = 500
 MAX_ANALYSIS_EVENTS = 5000
 MAX_SEARCH_MATCHES = 2000
@@ -49,6 +50,8 @@ MAX_LOG_FILES = 5
 MAX_LOG_FILE_BYTES = 6 * 1024 * 1024
 AI_USAGE_CACHE_TTL_SECONDS = 300
 AI_USAGE_PROVIDER_TIMEOUT_SECONDS = 12
+DEFAULT_RATE_SAMPLE_THRESHOLD = 20
+MAX_ROUTE_MAPPINGS = 200
 
 _ERROR_FINISH_REASONS = {"error", "agent_error", "content_filter"}
 _ERROR_EFFECTS = {"blocked", "denied", "error", "failed", "failure"}
@@ -1451,6 +1454,45 @@ _MODEL_ORIGIN_NAMES = {
 }
 
 
+def _plugin_settings() -> Dict[str, Any]:
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly() or {}
+    except (ImportError, OSError, ValueError):
+        return {}
+    plugins = config.get("plugins") if isinstance(config, Mapping) else None
+    entries = plugins.get("entries") if isinstance(plugins, Mapping) else None
+    entry = entries.get("session-lens") if isinstance(entries, Mapping) else None
+    if not isinstance(entry, Mapping):
+        return {}
+    settings = entry.get("settings")
+    if isinstance(settings, Mapping):
+        return dict(settings)
+    legacy = entry.get("config")
+    return dict(legacy) if isinstance(legacy, Mapping) else {}
+
+
+def _rate_sample_threshold(settings: Optional[Mapping[str, Any]] = None) -> int:
+    value = (settings if settings is not None else _plugin_settings()).get(
+        "rate_sample_threshold", DEFAULT_RATE_SAMPLE_THRESHOLD
+    )
+    return max(1, min(10000, _integer(value, DEFAULT_RATE_SAMPLE_THRESHOLD)))
+
+
+def _configured_route_mappings(settings: Optional[Mapping[str, Any]] = None) -> Dict[str, str]:
+    raw = (settings if settings is not None else _plugin_settings()).get("model_route_mappings", {})
+    if not isinstance(raw, Mapping):
+        return {}
+    mappings: Dict[str, str] = {}
+    for pattern, label in list(raw.items())[:MAX_ROUTE_MAPPINGS]:
+        clean_pattern = _clean_text(pattern, 240).strip()
+        clean_label = _clean_text(label, 120).strip()
+        if clean_pattern and clean_label:
+            mappings[clean_pattern] = clean_label
+    return mappings
+
+
 def _table_columns(connection: Any, table: str) -> set[str]:
     try:
         return {str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
@@ -1528,6 +1570,69 @@ def _route_descriptor(provider: Any, base_url: Any, billing_mode: Any) -> Dict[s
         "subscription": subscription,
         "quota_provider": meta.get("quota_provider"),
     }
+
+
+def _route_needs_mapping(route: Mapping[str, Any]) -> bool:
+    return str(route.get("provider") or "").lower() in {"", "unknown"} or str(
+        route.get("label") or ""
+    ).lower() in {"unknown", "unknown api", "unknown route"}
+
+
+def _model_family_glob(model_id: str) -> Optional[str]:
+    match = re.match(r"^(?P<prefix>.*?-\d+(?:\.\d+)?)(?:-|$)", str(model_id or ""), re.IGNORECASE)
+    return f"{match.group('prefix')}-*" if match else None
+
+
+def _historical_route_mappings(models: Mapping[str, Mapping[str, Any]]) -> Dict[str, str]:
+    exact: Dict[str, str] = {}
+    family_labels: Dict[str, set[str]] = defaultdict(set)
+    for model_id, model in models.items():
+        labels = {
+            str(route.get("label") or "").strip()
+            for route in (model.get("routes_map") or {}).values()
+            if not _route_needs_mapping(route) and str(route.get("label") or "").strip()
+        }
+        if len(labels) != 1:
+            continue
+        label = next(iter(labels))
+        exact[model_id] = label
+        family = _model_family_glob(model_id)
+        if family:
+            family_labels[family].add(label)
+    for family, labels in family_labels.items():
+        if len(labels) == 1:
+            exact.setdefault(family, next(iter(labels)))
+    return exact
+
+
+def _apply_route_mapping(
+    model_id: str,
+    route: Mapping[str, Any],
+    configured: Mapping[str, str],
+    historical: Mapping[str, str],
+) -> Dict[str, Any]:
+    resolved = dict(route)
+    if not _route_needs_mapping(resolved):
+        resolved["mapping_source"] = "recorded"
+        return resolved
+    model_key = str(model_id or "").lower()
+    for source, mappings in (("config", configured), ("historical", historical)):
+        for pattern, label in mappings.items():
+            if fnmatch.fnmatchcase(model_key, str(pattern).lower()):
+                resolved["label"] = label
+                resolved["mapping_pattern"] = pattern
+                resolved["mapping_source"] = source
+                for provider_key, meta in _MODEL_ROUTE_META.items():
+                    if str(meta.get("label") or "").casefold() != str(label).casefold():
+                        continue
+                    semantics = _route_descriptor(provider_key, "", "")
+                    for field in ("provider", "provider_label", "oauth", "subscription", "quota_provider"):
+                        resolved[field] = semantics.get(field)
+                    break
+                return resolved
+    resolved["label"] = "Unmapped (edit in config)"
+    resolved["mapping_source"] = "unmapped"
+    return resolved
 
 
 def _auxiliary_task_label(task: str) -> str:
@@ -1691,6 +1796,9 @@ def _ai_models_sync(
     start_at: Optional[float] = None,
     end_at: Optional[float] = None,
 ) -> Dict[str, Any]:
+    settings = _plugin_settings()
+    rate_sample_threshold = _rate_sample_threshold(settings)
+    configured_route_mappings = _configured_route_mappings(settings)
     period_start, period_end = _period_bounds(days, start_at, end_at)
     period_sql, period_params = _period_sql("s.started_at", period_start, period_end)
     now = time.time()
@@ -2083,6 +2191,7 @@ def _ai_models_sync(
         )
         route_row["last_used_at"] = max(_number(route_row.get("last_used_at"), 0), last_used) or None
 
+    historical_route_mappings = _historical_route_mappings(models)
     runtime = _runtime_events()
     known_models = set(models)
     latency_by_model: Dict[str, List[float]] = defaultdict(list)
@@ -2120,7 +2229,19 @@ def _ai_models_sync(
 
     final_models: List[Dict[str, Any]] = []
     for model_id, model in models.items():
-        routes = sorted(model.pop("routes_map").values(), key=lambda item: _number(item.get("last_used_at")), reverse=True)
+        routes = sorted(
+            (
+                _apply_route_mapping(
+                    model_id,
+                    route,
+                    configured_route_mappings,
+                    historical_route_mappings,
+                )
+                for route in model.pop("routes_map").values()
+            ),
+            key=lambda item: _number(item.get("last_used_at")),
+            reverse=True,
+        )
         primary_route = routes[0] if routes else _route_descriptor("unknown", "", "")
         route_providers = {str(route.get("provider") or "") for route in routes}
         reporting_routes = route_providers & cache_reporting_providers
@@ -2131,7 +2252,9 @@ def _ai_models_sync(
             cache_tokens = None
             cache_coverage = "unavailable"
 
-        included = bool(model.pop("included_cost"))
+        included = bool(model.pop("included_cost")) or any(
+            bool(route.get("subscription")) for route in routes
+        )
         free_api = bool(model.pop("free_api_cost"))
         actual = bool(model.pop("actual_cost"))
         estimated = bool(model.pop("estimated_cost"))
@@ -2176,17 +2299,29 @@ def _ai_models_sync(
         failure_counts_by_type = failures_by_model.get(model_id, Counter())
         observed_failures = sum(failure_counts_by_type.values())
         observed_successes = successes_by_model.get(model_id, 0)
-        failure_rate = observed_failures / (observed_successes + observed_failures) if observed_successes + observed_failures else None
+        failure_samples = observed_successes + observed_failures
+        failure_rate = observed_failures / failure_samples if failure_samples else None
         latencies = latency_by_model.get(model_id, [])
         latency_p50 = _percentile(latencies, 0.50)
-        if failure_rate is not None and failure_rate > 0.05:
+        retry_switch_samples = len(sessions_set)
+        has_in_period_requests = _integer(model.get("requests")) > 0
+        if (
+            has_in_period_requests
+            and failure_samples >= rate_sample_threshold
+            and failure_rate is not None
+            and failure_rate > 0.05
+        ):
             insight = f"Observed API/request failures reached {failure_rate * 100:.1f}% in the bounded log window."
-        elif retry_switch_rate is not None and retry_switch_rate > 0.05:
+        elif (
+            retry_switch_samples >= rate_sample_threshold
+            and retry_switch_rate is not None
+            and retry_switch_rate > 0.05
+        ):
             insight = (
                 f"{retry_switch_rate * 100:.1f}% of recorded sessions used a rewind, resent a near-identical prompt "
                 "within five minutes, or switched models within the same task role."
             )
-        elif latency_p50 is not None and latency_p50 > 10:
+        elif has_in_period_requests and latency_p50 is not None and latency_p50 > 10:
             insight = f"Median recorded response latency is {latency_p50:.1f}s."
         else:
             insight = None
@@ -2195,6 +2330,8 @@ def _ai_models_sync(
             {
                 "provider_label": _model_origin_label(model_id, primary_route.get("provider")),
                 "route_label": primary_route.get("label"),
+                "route_mapping_source": primary_route.get("mapping_source"),
+                "route_mapping_pattern": primary_route.get("mapping_pattern"),
                 "routes": routes,
                 "route_count": len(routes),
                 "cache_tokens": cache_tokens,
@@ -2204,6 +2341,7 @@ def _ai_models_sync(
                 "acceptance_samples": len(acceptance_sessions),
                 "accepted_tasks": len(accepted_sessions),
                 "retry_switch_sessions": len(retry_sessions),
+                "retry_switch_samples": retry_switch_samples,
                 "retry_switch_rate": retry_switch_rate,
                 "task_types": task_types,
                 "failures": {
@@ -2214,6 +2352,7 @@ def _ai_models_sync(
                     "tool_failures": tool_failures_by_model.get(model_id, 0),
                     "observed_successes": observed_successes,
                     "observed_failures": observed_failures,
+                    "samples": failure_samples,
                     "coverage": "bounded_logs" if observed_successes + observed_failures else "unavailable",
                 },
                 "latency": {
@@ -2282,6 +2421,10 @@ def _ai_models_sync(
             "recorded_tool_failures": len(tool_failure_rows),
             "attributed_tool_failures": sum(tool_failures_by_model.values()),
             "unattributed_tool_failures": unattributed_tool_failures,
+            "rate_sample_threshold": rate_sample_threshold,
+            "configured_route_mappings": len(configured_route_mappings),
+            "historical_route_mappings": len(historical_route_mappings),
+            "route_mapping_config_path": "plugins.entries.session-lens.settings.model_route_mappings",
         },
         "generated_at": time.time(),
     }
