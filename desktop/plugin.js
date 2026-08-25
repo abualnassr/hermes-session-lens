@@ -1913,6 +1913,10 @@ function AIUsageView({ query, narrow, refreshError }) {
   if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'AI usage is unavailable' })
   const data = query.data
   const providers = data?.providers || []
+  const orderedProviders = [
+    ...providers.filter(provider => provider.status === 'ok'),
+    ...providers.filter(provider => provider.status !== 'ok')
+  ]
   return jsx('div', {
     style: { flex: 1, minHeight: 0, overflow: 'auto', padding: '1rem' },
     children: jsxs('div', {
@@ -1933,7 +1937,7 @@ function AIUsageView({ query, narrow, refreshError }) {
           id: 'supported-ai-usage',
           title: 'Supported providers',
           description: 'Provider-supported account limits and balances resolved through Hermes credentials.',
-          providers,
+          providers: orderedProviders,
           narrow
         }),
         jsxs('div', {
