@@ -980,6 +980,23 @@ def _ai_models_payload_sync(
             for row in confirmed_failure_rows
             if str(row.get("role") or "").lower() == "tool"
         ]
+        tool_call_rows = (
+            [
+                _row_dict(row)
+                for row in connection.execute(
+                    f"""
+                    SELECT m.session_id, m.timestamp
+                    FROM messages m
+                    JOIN sessions s ON s.id=m.session_id
+                    WHERE {period_sql} AND coalesce(s.hidden,0)=0
+                      AND coalesce(m.active,1)=1 AND m.role='tool'
+                    """,
+                    tuple(period_params),
+                ).fetchall()
+            ]
+            if session_rows
+            else []
+        )
         cached_facts_by_session: Dict[str, Dict[str, Any]] = {}
         classification_session_ids: List[str] = []
         for session_id, session in sessions_by_id.items():
@@ -1073,6 +1090,19 @@ def _ai_models_payload_sync(
             tool_failures_by_model[model_id] += 1
         else:
             unattributed_tool_failures += 1
+
+    tool_calls_by_model: Counter[str] = Counter()
+    unattributed_tool_calls = 0
+    for call in tool_call_rows:
+        session_id = str(call.get("session_id") or "")
+        model_id = _model_for_session_event(
+            usage_by_session.get(session_id, []),
+            _number(call.get("timestamp")),
+        )
+        if model_id:
+            tool_calls_by_model[model_id] += 1
+        else:
+            unattributed_tool_calls += 1
 
     models: Dict[str, Dict[str, Any]] = {}
     for usage in usage_rows:
@@ -1552,6 +1582,7 @@ def _ai_models_payload_sync(
                     "timeouts": failure_counts_by_type.get("timeout", 0),
                     "errors": failure_counts_by_type.get("error", 0),
                     "tool_failures": tool_failures_by_model.get(model_id, 0),
+                    "tool_calls": tool_calls_by_model.get(model_id, 0),
                     "observed_successes": observed_successes,
                     "observed_failures": observed_failures,
                     "samples": failure_samples,
@@ -1652,6 +1683,9 @@ def _ai_models_payload_sync(
             "recorded_tool_failures": len(tool_failure_rows),
             "attributed_tool_failures": sum(tool_failures_by_model.values()),
             "unattributed_tool_failures": unattributed_tool_failures,
+            "recorded_tool_calls": len(tool_call_rows),
+            "attributed_tool_calls": sum(tool_calls_by_model.values()),
+            "unattributed_tool_calls": unattributed_tool_calls,
             "rate_sample_threshold": rate_sample_threshold,
             "configured_route_mappings": len(configured_route_mappings),
             "historical_route_mappings": len(historical_route_mappings),

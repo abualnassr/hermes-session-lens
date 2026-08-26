@@ -1226,7 +1226,21 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertEqual(model["failures"]["timeouts"], 1)
         self.assertEqual(model["failures"]["errors"], 0)
         self.assertEqual(model["failures"]["tool_failures"], 1)
+        self.assertEqual(model["failures"]["tool_calls"], 2)
         self.assertAlmostEqual(model["failures"]["rate"], 2 / 3)
+
+    def test_ai_model_tool_call_denominator_is_reported(self):
+        payload = api._ai_models_sync(0)
+        model = payload["models"][0]
+        self.assertGreaterEqual(
+            model["failures"]["tool_calls"], model["failures"]["tool_failures"]
+        )
+        coverage = payload["coverage"]
+        self.assertEqual(coverage["recorded_tool_calls"], 2)
+        self.assertEqual(
+            coverage["recorded_tool_calls"],
+            coverage["attributed_tool_calls"] + coverage["unattributed_tool_calls"],
+        )
 
     def test_work_reliability_uses_task_outcomes_and_confidence_adjustment(self):
         counts = api._work_reliability_counts(
@@ -1397,14 +1411,17 @@ class SessionLensApiTests(unittest.TestCase):
 
     def test_ai_models_ui_guards_rate_samples_and_zero_request_log_metrics(self):
         source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
-        self.assertIn("(n=${formatCount(samples)})", source)
+        self.assertIn("of ${formatCount(samples)} ${sampleNoun}", source)
+        self.assertIn("${formatCount(count)}/${formatCount(samples)}", source)
         self.assertIn("leftAdequate ? -1 : 1", source)
         self.assertIn("if (!leftAdequate) return left.index - right.index", source)
-        self.assertIn("activity outside selected period; see bounded log note", source)
+        self.assertIn("activity outside selected period; see the provenance note", source)
         self.assertIn("Unmapped (edit in config)", source)
-        self.assertIn("Reliability rank #${formatCount(data.rank)}", source)
-        self.assertIn("95% upper risk", source)
-        self.assertIn("Work reliability scores completed main-role tasks", source)
+        self.assertIn("Reliability rank #${formatCount(reliability.rank)}", source)
+        self.assertIn("Not rankable yet", source)
+        self.assertIn("risk ≤ ${formatPercent(bound)}", source)
+        self.assertIn("of ${formatCount(toolCalls)} tool calls", source)
+        self.assertIn("Work ledger: scores completed main-role tasks", source)
         self.assertIn("API attempt failure rate", source)
 
     def test_custom_period_is_inclusive_by_start_and_exclusive_by_end(self):

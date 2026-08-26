@@ -2372,7 +2372,12 @@ function modelQuota(model, quotaData, allModels) {
   }
 }
 
-function RateValue({ value, label, sampleCount = 0, sampleThreshold = 20, unavailableReason }) {
+function formatLogWindow(coverage) {
+  if (!coverage?.log_start_at) return null
+  return `${formatShortDate(coverage.log_start_at)} – ${formatShortDate(coverage.log_end_at)}`
+}
+
+function RateValue({ value, numerator, label, sampleCount = 0, sampleThreshold = 20, sampleNoun = 'samples', unavailableReason }) {
   if (unavailableReason) {
     return jsx('span', {
       title: unavailableReason,
@@ -2381,15 +2386,35 @@ function RateValue({ value, label, sampleCount = 0, sampleThreshold = 20, unavai
     })
   }
   const samples = Math.max(0, Number(sampleCount) || 0)
+  const available = value !== null && value !== undefined && samples > 0
+  if (!available) {
+    return jsx('span', {
+      title: `${label} is unavailable; ${formatCount(samples)} ${sampleNoun}`,
+      style: { ...tabular, color: color.tertiary, fontWeight: 400 },
+      children: '–'
+    })
+  }
   const lowSample = samples < sampleThreshold
-  const tone = lowSample ? 'neutral' : metricTone(value)
-  const available = value !== null && value !== undefined
-  return jsx('span', {
-    title: available
-      ? `${label}: ${(Number(value) * 100).toFixed(1)}% across ${formatCount(samples)} samples${lowSample ? `; below the configured ${formatCount(sampleThreshold)}-sample confidence threshold` : ''}`
-      : `${label} is unavailable; ${formatCount(samples)} samples`,
-    style: { ...tabular, color: lowSample ? color.tertiary : toneColor(tone), fontWeight: available ? 650 : 400 },
-    children: `${available ? `${(Number(value) * 100).toFixed(1)}%` : '–'} (n=${formatCount(samples)})`
+  if (lowSample) {
+    const count = numerator === null || numerator === undefined
+      ? Math.round(Number(value) * samples)
+      : Math.max(0, Number(numerator) || 0)
+    return jsxs('span', {
+      title: `${label}: ${formatCount(count)} of ${formatCount(samples)} ${sampleNoun}; below the ${formatCount(sampleThreshold)}-sample floor, so no percentage is shown`,
+      style: { display: 'grid', gap: '0.08rem', justifyItems: 'end' },
+      children: [
+        jsx('span', { style: { ...tabular, color: color.tertiary, fontWeight: 500 }, children: `${formatCount(count)}/${formatCount(samples)}` }),
+        jsx('span', { style: { color: color.quaternary, fontSize: '0.625rem' }, children: sampleNoun })
+      ]
+    })
+  }
+  return jsxs('span', {
+    title: `${label}: ${(Number(value) * 100).toFixed(1)}% across ${formatCount(samples)} ${sampleNoun}`,
+    style: { display: 'grid', gap: '0.08rem', justifyItems: 'end' },
+    children: [
+      jsx('span', { style: { ...tabular, color: toneColor(metricTone(value)), fontWeight: 650 }, children: `${(Number(value) * 100).toFixed(1)}%` }),
+      jsx('span', { style: { ...tabular, color: color.quaternary, fontSize: '0.625rem' }, children: `of ${formatCount(samples)} ${sampleNoun}` })
+    ]
   })
 }
 
@@ -2477,176 +2502,346 @@ function TrendBars({ rows }) {
   })
 }
 
-function TaskTypeBreakdown({ rows }) {
-  if (!rows?.length) return jsx('div', { style: { color: color.quaternary, fontSize: '0.75rem' }, children: 'No task-type evidence is available.' })
-  return jsx('div', {
-    style: { display: 'grid', gap: '0.7rem' },
-    children: rows.map(row => {
-      const acceptance = row.first_attempt_acceptance_rate
-      const width = acceptance === null || acceptance === undefined ? 0 : Math.max(0, Math.min(100, Number(acceptance) * 100))
-      return jsxs('div', {
-        style: { display: 'grid', gap: '0.28rem' },
-        children: [
-          jsxs('div', {
-            style: { alignItems: 'baseline', display: 'flex', gap: '0.75rem', justifyContent: 'space-between' },
-            children: [
-              jsx('span', { style: { color: color.secondary, fontSize: '0.75rem', fontWeight: 600 }, children: row.task_type }),
-              jsx('span', {
-                style: { ...tabular, color: color.tertiary, fontSize: '0.6875rem' },
-                title: row.acceptance_basis,
-                children: `${formatCount(row.requests)} requests · ${acceptance === null || acceptance === undefined ? 'n/a' : `${width.toFixed(0)}%`} accepted first attempt`
-              })
-            ]
-          }),
-          jsx('div', {
-            role: acceptance === null || acceptance === undefined ? undefined : 'progressbar',
-            'aria-label': `${row.task_type} first-attempt acceptance`,
-            'aria-valuemin': acceptance === null || acceptance === undefined ? undefined : 0,
-            'aria-valuemax': acceptance === null || acceptance === undefined ? undefined : 100,
-            'aria-valuenow': acceptance === null || acceptance === undefined ? undefined : Math.round(width),
-            style: { background: color.surfaceRaised, borderRadius: '999px', height: '0.34rem', overflow: 'hidden' },
-            children: jsx('div', {
-              style: { background: color.success, borderRadius: '999px', height: '100%', width: `${width}%` }
-            })
-          })
-        ]
-      }, row.task_type)
-    })
+function modelVerdict(model, sampleThreshold) {
+  const failures = model.failures || {}
+  const reliability = model.work_reliability || {}
+  const threshold = Math.max(1, Number(sampleThreshold) || 20)
+  const parts = []
+  const failureSamples = Number(failures.samples) || 0
+  const failureRate = failures.rate
+  if (Number(model.requests) === 0) {
+    parts.push('No recorded calls in this period.')
+  } else if (!failureSamples) {
+    parts.push('API health unmeasured — no bounded-log coverage.')
+  } else if (failureSamples < threshold) {
+    parts.push(`API log sample thin — ${formatCount(failures.observed_failures)}/${formatCount(failureSamples)} logged calls failed.`)
+  } else if (failureRate !== null && failureRate !== undefined && failureRate > 0.05) {
+    parts.push(`API unstable — ${(failureRate * 100).toFixed(1)}% of ${formatCount(failureSamples)} logged calls failed.`)
+  } else {
+    parts.push('API steady.')
+  }
+  const eligible = Number(reliability.eligible_tasks) || 0
+  const gate = Math.max(1, Number(reliability.sample_threshold) || threshold)
+  const bound = reliability.failure_rate_upper_bound_95
+  const boundText = bound === null || bound === undefined ? null : formatPercent(bound)
+  if (Number(reliability.rank) > 0 && Number(reliability.ranked_models) > 0) {
+    parts.push(`Ranked #${formatCount(reliability.rank)} of ${formatCount(reliability.ranked_models)} — work-failure risk ≤ ${boundText || '—'}.`)
+  } else if (eligible > 0) {
+    parts.push(`Too little finished work to rank — ${formatCount(eligible)} of ${formatCount(gate)} tasks${boundText ? `; true failure could reach ${boundText}` : ''}.`)
+  } else {
+    parts.push('No scored work evidence yet.')
+  }
+  return parts.join(' ')
+}
+
+function WorkEvidenceCell({ model }) {
+  const reliability = model.work_reliability || {}
+  const eligible = Number(reliability.eligible_tasks) || 0
+  const gate = Math.max(1, Number(reliability.sample_threshold) || 20)
+  const bound = reliability.failure_rate_upper_bound_95
+  const ranked = Number(reliability.rank) > 0 && Number(reliability.ranked_models) > 0
+  const progress = Math.max(0, Math.min(100, (eligible / gate) * 100))
+  const headline = ranked ? `#${formatCount(reliability.rank)} of ${formatCount(reliability.ranked_models)}` : `${formatCount(eligible)} / ${formatCount(gate)} tasks`
+  const riskText = bound === null || bound === undefined ? 'no scored work' : `risk ≤ ${formatPercent(bound)}`
+  return jsxs('div', {
+    title: ranked
+      ? `Reliability rank by lowest 95% Wilson upper failure bound across ${formatCount(reliability.ranked_models)} comparable models; ${formatCount(eligible)} eligible main-role tasks.`
+      : `${formatCount(eligible)} eligible main-role tasks of the ${formatCount(gate)} required before ranking; the 95% Wilson upper bound caps how bad the true failure rate could be.`,
+    style: { display: 'grid', gap: '0.28rem', minWidth: '7.5rem' },
+    children: [
+      jsx('span', { style: { ...tabular, color: ranked ? color.primary : color.tertiary, fontSize: '0.6875rem', fontWeight: ranked ? 650 : 500 }, children: headline }),
+      jsx('div', {
+        role: 'progressbar',
+        'aria-label': 'Eligible tasks toward the ranking gate',
+        'aria-valuemin': 0,
+        'aria-valuemax': 100,
+        'aria-valuenow': Math.round(progress),
+        style: { background: color.surfaceRaised, borderRadius: '999px', height: '0.32rem', overflow: 'hidden' },
+        children: jsx('div', {
+          style: { background: ranked ? color.success : color.accent, borderRadius: '999px', height: '100%', opacity: ranked ? 0.9 : 0.7, width: `${progress}%` }
+        })
+      }),
+      jsx('span', { style: { ...tabular, color: color.quaternary, fontSize: '0.625rem' }, children: riskText })
+    ]
   })
 }
 
-function WorkReliabilityBreakdown({ title, rows }) {
-  if (!rows?.length) return null
-  return jsxs('div', {
-    style: { display: 'grid', gap: '0.35rem', minWidth: 0 },
+function LayerPane({ title, meta, children }) {
+  return jsxs('section', {
+    style: { border, borderRadius: '6px', display: 'grid', gap: '0.65rem', gridTemplateRows: 'auto 1fr', minWidth: 0, padding: '0.75rem 0.85rem' },
     children: [
-      jsx('div', { style: { color: color.quaternary, fontSize: '0.625rem', fontWeight: 600 }, children: title }),
+      jsxs('div', {
+        style: { alignItems: 'baseline', display: 'flex', flexWrap: 'wrap', gap: '0.3rem 0.75rem', justifyContent: 'space-between' },
+        children: [
+          jsx('h3', { style: { color: color.primary, fontSize: '0.8125rem', fontWeight: 650, margin: 0 }, children: title }),
+          jsx('span', { style: { ...tabular, color: color.quaternary, fontSize: '0.625rem' }, children: meta })
+        ]
+      }),
+      jsx('div', { style: { display: 'grid', gap: '0.7rem', minWidth: 0 }, children })
+    ]
+  })
+}
+
+function ApiLayerPane({ model, coverage }) {
+  const failures = model.failures || {}
+  const logSamples = Number(failures.samples) || 0
+  const window = formatLogWindow(coverage)
+  const mixRows = [...(model.task_types || []), ...(model.auxiliary_tasks || []).map(row => ({ ...row, auxiliary: true }))]
+  const totalMixCalls = mixRows.reduce((sum, row) => sum + (Number(row.requests) || 0), 0)
+  const toolCalls = Number(failures.tool_calls) || 0
+  const toolFailures = Number(failures.tool_failures) || 0
+  const latency = model.latency || {}
+  return jsxs(LayerPane, {
+    title: 'API layer',
+    meta: `${formatCount(model.requests)} calls in period · logs ${window || 'unavailable'}`,
+    children: [
+      jsxs('div', {
+        style: { display: 'grid', gap: '0.45rem' },
+        children: [
+          jsx('div', { style: { color: color.quaternary, fontSize: '0.625rem', fontWeight: 600 }, children: 'Request mix by session type (calls)' }),
+          mixRows.length
+            ? mixRows.map(row => {
+                const calls = Number(row.requests) || 0
+                const share = totalMixCalls ? (calls / totalMixCalls) * 100 : 0
+                return jsxs('div', {
+                  style: { display: 'grid', gap: '0.2rem' },
+                  children: [
+                    jsxs('div', {
+                      style: { alignItems: 'baseline', display: 'flex', gap: '0.75rem', justifyContent: 'space-between' },
+                      children: [
+                        jsx('span', { style: { color: color.secondary, fontSize: '0.6875rem', fontWeight: 600 }, children: row.auxiliary ? `${row.task_type} (auxiliary)` : row.task_type }),
+                        jsx('span', { style: { ...tabular, color: color.tertiary, fontSize: '0.625rem' }, children: `${formatCount(calls)} calls · ${share.toFixed(0)}%` })
+                      ]
+                    }),
+                    jsx('div', {
+                      style: { background: color.surfaceRaised, borderRadius: '999px', height: '0.28rem', overflow: 'hidden' },
+                      children: jsx('div', { style: { background: color.accent, borderRadius: '999px', height: '100%', opacity: 0.75, width: `${share}%` } })
+                    })
+                  ]
+                }, `${row.task_type}-${row.auxiliary ? 'aux' : 'main'}`)
+              })
+            : jsx('span', { style: { color: color.quaternary, fontSize: '0.6875rem' }, children: 'No recorded calls in this period.' })
+        ]
+      }),
       jsx('div', {
-        style: { borderTop: border, display: 'grid' },
-        children: rows.map(row => {
-          const eligible = Number(row.eligible_tasks) || 0
-          const unknown = Number(row.unknown_tasks) || 0
-          const switched = Number(row.switched_away_tasks) || 0
-          const excluded = Number(row.excluded_tasks) || 0
-          const evidence = eligible > 0
-            ? `${formatPercent(row.completion_rate)} completed · ${formatCount(row.unrecovered_failures)} unrecovered · n=${formatCount(eligible)}`
-            : unknown > 0
-              ? `n/a · ${formatCount(unknown)} unknown`
-              : switched > 0
-                ? `n/a · ${formatCount(switched)} switched away`
-                : excluded > 0
-                  ? `n/a · ${formatCount(excluded)} not scored`
-                  : 'n/a'
-          return jsxs('div', {
-            title: eligible > 0 ? `${formatPercent(row.unrecovered_failure_rate)} unrecovered task failure rate` : undefined,
-            style: { alignItems: 'baseline', borderBottom: border, display: 'flex', gap: '0.75rem', justifyContent: 'space-between', minWidth: 0, padding: '0.38rem 0.1rem' },
-            children: [
-              jsx('span', { style: { color: color.secondary, fontSize: '0.6875rem', fontWeight: 600, minWidth: 0, overflowWrap: 'anywhere' }, children: row.label }),
-              jsx('span', { style: { ...tabular, color: color.tertiary, flexShrink: 0, fontSize: '0.625rem', textAlign: 'right' }, children: evidence })
-            ]
-          }, row.label)
-        })
+        style: { borderTop: border, display: 'grid', gridTemplateColumns: 'repeat(3, minmax(5.5rem, 1fr))' },
+        children: [
+          ['Rate limits', failures.rate_limits],
+          ['Timeouts', failures.timeouts],
+          ['API errors', failures.errors]
+        ].map(([label, value]) => jsxs('div', {
+          style: { borderBottom: border, padding: '0.5rem 0.45rem' },
+          children: [
+            jsx('div', { style: { color: color.quaternary, fontSize: '0.625rem' }, children: label }),
+            jsxs('div', {
+              style: { alignItems: 'baseline', display: 'flex', flexWrap: 'wrap', gap: '0.15rem 0.35rem', marginTop: '0.12rem' },
+              children: [
+                jsx('span', { style: { ...tabular, color: Number(value) > 0 ? color.danger : color.primary, fontSize: '0.8125rem', fontWeight: 650 }, children: formatCount(value) }),
+                jsx('span', { style: { ...tabular, color: color.quaternary, fontSize: '0.625rem' }, children: `of ${formatCount(logSamples)} logged` })
+              ]
+            })
+          ]
+        }, label))
+      }),
+      jsxs('div', {
+        style: { alignItems: 'baseline', display: 'flex', gap: '0.75rem', justifyContent: 'space-between' },
+        children: [
+          jsx('span', { style: { color: color.tertiary, fontSize: '0.6875rem' }, children: 'Tool failures (session records)' }),
+          jsx('span', {
+            style: { ...tabular, color: toolFailures > 0 ? color.danger : color.primary, fontSize: '0.75rem', fontWeight: 650 },
+            children: toolCalls > 0
+              ? `${formatCount(toolFailures)} of ${formatCount(toolCalls)} tool calls · ${((toolFailures / toolCalls) * 100).toFixed(1)}%`
+              : formatCount(toolFailures)
+          })
+        ]
+      }),
+      jsxs('div', {
+        style: { alignItems: 'baseline', display: 'flex', gap: '0.75rem', justifyContent: 'space-between' },
+        children: [
+          jsx('span', { style: { color: color.tertiary, fontSize: '0.6875rem' }, children: 'Total latency' }),
+          jsx('span', { style: { ...tabular, color: color.primary, fontSize: '0.75rem', fontWeight: 650 }, children: `p50 ${formatSeconds(latency.total_p50_seconds)} · p95 ${formatSeconds(latency.total_p95_seconds)} · ${formatCount(latency.samples)} samples` })
+        ]
       })
     ]
   })
 }
 
-function WorkReliability({ reliability, sampleThreshold }) {
-  const data = reliability || {}
-  const eligible = Number(data.eligible_tasks) || 0
-  const threshold = Math.max(1, Number(sampleThreshold) || 20)
-  const lowSample = eligible < threshold
-  const rankAvailable = Number(data.rank) > 0 && Number(data.ranked_models) > 0
-  const rankText = rankAvailable
-    ? `Reliability rank #${formatCount(data.rank)} of ${formatCount(data.ranked_models)} comparable models`
-    : eligible > 0
-      ? `${formatCount(eligible)} eligible tasks; ${formatCount(threshold)} required for ranking`
-      : 'No comparable main-role task outcome in bounded logs'
-  const metrics = [
-    ['Task completion', data.completion_rate, `n=${formatCount(eligible)}`, 'Completion includes clean, recovered, and completed-with-intervention tasks.'],
-    ['Clean completion', data.clean_completion_rate, `${formatCount(data.clean_completions)} tasks`, 'Completed without an observed API failure, rewind, resend, or same-role switch.'],
-    ['Unrecovered', data.unrecovered_failure_rate, `${formatCount(data.unrecovered_failures)} tasks`, 'Failed with no later successful API event on the final model-role.'],
-    ['Recovery', data.recovery_rate, `n=${formatCount(data.recovery_samples)}`, 'Completed after an observed API failure on the same final model-role.']
-  ]
-  return jsxs('div', {
-    style: { display: 'grid', gap: '0.65rem' },
+function WorkLedgerRow({ row, acceptance }) {
+  const eligible = Number(row.eligible_tasks) || 0
+  const completed = Number(row.completed_tasks) || 0
+  const clean = Number(row.clean_completions) || 0
+  const recovered = Number(row.recovered_tasks) || 0
+  const excluded = Number(row.excluded_tasks) || 0
+  const unknown = Number(row.unknown_tasks) || 0
+  const switched = Number(row.switched_away_tasks) || 0
+  const note = row.label === 'Orchestration'
+    ? 'not scored by design'
+    : unknown > 0
+      ? `${formatCount(unknown)} without attributable evidence`
+      : switched > 0
+        ? `${formatCount(switched)} switched away`
+        : excluded > 0
+          ? `${formatCount(excluded)} not eligible`
+          : 'no eligible tasks'
+  const title = acceptance && Number(acceptance.eligible_sessions) > 0
+    ? `${acceptance.acceptance_basis}; ${formatCount(acceptance.accepted_sessions)}/${formatCount(acceptance.eligible_sessions)} accepted first attempt`
+    : acceptance?.acceptance_basis
+  const numberCell = (value, key) => jsx('td', {
+    style: { ...tabular, borderBottom: border, color: eligible > 0 ? color.primary : color.tertiary, fontSize: '0.6875rem', padding: '0.34rem 0.3rem', textAlign: 'right' },
+    children: value
+  }, key)
+  return jsxs('tr', {
+    title,
     children: [
-      jsxs('div', {
-        style: { alignItems: 'baseline', display: 'flex', flexWrap: 'wrap', gap: '0.35rem 0.75rem', justifyContent: 'space-between' },
-        children: [
-          jsx('span', { style: { color: rankAvailable ? color.primary : color.tertiary, fontSize: '0.6875rem', fontWeight: rankAvailable ? 650 : 400 }, children: rankText }),
-          data.failure_rate_upper_bound_95 !== null && data.failure_rate_upper_bound_95 !== undefined
-            ? jsx('span', {
-                title: 'Models are ranked by the lowest 95% Wilson upper bound after the sample floor.',
-                style: { ...tabular, color: color.quaternary, fontSize: '0.625rem' },
-                children: `95% upper risk ${formatPercent(data.failure_rate_upper_bound_95)}`
-              })
-            : null
-        ]
-      }),
-      jsx('div', {
-        style: { borderTop: border, display: 'grid', gridTemplateColumns: 'repeat(2, minmax(7rem, 1fr))' },
-        children: metrics.map(([label, value, detail, title]) => {
-          const available = value !== null && value !== undefined
-          const isFailure = label === 'Unrecovered'
-          const metricColor = !available || lowSample
-            ? color.tertiary
-            : isFailure
-              ? toneColor(metricTone(value))
-              : color.primary
-          return jsxs('div', {
-            title,
-            style: { borderBottom: border, minWidth: 0, padding: '0.48rem 0.45rem' },
-            children: [
-              jsx('div', { style: { color: color.quaternary, fontSize: '0.625rem' }, children: label }),
-              jsxs('div', {
-                style: { alignItems: 'baseline', display: 'flex', flexWrap: 'wrap', gap: '0.2rem 0.4rem', marginTop: '0.12rem' },
-                children: [
-                  jsx('span', { style: { ...tabular, color: metricColor, fontSize: '0.8125rem', fontWeight: available ? 650 : 400 }, children: available ? formatPercent(value) : 'n/a' }),
-                  jsx('span', { style: { ...tabular, color: color.quaternary, fontSize: '0.625rem' }, children: detail })
-                ]
-              })
-            ]
-          }, label)
-        })
-      }),
-      jsx(WorkReliabilityBreakdown, { title: 'By task type', rows: data.by_task_type }),
-      data.by_route?.length > 1 ? jsx(WorkReliabilityBreakdown, { title: 'By route', rows: data.by_route }) : null
+      jsx('td', { style: { borderBottom: border, color: color.secondary, fontSize: '0.6875rem', fontWeight: 600, padding: '0.34rem 0.3rem 0.34rem 0' }, children: row.label }, 'task'),
+      eligible > 0
+        ? [
+            numberCell(formatCount(eligible), 'eligible'),
+            numberCell(`${formatCount(completed)}/${formatCount(eligible)}`, 'completed'),
+            numberCell(`${formatCount(clean)}/${formatCount(eligible)}`, 'clean'),
+            numberCell(`${formatCount(recovered)}/${formatCount(eligible)}`, 'recovered')
+          ]
+        : jsx('td', {
+            colSpan: 4,
+            style: { borderBottom: border, color: color.quaternary, fontSize: '0.625rem', fontStyle: 'italic', padding: '0.34rem 0.3rem', textAlign: 'right' },
+            children: note
+          }, 'note')
     ]
-  })
+  }, row.label)
 }
 
-function ModelExpanded({ model, quota, coverage, narrow }) {
-  const failures = model.failures || {}
+function WorkLedgerPane({ model, quota }) {
+  const reliability = model.work_reliability || {}
+  const eligible = Number(reliability.eligible_tasks) || 0
+  const bound = reliability.failure_rate_upper_bound_95
+  const ranked = Number(reliability.rank) > 0 && Number(reliability.ranked_models) > 0
+  const unrecovered = Number(reliability.unrecovered_failures) || 0
+  const acceptanceByType = new Map((model.task_types || []).map(row => [row.task_type, row]))
   const hasEnoughAcceptedTasks = Number(model.accepted_tasks) >= 10
   const costPerAccepted = !hasEnoughAcceptedTasks
     ? 'insufficient data'
     : quota.kind === 'subscription'
       ? (quota.capPerAcceptedTask === null || quota.capPerAcceptedTask === undefined ? '—' : `~${quota.capPerAcceptedTask.toFixed(2)}% of cap`)
       : ['actual', 'estimated', 'free', 'mixed'].includes(model.cost_kind)
-        ? formatCost((Number(model.cost_usd) || 0) / model.accepted_tasks, model.cost_kind === 'free' ? 'actual' : 'actual')
+        ? formatCost((Number(model.cost_usd) || 0) / model.accepted_tasks, 'actual')
         : '—'
+  const headerCell = label => jsx('th', {
+    scope: 'col',
+    style: { borderBottom: border, color: color.quaternary, fontSize: '0.625rem', fontWeight: 600, padding: '0 0.3rem 0.3rem', textAlign: label === 'Task' ? 'left' : 'right', whiteSpace: 'nowrap' },
+    children: label
+  })
+  return jsxs(LayerPane, {
+    title: 'Work ledger',
+    meta: `${formatCount(eligible)} eligible tasks`,
+    children: [
+      ranked
+        ? jsxs('div', {
+            style: { alignItems: 'baseline', display: 'flex', flexWrap: 'wrap', gap: '0.3rem 0.75rem', justifyContent: 'space-between' },
+            children: [
+              jsx('span', { style: { color: color.primary, fontSize: '0.6875rem', fontWeight: 650 }, children: `Reliability rank #${formatCount(reliability.rank)} of ${formatCount(reliability.ranked_models)} comparable models` }),
+              jsx('span', {
+                title: 'Models rank by the lowest 95% Wilson upper bound on the unrecovered-failure rate.',
+                style: { ...tabular, color: toneColor(metricTone(bound)), fontSize: '0.6875rem', fontWeight: 650 },
+                children: `true failure ≤ ${formatPercent(bound)}`
+              })
+            ]
+          })
+        : null,
+      eligible > 0
+        ? jsx('span', {
+            style: { ...tabular, color: color.tertiary, fontSize: '0.625rem' },
+            children: `${formatCount(unrecovered)}/${formatCount(eligible)} unrecovered · ${formatCount(reliability.recovered_tasks)}/${formatCount(eligible)} recovered after an API failure`
+          })
+        : null,
+      jsx('div', {
+        style: { overflowX: 'auto' },
+        children: jsxs('table', {
+          style: { borderCollapse: 'collapse', minWidth: '17rem', width: '100%' },
+          children: [
+            jsx('thead', {
+              children: jsx('tr', { children: ['Task', 'Eligible', 'Completed', 'Clean', 'Recovered'].map(headerCell) })
+            }),
+            jsx('tbody', {
+              children: (reliability.by_task_type || []).map(row => jsx(WorkLedgerRow, { row, acceptance: acceptanceByType.get(row.label) }, row.label))
+            })
+          ]
+        })
+      }),
+      model.auxiliary_tasks?.length
+        ? jsx('span', { style: { color: color.quaternary, fontSize: '0.625rem', fontStyle: 'italic' }, children: 'Auxiliary jobs are not scored by design.' })
+        : null,
+      reliability.by_route?.length > 1
+        ? jsxs('div', {
+            style: { display: 'grid', gap: '0.3rem' },
+            children: [
+              jsx('div', { style: { color: color.quaternary, fontSize: '0.625rem', fontWeight: 600 }, children: 'By route' }),
+              ...reliability.by_route.map(row => {
+                const routeEligible = Number(row.eligible_tasks) || 0
+                return jsxs('div', {
+                  style: { alignItems: 'baseline', display: 'flex', gap: '0.75rem', justifyContent: 'space-between' },
+                  children: [
+                    jsx('span', { style: { color: color.secondary, fontSize: '0.6875rem', minWidth: 0, overflowWrap: 'anywhere' }, children: row.label }),
+                    jsx('span', {
+                      style: { ...tabular, color: color.tertiary, flexShrink: 0, fontSize: '0.625rem' },
+                      children: routeEligible > 0
+                        ? `${formatCount(row.completed_tasks)}/${formatCount(routeEligible)} completed · ${formatCount(row.unrecovered_failures)} unrecovered`
+                        : 'no eligible tasks'
+                    })
+                  ]
+                }, row.label)
+              })
+            ]
+          })
+        : null,
+      jsxs('div', {
+        style: { alignItems: 'baseline', borderTop: border, display: 'flex', gap: '0.75rem', justifyContent: 'space-between', paddingTop: '0.55rem' },
+        children: [
+          jsx('span', { style: { color: color.tertiary, fontSize: '0.6875rem' }, children: quota.kind === 'subscription' ? 'Cap per accepted task' : 'Cost per accepted task' }),
+          jsx('span', { style: { ...tabular, color: color.primary, fontSize: '0.75rem', fontWeight: 650 }, children: costPerAccepted })
+        ]
+      }),
+      hasEnoughAcceptedTasks && quota.kind === 'subscription' && quota.capPerAcceptedTask !== null && quota.capPerAcceptedTask !== undefined
+        ? jsx('span', { style: { color: color.quaternary, fontSize: '0.625rem', lineHeight: 1.45 }, children: 'Estimate allocated by this model’s share of recorded OAuth requests in the selected period; provider quota is account-level.' })
+        : null
+    ]
+  })
+}
+
+function ModelExpanded({ model, quota, coverage, narrow }) {
+  const reliability = model.work_reliability || {}
+  const eligible = Number(reliability.eligible_tasks) || 0
+  const gate = Math.max(1, Number(reliability.sample_threshold) || Number(coverage?.rate_sample_threshold) || 20)
+  const bound = reliability.failure_rate_upper_bound_95
+  const rankEligible = Boolean(reliability.rank_eligible)
   const quotaInsight = quota.available && !quota.earlyPeriod && quota.elapsed !== null && quota.burn > quota.elapsed
     ? `${quota.window.label} is burning ${Math.round(quota.burn - quota.elapsed)} percentage points faster than the billing period is elapsing.`
     : null
   const insight = quotaInsight || model.insight
   const routeLabels = distinctValues((model.routes || []).map(route => route.label))
   const routeMappingNote = model.route_mapping_source === 'unmapped'
-    ? `Route mapping: add a model-id glob under ${coverage?.route_mapping_config_path || 'plugins.entries.session-lens.settings.model_route_mappings'}.`
+    ? `add a model-id glob under ${coverage?.route_mapping_config_path || 'plugins.entries.session-lens.settings.model_route_mappings'}`
     : model.route_mapping_source === 'historical'
-      ? `Route mapping: inferred from recorded routes using ${model.route_mapping_pattern}.`
+      ? `mapping inferred from recorded routes using ${model.route_mapping_pattern}`
       : model.route_mapping_source === 'config'
-        ? `Route mapping: matched config pattern ${model.route_mapping_pattern}.`
+        ? `mapping matched config pattern ${model.route_mapping_pattern}`
         : null
-  const footnotes = distinctValues([
-    `Routes: ${routeLabels.join(' · ') || 'Unknown'}`,
-    routeMappingNote,
-    `Failure and total-latency samples come from bounded logs${coverage?.log_start_at ? ` (${formatShortDate(coverage.log_start_at)}–${formatShortDate(coverage.log_end_at)})` : ''}; time-to-first-token is not recorded by Hermes.`,
-    'Counts API errors, timeouts, and rate limits; tool-call failures are shown separately.',
-    'Work reliability scores completed main-role tasks and terminal model/API failures. Open, cancelled, orchestration, auxiliary, ambiguous, and uncovered runs are excluded; missing evidence is never treated as success.',
-    `Comparable models require n=${formatCount(coverage?.rate_sample_threshold || 20)} eligible tasks and rank by the lowest 95% Wilson upper failure bound.`,
-    'Retry/switch counts rewinds, near-identical prompts resent to the same model within five minutes, and model changes within the same task role; models on different roles are not switches.',
-    'Session Lens assigns one primary type in this order: Orchestration, Coding, Writing, Analysis, General. General and Analysis use the existing proxy; Coding requires a resolved code artifact save or commit; Writing requires a resolved non-code artifact write; Orchestration and auxiliary jobs are n/a.'
+  const window = formatLogWindow(coverage)
+  const banner = !rankEligible
+    ? eligible > 0
+      ? {
+          tone: 'warning',
+          text: `Not rankable yet — ${formatCount(eligible)} of ${formatCount(gate)} eligible tasks. True failure rate could be anywhere up to ${bound === null || bound === undefined ? '100%' : formatPercent(bound)}.`
+        }
+      : {
+          tone: 'neutral',
+          text: 'No scored work evidence in this period — the API layer below is the only signal.'
+        }
+    : null
+  const provenance = distinctValues([
+    `Routes: ${routeLabels.join(' · ') || 'Unknown'}${routeMappingNote ? ` (${routeMappingNote})` : ''}.`,
+    `Log window: ${window || 'unavailable'}. Fail rate counts API errors, timeouts, and rate limits from bounded local Hermes logs; time-to-first-token is not recorded, so latency is total response time.`,
+    `Work ledger: scores completed main-role tasks and terminal model/API failures. Open, cancelled, orchestration, auxiliary, ambiguous, and uncovered runs are excluded; missing evidence is never treated as success. Ranking needs ${formatCount(gate)} eligible tasks and orders by the lowest 95% Wilson upper failure bound.`,
+    'Classification assigns one primary type per session in this order: Orchestration, Coding, Writing, Analysis, General. Acceptance: General/Analysis use the eligible-closed-session proxy; Coding requires a resolved code save or commit; Writing a resolved non-code artifact write. Retry/switch counts rewinds, near-identical resends to the same model within five minutes, and same-role model changes.'
   ])
   return jsxs('div', {
     style: {
@@ -2654,52 +2849,35 @@ function ModelExpanded({ model, quota, coverage, narrow }) {
       borderTop: border,
       boxSizing: 'border-box',
       display: 'grid',
-      gap: '1rem',
+      gap: '0.85rem',
       padding: '0.9rem 1rem',
       position: 'static',
       width: '100%'
     },
     children: [
-      jsx('div', {
-        style: { display: 'grid', gap: '1.25rem', gridTemplateColumns: narrow ? '1fr' : 'minmax(20rem, 1.35fr) minmax(17rem, 1fr)' },
-        children: [
-          jsxs('section', {
-            children: [
-              jsx('h3', { style: { color: color.primary, fontSize: '0.8125rem', fontWeight: 650, margin: '0 0 0.65rem' }, children: 'Task-type breakdown' }),
-              jsx(TaskTypeBreakdown, { rows: model.task_types })
-            ]
-          }),
-          jsxs('section', {
-            children: [
-              jsx('h3', { style: { color: color.primary, fontSize: '0.8125rem', fontWeight: 650, margin: '0 0 0.65rem' }, children: 'Reliability and efficiency' }),
-              jsx(WorkReliability, { reliability: model.work_reliability, sampleThreshold: coverage?.rate_sample_threshold }),
-              jsx('div', {
-                style: { borderTop: border, display: 'grid', gridTemplateColumns: 'repeat(4, minmax(5rem, 1fr))', marginTop: '0.75rem' },
-                children: [
-                  ['Rate limits', failures.rate_limits],
-                  ['Timeouts', failures.timeouts],
-                  ['Errors', failures.errors],
-                  ['Tool failures', failures.tool_failures]
-                ].map(([label, value]) => jsxs('div', {
-                  style: { borderBottom: border, padding: '0.55rem 0.45rem' },
-                  children: [
-                    jsx('div', { style: { color: color.quaternary, fontSize: '0.625rem' }, children: label }),
-                    jsx('div', { style: { ...tabular, color: Number(value) > 0 ? color.danger : color.primary, fontSize: '0.8125rem', fontWeight: 650, marginTop: '0.15rem' }, children: formatCount(value) })
-                  ]
-                }, label))
-              }),
-              jsxs('div', {
-                style: { alignItems: 'baseline', display: 'flex', gap: '0.75rem', justifyContent: 'space-between', paddingTop: '0.65rem' },
-                children: [
-                  jsx('span', { style: { color: color.tertiary, fontSize: '0.6875rem' }, children: quota.kind === 'subscription' ? 'Cap per accepted task' : 'Cost per accepted task' }),
-                  jsx('span', { style: { ...tabular, color: color.primary, fontSize: '0.75rem', fontWeight: 650 }, children: costPerAccepted })
-                ]
-              }),
-              hasEnoughAcceptedTasks && quota.kind === 'subscription' && quota.capPerAcceptedTask !== null && quota.capPerAcceptedTask !== undefined
-                ? jsx('div', { style: { color: color.quaternary, fontSize: '0.625rem', lineHeight: 1.45, marginTop: '0.25rem' }, children: 'Estimate allocated by this model’s share of recorded OAuth requests in the selected period; provider quota is account-level.' })
-                : null
-            ]
+      banner
+        ? jsxs('div', {
+            role: banner.tone === 'warning' ? 'status' : undefined,
+            style: {
+              alignItems: 'flex-start',
+              background: banner.tone === 'warning' ? color.warningSoft : color.surfaceRaised,
+              borderRadius: '5px',
+              color: banner.tone === 'warning' ? color.warning : color.secondary,
+              display: 'flex',
+              fontSize: '0.6875rem',
+              fontWeight: banner.tone === 'warning' ? 600 : 400,
+              gap: '0.45rem',
+              lineHeight: 1.5,
+              padding: '0.5rem 0.6rem'
+            },
+            children: [jsx(Codicon, { name: banner.tone === 'warning' ? 'warning' : 'info', size: '0.72rem', style: { marginTop: '0.15rem' } }), jsx('span', { children: banner.text })]
           })
+        : null,
+      jsxs('div', {
+        style: { display: 'grid', gap: '0.85rem', gridTemplateColumns: narrow ? '1fr' : 'minmax(19rem, 1fr) minmax(19rem, 1fr)' },
+        children: [
+          jsx(ApiLayerPane, { model, coverage }),
+          jsx(WorkLedgerPane, { model, quota })
         ]
       }),
       insight
@@ -2719,8 +2897,11 @@ function ModelExpanded({ model, quota, coverage, narrow }) {
           })
         : null,
       jsxs('div', {
-        style: { borderTop: border, color: color.quaternary, display: 'grid', fontSize: '0.625rem', gap: '0.25rem', lineHeight: 1.45, paddingTop: '0.65rem' },
-        children: footnotes.map(note => jsx('span', { children: note }, note))
+        style: { borderTop: border, display: 'grid', gap: '0.25rem', paddingTop: '0.6rem' },
+        children: [
+          jsx('span', { style: { color: color.quaternary, fontSize: '0.625rem', fontWeight: 600 }, children: 'Provenance' }),
+          ...provenance.map(note => jsx('span', { style: { color: color.quaternary, fontSize: '0.625rem', lineHeight: 1.45 }, children: note }, note))
+        ]
       })
     ]
   })
@@ -2740,11 +2921,11 @@ function AIModelsTable({ models, quotaData, coverage, narrow }) {
     { key: 'route', label: 'Route', value: item => item.model.route_label || '' },
     { key: 'requests', label: 'Requests', align: 'right', value: item => item.model.requests },
     { key: 'total_tokens', label: 'Tokens in / out / cached', align: 'right', value: item => item.model.total_tokens },
-    { key: 'cost', label: 'Cost', align: 'right', value: item => ['actual', 'estimated', 'free', 'mixed'].includes(item.model.cost_kind) ? item.model.cost_usd : null },
-    { key: 'quota', label: 'Quota burn', value: item => item.quota.available ? item.quota.burn : null },
+    { key: 'cost', label: 'Cost · quota (weekly)', value: item => ['actual', 'estimated', 'free', 'mixed'].includes(item.model.cost_kind) ? item.model.cost_usd : null },
     { key: 'failure', label: 'Fail rate', align: 'right', value: item => Number(item.model.requests) > 0 ? item.model.failures?.rate : null, sample: item => item.model.failures?.samples },
     { key: 'retry', label: 'Retry / switch', align: 'right', value: item => item.model.retry_switch_rate, sample: item => item.model.retry_switch_samples },
-    { key: 'latency', label: 'Latency (TTFT / total)', align: 'right', value: item => Number(item.model.requests) > 0 ? item.model.latency?.total_p50_seconds : null },
+    { key: 'work', label: 'Work evidence', value: item => item.model.work_reliability?.failure_rate_upper_bound_95 ?? null, sample: item => item.model.work_reliability?.eligible_tasks },
+    { key: 'latency', label: 'Total latency', align: 'right', value: item => Number(item.model.requests) > 0 ? item.model.latency?.total_p50_seconds : null },
     { key: 'trend', label: 'Trend', align: 'right', value: item => (item.model.trend || []).reduce((sum, row) => sum + (Number(row.requests) || 0), 0) }
   ]
   const sortedRows = useMemo(() => {
@@ -2780,7 +2961,7 @@ function AIModelsTable({ models, quotaData, coverage, narrow }) {
   return jsx('div', {
     style: { border, borderRadius: '6px', overflowX: 'auto' },
     children: jsx('table', {
-      style: { borderCollapse: 'collapse', fontSize: '0.75rem', minWidth: '92rem', width: '100%' },
+      style: { borderCollapse: 'collapse', fontSize: '0.75rem', minWidth: '94rem', width: '100%' },
       children: [
         jsx('thead', {
           children: jsx('tr', {
@@ -2825,9 +3006,10 @@ function AIModelsTable({ models, quotaData, coverage, narrow }) {
             const model = item.model
             const isExpanded = expanded.has(model.model_id)
             const detailId = `model-detail-${item.index}`
+            const verdict = modelVerdict(model, rateSampleThreshold)
             const cells = [
               jsx('td', {
-                style: { borderBottom: isExpanded ? 'none' : border, minWidth: '14rem', padding: 0, verticalAlign: 'top' },
+                style: { borderBottom: isExpanded ? 'none' : border, minWidth: '17rem', padding: 0, verticalAlign: 'top' },
                 children: jsx('button', {
                   type: 'button',
                   onClick: event => {
@@ -2843,7 +3025,8 @@ function AIModelsTable({ models, quotaData, coverage, narrow }) {
                       style: { display: 'grid', gap: '0.12rem', minWidth: 0 },
                       children: [
                         jsx('span', { style: { fontWeight: 650, overflowWrap: 'anywhere' }, children: model.display_name }),
-                        jsx('span', { style: { color: color.tertiary, fontSize: '0.6875rem' }, children: `${model.provider_label} · ${formatRelativeTime(model.last_used_at)}` })
+                        jsx('span', { style: { color: color.tertiary, fontSize: '0.6875rem' }, children: `${model.provider_label} · ${formatRelativeTime(model.last_used_at)}` }),
+                        jsx('span', { style: { color: color.quaternary, fontSize: '0.625rem', lineHeight: 1.4, maxWidth: '22rem', whiteSpace: 'normal' }, children: verdict })
                       ]
                     })
                   ]
@@ -2852,11 +3035,20 @@ function AIModelsTable({ models, quotaData, coverage, narrow }) {
               jsx('td', { title: model.route_mapping_source === 'unmapped' ? `Add a model-id glob under ${coverage?.route_mapping_config_path || 'plugins.entries.session-lens.settings.model_route_mappings'}.` : model.route_mapping_source === 'historical' ? `Inferred from recorded routes using ${model.route_mapping_pattern}.` : model.route_mapping_source === 'config' ? `Mapped by config pattern ${model.route_mapping_pattern}.` : undefined, style: { borderBottom: isExpanded ? 'none' : border, color: color.secondary, minWidth: '9rem', padding: '0.62rem 0.65rem', verticalAlign: 'top' }, children: jsxs('span', { children: [model.route_label || 'Unmapped (edit in config)', model.route_count > 1 ? jsx('span', { style: { color: color.quaternary, display: 'block', fontSize: '0.625rem', marginTop: '0.12rem' }, children: `+${model.route_count - 1} more` }) : null] }) }, 'route'),
               jsx('td', { style: { ...tabular, borderBottom: isExpanded ? 'none' : border, padding: '0.62rem 0.65rem', textAlign: 'right', verticalAlign: 'top' }, children: formatCount(model.requests) }, 'requests'),
               jsx('td', { title: model.cache_coverage === 'partial' ? 'Cached-token coverage is partial across routes.' : model.cache_coverage === 'unavailable' ? 'This route has not demonstrated cached-token reporting in the selected period.' : undefined, style: { ...tabular, borderBottom: isExpanded ? 'none' : border, minWidth: '11rem', padding: '0.62rem 0.65rem', textAlign: 'right', verticalAlign: 'top' }, children: `${formatCount(model.input_tokens)} / ${formatCount(model.output_tokens)} / ${model.cache_tokens === null || model.cache_tokens === undefined ? '–' : formatCount(model.cache_tokens)}` }, 'tokens'),
-              jsx('td', { style: { ...tabular, borderBottom: isExpanded ? 'none' : border, padding: '0.62rem 0.65rem', textAlign: 'right', verticalAlign: 'top' }, children: formatModelCost(model) }, 'cost'),
-              jsx('td', { style: { borderBottom: isExpanded ? 'none' : border, padding: '0.58rem 0.65rem', verticalAlign: 'top' }, children: jsx(QuotaBurn, { quota: item.quota }) }, 'quota'),
-              jsx('td', { style: { borderBottom: isExpanded ? 'none' : border, padding: '0.62rem 0.65rem', textAlign: 'right', verticalAlign: 'top' }, children: jsx(RateValue, { value: model.failures?.rate, sampleCount: model.failures?.samples, sampleThreshold: rateSampleThreshold, unavailableReason: Number(model.requests) === 0 ? 'activity outside selected period; see bounded log note' : undefined, label: 'API attempt failure rate: errors, timeouts, or rate-limit responses' }) }, 'failure'),
-              jsx('td', { style: { borderBottom: isExpanded ? 'none' : border, padding: '0.62rem 0.65rem', textAlign: 'right', verticalAlign: 'top' }, children: jsx(RateValue, { value: model.retry_switch_rate, sampleCount: model.retry_switch_samples, sampleThreshold: rateSampleThreshold, label: 'Rewind, same-model prompt resend, or same-role model-switch session rate' }) }, 'retry'),
-              jsx('td', { title: Number(model.requests) === 0 ? 'activity outside selected period; see bounded log note' : `${model.latency?.samples || 0} bounded-log samples. Hermes does not record time-to-first-token.`, style: { ...tabular, borderBottom: isExpanded ? 'none' : border, minWidth: '7rem', padding: '0.62rem 0.65rem', textAlign: 'right', verticalAlign: 'top' }, children: Number(model.requests) === 0 ? '–' : `– / ${formatSeconds(model.latency?.total_p50_seconds)}` }, 'latency'),
+              jsx('td', {
+                style: { borderBottom: isExpanded ? 'none' : border, minWidth: '9.5rem', padding: '0.58rem 0.65rem', verticalAlign: 'top' },
+                children: jsxs('div', {
+                  style: { display: 'grid', gap: '0.3rem' },
+                  children: [
+                    jsx('span', { style: { ...tabular, fontWeight: 600 }, children: formatModelCost(model) }),
+                    jsx(QuotaBurn, { quota: item.quota })
+                  ]
+                })
+              }, 'cost'),
+              jsx('td', { style: { borderBottom: isExpanded ? 'none' : border, padding: '0.62rem 0.65rem', textAlign: 'right', verticalAlign: 'top' }, children: jsx(RateValue, { value: model.failures?.rate, numerator: model.failures?.observed_failures, sampleCount: model.failures?.samples, sampleThreshold: rateSampleThreshold, sampleNoun: 'logged calls', unavailableReason: Number(model.requests) === 0 ? 'activity outside selected period; see the provenance note in the expanded card' : undefined, label: 'API attempt failure rate: errors, timeouts, or rate-limit responses' }) }, 'failure'),
+              jsx('td', { style: { borderBottom: isExpanded ? 'none' : border, padding: '0.62rem 0.65rem', textAlign: 'right', verticalAlign: 'top' }, children: jsx(RateValue, { value: model.retry_switch_rate, numerator: model.retry_switch_sessions, sampleCount: model.retry_switch_samples, sampleThreshold: rateSampleThreshold, sampleNoun: 'sessions', label: 'Rewind, same-model prompt resend, or same-role model-switch session rate' }) }, 'retry'),
+              jsx('td', { style: { borderBottom: isExpanded ? 'none' : border, padding: '0.58rem 0.65rem', verticalAlign: 'top' }, children: jsx(WorkEvidenceCell, { model }) }, 'work'),
+              jsx('td', { title: Number(model.requests) === 0 ? 'activity outside selected period; see the provenance note in the expanded card' : `p95 ${formatSeconds(model.latency?.total_p95_seconds)} · ${model.latency?.samples || 0} bounded-log samples. Hermes does not record time-to-first-token.`, style: { ...tabular, borderBottom: isExpanded ? 'none' : border, minWidth: '6rem', padding: '0.62rem 0.65rem', textAlign: 'right', verticalAlign: 'top' }, children: Number(model.requests) === 0 ? '–' : formatSeconds(model.latency?.total_p50_seconds) }, 'latency'),
               jsx('td', { style: { borderBottom: isExpanded ? 'none' : border, padding: '0.54rem 0.65rem', verticalAlign: 'top' }, children: jsx(TrendBars, { rows: model.trend }) }, 'trend')
             ]
             const detail = isExpanded
@@ -2899,6 +3091,8 @@ function AIModelsView({ query, quotaQuery, narrow, refreshError }) {
   if (query.isLoading) return jsx(LoadingBlock, { rows: 9 })
   if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'AI model analytics are unavailable' })
   const data = query.data
+  const window = formatLogWindow(data.coverage)
+  const toolCalls = Number(data.coverage?.recorded_tool_calls) || 0
   return jsx('div', {
     style: { flex: 1, minHeight: 0, overflow: 'auto', padding: '1rem' },
     children: jsxs('div', {
@@ -2906,7 +3100,14 @@ function AIModelsView({ query, quotaQuery, narrow, refreshError }) {
       children: [
         jsx(SectionHeading, {
           title: 'Model performance and efficiency',
-          description: 'The inventory includes every model Hermes has recorded; requests, tokens, cost, and performance honor the selected period. Click a row for task mix, reliability evidence, cost efficiency, and threshold insights.'
+          description: 'Each row states a verdict from two separated evidence layers: the API layer (logged calls) and the work ledger (eligible finished tasks). Click a row for the full evidence card.',
+          action: window
+            ? jsx('span', {
+                title: 'Fail rate and latency come from bounded local Hermes agent logs covering this window; samples can exceed the period’s recorded requests when the log window is wider.',
+                style: { ...tabular, background: color.surfaceRaised, border, borderRadius: '999px', color: color.tertiary, flexShrink: 0, fontSize: '0.625rem', padding: '0.22rem 0.6rem', whiteSpace: 'nowrap' },
+                children: `logs ${window}`
+              })
+            : null
         }),
         refreshError
           ? jsx('div', { role: 'alert', style: { background: color.dangerSoft, borderRadius: '5px', color: color.danger, fontSize: '0.6875rem', padding: '0.5rem 0.6rem' }, children: `Manual refresh failed: ${refreshError}` })
@@ -2920,7 +3121,7 @@ function AIModelsView({ query, quotaQuery, narrow, refreshError }) {
           children: [
             jsx(Codicon, { name: 'info', size: '0.75rem', style: { marginTop: '0.15rem' } }),
             jsx('span', {
-              children: `Requests, tokens, routes, and cost come from Hermes session accounting. Work reliability evaluates completed main-role tasks and terminal model/API failures; incomplete or ambiguous evidence is excluded, and qualifying models rank by a confidence-adjusted upper failure bound. Retry/switch counts rewinds, same-model near-identical prompt resends within five minutes, and same-role model changes. Acceptance is available for General and Analysis, plus Coding and Writing when valid saved/committed artifact evidence is recorded. Fail rate is the API attempt failure rate from bounded local logs; time-to-first-token is not recorded. Rate samples below n=${formatCount(data.coverage?.rate_sample_threshold || 20)} are neutral. Session records contain ${formatCount(data.coverage?.recorded_failure_events)} failure events in this period; ${formatCount(data.coverage?.recorded_tool_failures)} are tool-call failures (${formatCount(data.coverage?.attributed_tool_failures)} attributed to a model, ${formatCount(data.coverage?.unattributed_tool_failures)} unattributed).`
+              children: `Requests, tokens, routes, and cost come from Hermes session accounting; API-layer rates come from bounded local logs${window ? ` (${window})` : ''}; the work ledger scores eligible finished main-role tasks and ranks by the 95% Wilson upper failure bound after an n=${formatCount(data.coverage?.rate_sample_threshold || 20)} floor. This period recorded ${formatCount(data.coverage?.recorded_failure_events)} failure events, including ${formatCount(data.coverage?.recorded_tool_failures)}${toolCalls ? ` of ${formatCount(toolCalls)}` : ''} tool-call failures (${formatCount(data.coverage?.attributed_tool_failures)} attributed to a model). Full metric definitions live in each card's provenance block.`
             })
           ]
         })
