@@ -45,7 +45,18 @@ try:
 except ImportError:  # pragma: no cover - direct Hermes file loading
     from _hermes_compat import *
 
-PLUGIN_VERSION = "0.6.2"
+def _plugin_version() -> str:
+    try:
+        manifest_text = (Path(__file__).resolve().parents[1] / "plugin.yaml").read_text(encoding="utf-8")
+        match = re.search(r"(?m)^version:\s*['\"]?([^\s'\"]+)", manifest_text)
+        if match:
+            return match.group(1)
+    except OSError:
+        pass
+    return "0.7.0"
+
+
+PLUGIN_VERSION = _plugin_version()
 MAX_SESSION_PAGE = 500
 MAX_ANALYSIS_EVENTS = 5000
 MAX_SEARCH_MATCHES = 2000

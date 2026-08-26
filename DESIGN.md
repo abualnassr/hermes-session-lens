@@ -104,7 +104,7 @@ components:
 
 Hermes Session Lens is an **Operate** surface inside Hermes Desktop: one native observatory connecting provider capacity and session evidence to accounting and operational health. It inherits Hermes typography, controls, codicons, focus behavior, and light/dark theme roles; it does not establish a separate brand skin.
 
-This design document describes Hermes Session Lens `0.6.2`.
+This design document describes Hermes Session Lens `0.7.0`.
 
 The interface is compact, quiet, and evidence-first. A user finds a session, verifies trace and accounting, then inspects runtime, profile, schedule, or Kanban state without leaving Hermes. Progressive disclosure carries the density, while explicit provenance, bounded excerpts, and read-only language make the trust boundary visible.
 
@@ -198,6 +198,7 @@ The form language is compact and lightly softened. Native/select controls use re
 ### Header and signals
 
 - **Header:** Compact title and grounding sentence on the left; preset/custom time range and explicit refresh on the right. Custom ranges expose labelled native start/end date fields and treat the end date as inclusive. AI Usage replaces historical controls with a labelled live-quota state and makes refresh bypass the provider cache. AI Models keeps the historical range and refreshes both local model evidence and shared account quotas.
+- **Refresh cadence:** AI Models reuses unchanged backend payloads for 60 seconds and polls from the Desktop every five minutes. Closed-session classification facts remain in memory for the process lifetime; open sessions are recomputed. Manual refresh passes `fresh=true` and updates the visible query immediately.
 - **Signal strip:** Four equal accounting cells—Recorded cost, Tokens, Sessions, and Failures detected—with a small provenance/detail line below each value.
 - **Partial-known cost:** When some sessions are unpriced, preserve the sum of known cost and show the unpriced session count; do not replace known accounting with a false zero.
 
@@ -223,6 +224,7 @@ The form language is compact and lightly softened. Native/select controls use re
 
 - **Automatic inventory:** One row per all-time distinct model ID from `session_model_usage`, with a session-row fallback for older accounting. No model list is hardcoded, so first-time routes appear automatically; requests, tokens, cost, reliability, latency, task mix, and trend values honor the selected period.
 - **Comparison table:** All ten headers—Model, Route, Requests, Tokens in/out/cached, Cost, Quota burn, Fail rate, Retry/switch, Latency (TTFT/total), and Trend—are keyboard-sortable. The default is total tokens descending; the wide evidence table scrolls horizontally and retains input/output/cached token alignment. Fail and retry/switch percentages include `n`; samples below the configurable confidence floor use neutral text and sort after adequately sampled rows regardless of percentage.
+- **Narrow expansion:** Expanded model evidence becomes a normal `width: 100%` block inside its table row, with one-column internal layout and no sticky positioning or viewport-width calculation.
 - **Expandable evidence:** Clicking any row reveals request counts for the five Session Lens session types—Orchestration, Coding, Writing, Analysis, and General—plus valid acceptance bars, main-role task completion, clean completion, recovery, unrecovered model/API failure, confidence-adjusted rank, rate-limit/timeout/API-error/tool-failure counts, per-accepted-task efficiency after a ten-acceptance floor, a threshold insight, deduplicated route provenance, and coverage notes. Work reliability also breaks down eligible outcomes by task type and, when needed, route. Each session receives one primary type in that first-match order from recorded tool calls, arguments, code-mutating commands, and artifact paths; transport and schedule sources never determine type, read-only Git/GitHub inspection does not imply Coding, and auxiliary jobs remain separate and unscored. General and Analysis use the conservative first-attempt proxy; Coding requires a resolved session with a successful code artifact save or commit; Writing requires a resolved session with a successful non-code artifact write; Orchestration says `n/a`.
 - **Quota burn:** OAuth subscription routes reuse provider-account quota windows. The fill states cap used and a one-pixel tick marks inferred period elapsed; the first 10% of a period is labelled `early in period` without a pace judgment, then text labels accompany success, warning, and destructive theme roles. Pay-as-you-go routes say `pay-go`.
 - **Honest gaps:** Cached tokens become a dash when the route has not demonstrated cache reporting. Retry/switch includes rewinds, same-model near-identical prompt resends within five minutes, and same-role model changes while excluding cross-role routing. The table failure rate counts bounded-log API attempts that ended in errors, timeouts, or rate limits; recorded tool-call failures are shown separately for reconciliation. Work reliability treats a completed task after an observed API failure as recovered and counts an unrecovered failure only when the final model-role ends failed with no later successful API event. Open, cancelled, orchestration, auxiliary, ambiguous, switched-away, and uncovered runs are explicit exclusions, never implicit successes. Comparable models require the configured sample floor and rank by the lowest 95% Wilson upper failure bound. A row with no selected-period requests suppresses bounded-log fail rate and latency with an explanatory tooltip. Unknown routes use configured model-id globs, then distinct historical model/family routes, and finally the actionable `Unmapped (edit in config)` state. Total latency remains a bounded-log observation, and TTFT remains a dash because Hermes does not record it.
@@ -231,13 +233,15 @@ The form language is compact and lightly softened. Native/select controls use re
 
 - **Tables:** Secondary-surface headers, one-pixel row separators, right-aligned numeric columns, and horizontal overflow preserve dense comparisons. Every header is a keyboard-accessible sort control with a Codicon direction indicator and `aria-sort` state; sorting is local and stable.
 - **Trace:** Chronological user, assistant, reasoning, tool-call, and tool-result rows. Reasoning is collapsed by default; tool results use bounded, scrollable monospace blocks.
-- **Failure inspector:** Begins with a destructive-wash notice stating how many failures are shown versus detected and directs the user to review recorded evidence before concluding.
+- **Failure inspector:** Begins with a destructive-wash notice distinguishing failures shown in the bounded event scan from the confirmed full-session total. SQL only prefilters candidate content; the shared Python signature confirms it before any count, while recorded Hermes finish/effect states remain authoritative.
 - **Trust note:** Trace copy explicitly excludes system and scheduled-job scaffold prompts and states that content is secret-redacted and bounded to 6,000 characters per event.
 
 ### Ask Lens and states
 
 - **Ask Lens:** Uses a native textarea, collapsed prompt preview, and primary/outline copy actions. Copy explains that prompt construction is local and opens a new Hermes chat only after successful clipboard write.
 - **Loading, empty, error, unpriced, partial, and truncated states:** Use Hermes SDK states or quiet inline notices; uncertainty is stated directly rather than hidden.
+- **Tools truncation:** Aggregate tool evidence scans the latest 50,000 assistant rows. When the cap is exceeded, the view states that the aggregate is truncated rather than implying complete history.
+- **Log coverage:** Log-window labels use the earliest and latest parseable lines across the bounded source files, even when those lines cannot be attributed to a model. The in-memory parser cache retains only the ten most recently used paths.
 
 ## Do's and Don'ts
 

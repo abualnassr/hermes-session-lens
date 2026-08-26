@@ -564,6 +564,17 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertEqual(system["database"]["schema_version"], 26)
         self.assertIn(system["capabilities"]["key_resolution"], {"unknown", "available", "unavailable"})
 
+    def test_version_is_sourced_from_plugin_yaml_and_synced_to_manifest(self):
+        root = MODULE_PATH.parents[1]
+        plugin_version = next(
+            line.split(":", 1)[1].strip()
+            for line in (root / "plugin.yaml").read_text(encoding="utf-8").splitlines()
+            if line.startswith("version:")
+        )
+        dashboard_manifest = json.loads((root / "dashboard" / "manifest.json").read_text(encoding="utf-8"))
+        self.assertEqual(api.PLUGIN_VERSION, plugin_version)
+        self.assertEqual(dashboard_manifest["version"], plugin_version)
+
     def test_fake_schema_matches_recorded_hermes_v26_fixture(self):
         # Regenerate this fixture from the installed read-only Hermes state.db
         # whenever Hermes bumps its schema version.

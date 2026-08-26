@@ -4,11 +4,11 @@ Hermes Session Lens is a native observability page for Hermes Desktop. It appear
 
 It is a unified Hermes plugin—one install contains the native Desktop page and its namespaced Python API. There is no iframe, separate dashboard, Node server, or third-party telemetry service.
 
-This documentation describes Hermes Session Lens `0.6.2`.
+This documentation describes Hermes Session Lens `0.7.0`.
 
 ## What it includes
 
-- Failure-first session browser with full-text search snippets.
+- Failure-first session browser with full-text search snippets. SQL performs only a coarse candidate scan; the shared Python signature confirms tool-result text before list, detail, overview, tool, or AI Models metrics count it. Recorded Hermes finish/effect states remain authoritative.
 - Recorded actual/estimated cost provenance, with **Included** and **Unpriced** states instead of a false `$0`.
 - Input, output, cache-read, cache-write, reasoning, and per-model usage.
 - Dedicated failed-call inspector with bounded, redacted result snippets.
@@ -18,7 +18,7 @@ This documentation describes Hermes Session Lens `0.6.2`.
 - Async delegation summaries.
 - A chronological Trace tab for user, assistant, reasoning, tool-call, and tool-result evidence. System prompts are excluded and displayed content is redacted and bounded.
 - Conservative session outcomes that preserve Hermes' raw end reason.
-- Local agent-log telemetry for model latency, cache-hit ratio, and tool duration, cached until a source log changes.
+- Local agent-log telemetry for model latency, cache-hit ratio, and tool duration. The ten most recently used log paths are cached until a source log changes, and displayed log-window bounds come from all parseable lines rather than only model-attributed events.
 - An **AI Models** tab that keeps an automatic all-time inventory of every recorded model while requests, token mix, cost, shared OAuth quota burn, observed failures, retry/model-switch sessions, total latency, and seven-day request trends honor the selected period. Its ten sortable columns are Model, Route, Requests, Tokens in/out/cached, Cost, Quota burn, Fail rate, Retry/switch, Latency (TTFT/total), and Trend; the default sort is total tokens descending. Rows expand into task-specific acceptance, API-attempt and tool-failure evidence, work reliability, recovery, confidence-adjusted comparison, efficiency, route provenance, and coverage notes.
 - Cross-profile session, token, cost, model, and outcome totals.
 - Gateway and platform health for the default and named profiles.
@@ -27,8 +27,10 @@ This documentation describes Hermes Session Lens `0.6.2`.
 - Overview, Operations, Tools, Skills, System, AI Usage, and AI Models views.
 - Live account-level usage for OpenAI Codex, Anthropic Claude, Nous Research Portal, OpenRouter, DeepSeek, Grok, Kimi Code Plan, and Z.AI GLM Coding Plan using credentials already configured in Hermes.
 - Five-minute in-memory provider cache, explicit partial/stale states, and a manual fresh refresh.
+- AI Models caches immutable closed-session classification facts in memory and reuses unchanged period payloads for 60 seconds. The Desktop polls every five minutes; manual refresh bypasses the payload cache immediately. No cache file is written.
 - Ask Lens: builds a grounded analysis prompt locally, copies it, and opens a new Hermes chat.
 - Failure-first, recent, cost, token, and tool-call sorting; pagination grows to a 500-session safety limit.
+- Tools aggregation scans at most the latest 50,000 assistant rows and explicitly reports truncation. Search snippet IDs are queried in chunks of at most 900 parameters for older SQLite builds.
 - Click-to-sort headers on every evidence table, with visible direction and keyboard-accessible controls.
 - Persistent 7/30/90-day, all-time, or custom inclusive start/end date filtering for historical analytics.
 
@@ -89,7 +91,7 @@ plugins:
 - The API defines no archive, rename, delete, import, export, or other mutation route.
 - Tool results, transcript events, schedule errors, gateway errors, and Kanban evidence are secret-redacted and length-bounded before reaching the Desktop page.
 - Schedule and system prompts are never returned by the API.
-- Runtime logs are parsed locally with per-file memory caching; no new cache file is written.
+- Runtime logs and AI Models classification/payloads use bounded in-memory caching only; no new cache file is written.
 - Session content, prompts, and local telemetry are never sent to a third-party analytics service.
 - The AI Usage tab makes direct authenticated quota requests only to OpenAI, Anthropic, xAI, Nous Research, OpenRouter, DeepSeek, Kimi, and Z.AI. Credentials remain in the Python backend and are never returned to the Desktop plugin.
 - AI Models reads model IDs, routes, accounting, and session evidence locally. Session Lens—not Hermes—assigns one primary session type using first-match precedence: Orchestration, Coding, Writing, Analysis, then General. Classification uses recorded tool calls and arguments, including code-mutating commands and artifact paths; read-only Git/GitHub inspection does not imply Coding, cron, Telegram, webhook, desktop, and schedule remain sources, and auxiliary jobs retain separate unscored labels. OAuth quota is shared at provider-account level, suppresses pace judgments during the first 10% of a billing period, and only shows per-accepted-task efficiency after ten valid accepted tasks. General and Analysis use the conservative first-attempt proxy; Coding requires a resolved session with a successful code artifact save or commit; Writing requires a resolved session with a successful non-code artifact write; Orchestration and auxiliary jobs show `n/a`. Retry/switch counts rewinds, near-identical same-model prompt resends within five minutes, and same-role model changes. The table's Fail rate remains an API-attempt metric from bounded logs. Expanded work reliability instead scores completed main-role tasks, recovered tasks, clean completions, and terminal model/API failures; open, cancelled, orchestration, auxiliary, ambiguous, switched-away, and uncovered runs cannot improve the rate. Models with at least the configurable sample threshold rank by the lowest 95% Wilson upper failure bound. Fail and retry/switch percentages display their sample size; samples below the threshold are neutral and sort after adequately sampled rows. Zero-request rows suppress bounded-log failure and latency values to avoid mixing windows. Recorded tool-call failures are reconciled separately. Unknown routes first use explicit mappings, then distinct historical routes for the model or family, and otherwise become actionable `Unmapped (edit in config)` labels. Cost preserves recorded actual, estimated, free, subscription, mixed, or unpriced state; cached tokens show zero only after the route demonstrates cache reporting. TTFT is unavailable because Hermes does not record it.
@@ -97,7 +99,7 @@ plugins:
 - Usage checks accept provider credentials only when Hermes resolves them for the official provider host. Z.AI credential resolution deliberately avoids Hermes inference probes.
 - Ask Lens copies a locally generated prompt; the user decides whether to paste and submit it in Hermes.
 
-Failure detection combines Hermes' recorded finish/effect states with conservative signatures in tool results. The evidence is shown so users can verify it. File paths are observed evidence, not a guaranteed audit of every filesystem operation.
+Failure detection combines authoritative Hermes finish/effect states with conservative signatures in tool results. SQL signatures only identify candidates; the Python signature confirms content before any API metric counts it. The inspector distinguishes the bounded evidence currently shown from the confirmed full-session total so users can verify it. File paths are observed evidence, not a guaranteed audit of every filesystem operation.
 
 ## Development
 
