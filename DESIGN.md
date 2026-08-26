@@ -104,7 +104,7 @@ components:
 
 Hermes Session Lens is an **Operate** surface inside Hermes Desktop: one native observatory connecting provider capacity and session evidence to accounting and operational health. It inherits Hermes typography, controls, codicons, focus behavior, and light/dark theme roles; it does not establish a separate brand skin.
 
-This design document describes Hermes Session Lens `0.11.0`.
+This design document describes Hermes Session Lens `0.12.0`.
 
 The interface is compact, quiet, and evidence-first. A user finds a session, verifies trace and accounting, then inspects runtime, profile, or schedule state without leaving Hermes. Progressive disclosure carries the density, while explicit provenance, bounded excerpts, and read-only language make the trust boundary visible.
 
@@ -225,6 +225,7 @@ The form language is compact and lightly softened. Native/select controls use re
 ### AI Models
 
 - **Automatic inventory:** One row per all-time distinct model ID from `session_model_usage`, with a session-row fallback for older accounting. No model list is hardcoded, so first-time routes appear automatically; requests, tokens, cost, reliability, latency, task mix, and trend values honor the selected period.
+- **Routing summary:** A compact card above the table states the best current evidence per task type — Coding, Writing, Analysis, General — each naming the model with the lowest 95% Wilson upper bound at that task type (gate-passing models first), its completed/eligible fraction, and an explicit "below the N-task floor" caveat while provisional. Model names drill through to the Sessions view.
 - **Verdict-first rows:** Under each model name the row states a one-sentence verdict fused from the two evidence layers—API health from bounded logs and work evidence from eligible tasks (for example, "API steady. Too little finished work to rank — 4 of 20 tasks; true failure could reach 49%."). The verdict is generated only from already-computed values and never asserts a judgment the data does not support.
 - **Comparison table:** All ten headers—Model, Route, Requests, Tokens in/out/cached, Cost · quota (weekly), Fail rate, Retry/switch, Work evidence, Total latency, and Trend—are keyboard-sortable. The default is total tokens descending; the wide evidence table scrolls horizontally and retains input/output/cached token alignment. Cost and quota burn share one column: the recorded cost value above the quota meter. Work evidence is a dedicated column showing eligible tasks against the ranking gate ("4 / 20 tasks", or rank when achieved), a progress meter toward the gate, and the 95% Wilson upper bound as "risk ≤ Y%"; unrankable rows sort after rankable ones.
 - **Two denominators, two panes:** A rate never sits next to a sample it does not describe. Fail and retry/switch cells render the percentage above its own denominator ("0.4% · of 1,306 logged calls"); any sample below the configured floor renders as a plain neutral fraction ("2/3") instead of a percentage. The bounded-log window is declared once as a chip on the section header. The word "requests" never appears next to a task count.

@@ -464,6 +464,30 @@ class SessionLensApiTests(unittest.TestCase):
         paths = {item["path"] for item in detail["files"]}
         self.assertIn("C:\\work\\demo\\app.py", paths)
 
+    def test_digest_summarizes_periods_and_builds_markdown(self):
+        payload = api._digest_sync(0)
+        self.assertGreaterEqual(payload["totals"]["sessions"], 1)
+        self.assertGreaterEqual(payload["totals"]["tool_calls"], payload["totals"]["tool_failures"])
+        self.assertIsNone(payload["previous_period"])
+        self.assertIn("# Session Lens digest", payload["markdown"])
+        self.assertIn("## Totals", payload["markdown"])
+        self.assertIn("## Models by recorded requests", payload["markdown"])
+        self.assertNotIn("must-not-leak", payload["markdown"])
+
+        week = api._digest_sync(7)
+        self.assertIsNotNone(week["previous_period"])
+        self.assertEqual(week["previous_totals"]["sessions"], 0)
+        self.assertIn("(vs prior period)", week["markdown"])
+
+    def test_quota_exhaust_forecast_math(self):
+        now = time.time()
+        reset_at = now + 0.83 * 7 * 86400
+        exhaust = api._quota_exhaust_at("Weekly quota", reset_at, 31)
+        self.assertIsNotNone(exhaust)
+        self.assertAlmostEqual((exhaust - now) / 86400, 2.65, delta=0.1)
+        self.assertIsNone(api._quota_exhaust_at("Weekly quota", reset_at, 15))
+        self.assertIsNone(api._quota_exhaust_at("Balance", reset_at, 50))
+
     def test_attention_flags_runaway_and_reaped_sessions(self):
         connection = sqlite3.connect(self.db_path)
         try:

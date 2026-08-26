@@ -4,10 +4,11 @@ Hermes Session Lens is a native observability page for Hermes Desktop. It appear
 
 It is a unified Hermes plugin—one install contains the native Desktop page and its namespaced Python API. There is no iframe, separate dashboard, Node server, or third-party telemetry service.
 
-This documentation describes Hermes Session Lens `0.11.0`.
+This documentation describes Hermes Session Lens `0.12.0`.
 
 ## What it includes
 
+- A machine-consumable digest at `GET /api/plugins/session-lens/digest?days=7`: period totals with prior-period deltas (sessions, tokens, recorded cost, failure events, tool failures), the attention list, top models by requests with work-reliability evidence, over-pace quota windows with exhaustion forecasts, and a ready-made `markdown` field — built for cron agents, notification pipelines, or any automation that reads the plugin API. Read-only like every other route.
 - Quota exhaustion forecasts: when a timed OAuth quota window is burning faster than its billing period elapses, both the AI Usage window card and the AI Models quota meter state when the window runs out at the current pace ("At this pace, empty ~Sat, Aug 29"). Forecasts are linear extrapolations, suppressed during the first 10% of a period, for on-pace windows, and for windows without a known duration.
 - An attention banner above the session list flags runaway work: sessions open past 24 hours that are either still active (destructive severity) or idle with five million tokens or more, and reaped or expired sessions (`startup_orphan_reap`, `max_runtime`, `timeout`) at the same token threshold. Each flagged row jumps to that session in the list; quiet histories render no banner.
 - Failure-first session browser with full-text search snippets. SQL performs only a coarse candidate scan; the shared Python signature confirms tool-result text before list, detail, overview, tool, or AI Models metrics count it. Recorded Hermes finish/effect states remain authoritative.

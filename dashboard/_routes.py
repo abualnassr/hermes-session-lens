@@ -426,6 +426,296 @@ async def session_trace(
     return await asyncio.to_thread(_trace_sync, session_id, limit, offset)
 
 
+def _quota_window_duration_seconds(label: Any) -> Optional[float]:
+    text = str(label or "").lower()
+    if "week" in text:
+        return 7 * 86400.0
+    if "month" in text:
+        return 30 * 86400.0
+    if "day" in text:
+        return 86400.0
+    match = re.search(r"(\d+(?:\.\d+)?)\s*[- ]?hour|\((\d+(?:\.\d+)?)h\)", text)
+    if match:
+        return float(match.group(1) or match.group(2)) * 3600.0
+    return None
+
+
+def _quota_exhaust_at(label: Any, reset_at: Any, used_percent: Any) -> Optional[float]:
+    """Linear extrapolation of window burn; None unless it runs out before reset."""
+    duration = _quota_window_duration_seconds(label)
+    reset_epoch = _usage_reset_epoch(reset_at)
+    used = _number(used_percent)
+    if not duration or not reset_epoch or used <= 0:
+        return None
+    started_at = reset_epoch - duration
+    elapsed = time.time() - started_at
+    if elapsed <= 0:
+        return None
+    elapsed_percent = (elapsed / duration) * 100
+    if elapsed_percent < 10 or used <= elapsed_percent:
+        return None
+    exhaust_at = started_at + elapsed * (100 / used)
+    if exhaust_at >= reset_epoch:
+        return None
+    return exhaust_at
+
+
+def _digest_period_totals(
+    connection: sqlite3.Connection,
+    period_start: float,
+    period_end: Optional[float],
+) -> Dict[str, Any]:
+    session_sql, session_params = _period_sql("started_at", period_start, period_end)
+    row = _row_dict(
+        connection.execute(
+            f"""
+            SELECT COUNT(*) AS sessions,
+                   coalesce(SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens),0) AS total_tokens,
+                   coalesce(SUM(CASE WHEN coalesce(actual_cost_usd,0) > 0 THEN actual_cost_usd
+                                     WHEN coalesce(estimated_cost_usd,0) > 0 THEN estimated_cost_usd
+                                     ELSE 0 END),0) AS recorded_cost_usd
+            FROM sessions
+            WHERE {session_sql} AND coalesce(hidden,0)=0
+            """,
+            tuple(session_params),
+        ).fetchone()
+    )
+    joined_sql, joined_params = _period_sql("s.started_at", period_start, period_end)
+    tool_calls = connection.execute(
+        f"""
+        SELECT COUNT(*) FROM messages m JOIN sessions s ON s.id=m.session_id
+        WHERE {joined_sql} AND coalesce(s.hidden,0)=0
+          AND coalesce(m.active,1)=1 AND m.role='tool'
+        """,
+        tuple(joined_params),
+    ).fetchone()[0]
+    failure_rows = _confirmed_failure_rows(
+        connection, joined_sql + " AND coalesce(s.hidden,0)=0", joined_params
+    )
+    tool_failures = sum(1 for item in failure_rows if str(item.get("role") or "").lower() == "tool")
+    return {
+        "sessions": _integer(row.get("sessions")),
+        "total_tokens": _integer(row.get("total_tokens")),
+        "recorded_cost_usd": round(_number(row.get("recorded_cost_usd")), 4),
+        "failure_events": len(failure_rows),
+        "tool_calls": _integer(tool_calls),
+        "tool_failures": tool_failures,
+    }
+
+
+def _digest_tokens_label(value: Any) -> str:
+    number = _number(value)
+    if number >= 1_000_000_000:
+        return f"{number / 1_000_000_000:.1f}B"
+    if number >= 1_000_000:
+        return f"{number / 1_000_000:.1f}M"
+    if number >= 1_000:
+        return f"{number / 1_000:.1f}k"
+    return f"{number:.0f}"
+
+
+def _digest_delta_label(current: Any, previous: Any, formatter) -> str:
+    if previous is None:
+        return formatter(current)
+    delta = _number(current) - _number(previous)
+    sign = "+" if delta >= 0 else "-"
+    return f"{formatter(current)} ({sign}{formatter(abs(delta))} vs prior period)"
+
+
+def _digest_sync(
+    days: int = 7,
+    start_at: Optional[float] = None,
+    end_at: Optional[float] = None,
+) -> Dict[str, Any]:
+    period_start, period_end = _period_bounds(days, start_at, end_at)
+    now = time.time()
+    effective_end = period_end if period_end is not None else now
+    previous_bounds: Optional[Tuple[float, float]] = None
+    if period_start > 0 and effective_end > period_start:
+        span = effective_end - period_start
+        if period_start - span > 0:
+            previous_bounds = (period_start - span, period_start)
+
+    with _database() as db:
+        connection = _db_connection(db)
+        totals = _digest_period_totals(connection, period_start, period_end)
+        previous = (
+            _digest_period_totals(connection, previous_bounds[0], previous_bounds[1])
+            if previous_bounds
+            else None
+        )
+        prev_requests_by_model: Dict[str, int] = {}
+        if previous_bounds:
+            prev_sql, prev_params = _period_sql("s.started_at", previous_bounds[0], previous_bounds[1])
+            for model_row in connection.execute(
+                f"""
+                SELECT u.model, coalesce(SUM(u.api_call_count),0) AS requests
+                FROM session_model_usage u JOIN sessions s ON s.id=u.session_id
+                WHERE {prev_sql} AND coalesce(s.hidden,0)=0
+                GROUP BY u.model
+                """,
+                tuple(prev_params),
+            ).fetchall():
+                material = _row_dict(model_row)
+                prev_requests_by_model[str(material.get("model") or "")] = _integer(material.get("requests"))
+
+    models_payload = _ai_models_sync(days, start_at, end_at)
+    model_rows: List[Dict[str, Any]] = []
+    for model in models_payload.get("models", []):
+        if _integer(model.get("requests")) <= 0:
+            continue
+        reliability = model.get("work_reliability") or {}
+        model_rows.append(
+            {
+                "model_id": model.get("model_id"),
+                "display_name": model.get("display_name"),
+                "requests": _integer(model.get("requests")),
+                "previous_requests": prev_requests_by_model.get(str(model.get("model_id") or "")) if previous_bounds else None,
+                "total_tokens": _integer(model.get("total_tokens")),
+                "cost_usd": round(_number(model.get("cost_usd")), 4),
+                "cost_kind": model.get("cost_kind"),
+                "failure_rate": (model.get("failures") or {}).get("rate"),
+                "failure_samples": _integer((model.get("failures") or {}).get("samples")),
+                "eligible_tasks": _integer(reliability.get("eligible_tasks")),
+                "rank": reliability.get("rank"),
+                "failure_rate_upper_bound_95": reliability.get("failure_rate_upper_bound_95"),
+            }
+        )
+    model_rows.sort(key=lambda item: item["requests"], reverse=True)
+    model_rows = model_rows[:8]
+
+    attention = _attention_sync(days, start_at, end_at)
+    attention_rows = attention.get("sessions", [])[:8]
+
+    quota_rows: List[Dict[str, Any]] = []
+    try:
+        usage_payload = _ai_usage_sync()
+    except Exception:
+        usage_payload = {"providers": []}
+    for provider in usage_payload.get("providers", []):
+        if provider.get("status") not in {"ok", "stale"}:
+            continue
+        for window in provider.get("windows", []):
+            if window.get("kind") != "quota":
+                continue
+            used = window.get("percentage_used")
+            if used is None:
+                continue
+            duration = _quota_window_duration_seconds(window.get("label"))
+            reset_epoch = _usage_reset_epoch(window.get("reset_at"))
+            elapsed_percent = None
+            if duration and reset_epoch:
+                elapsed_percent = max(0.0, min(100.0, ((now - (reset_epoch - duration)) / duration) * 100))
+            exhaust_at = _quota_exhaust_at(window.get("label"), window.get("reset_at"), used)
+            quota_rows.append(
+                {
+                    "provider": provider.get("provider"),
+                    "label": window.get("label"),
+                    "percentage_used": _number(used),
+                    "elapsed_percent": elapsed_percent,
+                    "over_pace": bool(
+                        elapsed_percent is not None
+                        and elapsed_percent >= 10
+                        and _number(used) > elapsed_percent
+                    ),
+                    "reset_at": window.get("reset_at"),
+                    "exhaust_at": exhaust_at,
+                }
+            )
+
+    def cost_label(value: Any) -> str:
+        return f"${_number(value):.2f}"
+
+    period_label = (
+        f"{dt.datetime.fromtimestamp(period_start).strftime('%b %d')} – "
+        f"{dt.datetime.fromtimestamp(effective_end).strftime('%b %d, %Y')}"
+        if period_start
+        else "all recorded history"
+    )
+    lines = [f"# Session Lens digest — {period_label}", ""]
+    lines.append("## Totals" + (" (vs prior period)" if previous else ""))
+    lines.append(
+        "- Sessions: "
+        + _digest_delta_label(totals["sessions"], previous["sessions"] if previous else None, lambda v: f"{_integer(v)}")
+    )
+    lines.append(
+        "- Tokens: "
+        + _digest_delta_label(totals["total_tokens"], previous["total_tokens"] if previous else None, _digest_tokens_label)
+    )
+    lines.append(
+        "- Recorded cost: "
+        + _digest_delta_label(totals["recorded_cost_usd"], previous["recorded_cost_usd"] if previous else None, cost_label)
+    )
+    lines.append(
+        f"- Failure events: {totals['failure_events']}"
+        + (f" (prior {previous['failure_events']})" if previous else "")
+        + f" · Tool failures: {totals['tool_failures']} of {totals['tool_calls']} tool calls"
+    )
+    lines.append("")
+    if attention_rows:
+        lines.append("## Needs attention")
+        for item in attention_rows:
+            title = item.get("title") or item.get("id")
+            lines.append(f"- {title} — {item.get('reason')}")
+        remaining = _integer(attention.get("totals", {}).get("flagged")) - len(attention_rows)
+        if remaining > 0:
+            lines.append(f"- …and {remaining} more flagged sessions.")
+        lines.append("")
+    if model_rows:
+        lines.append("## Models by recorded requests")
+        for item in model_rows:
+            parts = [f"{item['requests']} requests"]
+            if item.get("previous_requests") is not None:
+                parts.append(f"prior {item['previous_requests']}")
+            parts.append(f"{_digest_tokens_label(item['total_tokens'])} tokens")
+            if item.get("rank"):
+                parts.append(f"reliability rank #{item['rank']}")
+            elif item.get("eligible_tasks"):
+                bound = item.get("failure_rate_upper_bound_95")
+                parts.append(
+                    f"{item['eligible_tasks']} eligible tasks"
+                    + (f", risk ≤ {_number(bound) * 100:.1f}%" if bound is not None else "")
+                )
+            lines.append(f"- {item['display_name']}: " + " · ".join(parts))
+        lines.append("")
+    if quota_rows:
+        lines.append("## Quota windows")
+        for item in quota_rows:
+            pace = ""
+            if item["elapsed_percent"] is not None:
+                pace = f" at {item['elapsed_percent']:.0f}% elapsed"
+                pace += " — over pace" if item["over_pace"] else " — on pace"
+            line = f"- {item['provider']} {item['label']}: {item['percentage_used']:.0f}% used{pace}"
+            if item.get("exhaust_at"):
+                line += f"; at this pace empty ~{dt.datetime.fromtimestamp(item['exhaust_at']).strftime('%a %b %d, %H:%M')}"
+            lines.append(line)
+        lines.append("")
+
+    return {
+        "period_days": days,
+        "period": _period_payload(days, period_start, period_end),
+        "previous_period": (
+            {"start_at": previous_bounds[0], "end_at": previous_bounds[1]} if previous_bounds else None
+        ),
+        "totals": totals,
+        "previous_totals": previous,
+        "attention": {"sessions": attention_rows, "totals": attention.get("totals")},
+        "models": model_rows,
+        "quota_windows": quota_rows,
+        "markdown": "\n".join(lines).rstrip() + "\n",
+        "generated_at": now,
+    }
+
+
+@router.get("/digest")
+async def digest(
+    days: int = Query(7, ge=0, le=3650),
+    start_at: Optional[float] = Query(None, ge=0),
+    end_at: Optional[float] = Query(None, ge=0),
+) -> Dict[str, Any]:
+    return await asyncio.to_thread(_digest_sync, days, start_at, end_at)
+
+
 ATTENTION_OPEN_HOURS = 24
 ATTENTION_MIN_TOKENS = 5_000_000
 _ATTENTION_REAPED_END_REASONS = {"startup_orphan_reap", "max_runtime", "timeout"}

@@ -2910,6 +2910,89 @@ function ModelExpanded({ model, quota, coverage, narrow, onDrill }) {
   })
 }
 
+function routingSummary(models, threshold) {
+  return ['Coding', 'Writing', 'Analysis', 'General'].map(taskType => {
+    const candidates = []
+    for (const model of models || []) {
+      const row = (model.work_reliability?.by_task_type || []).find(item => item.label === taskType)
+      if (!row || !Number(row.eligible_tasks)) continue
+      candidates.push({ model, row })
+    }
+    candidates.sort((left, right) => {
+      const leftGated = Number(left.row.eligible_tasks) >= threshold ? 0 : 1
+      const rightGated = Number(right.row.eligible_tasks) >= threshold ? 0 : 1
+      if (leftGated !== rightGated) return leftGated - rightGated
+      const leftBound = left.row.failure_rate_upper_bound_95 ?? 1
+      const rightBound = right.row.failure_rate_upper_bound_95 ?? 1
+      if (leftBound !== rightBound) return leftBound - rightBound
+      return Number(right.row.eligible_tasks) - Number(left.row.eligible_tasks)
+    })
+    return { taskType, best: candidates[0] || null }
+  })
+}
+
+function RoutingSummary({ models, coverage, onDrill }) {
+  const threshold = Math.max(1, Number(coverage?.rate_sample_threshold) || 20)
+  const rows = routingSummary(models, threshold)
+  if (!rows.some(row => row.best)) return null
+  const anyGatePassed = rows.some(row => row.best && Number(row.best.row.eligible_tasks) >= threshold)
+  return jsxs('section', {
+    style: { border, borderRadius: '6px', display: 'grid', gap: '0.6rem', padding: '0.75rem 0.85rem' },
+    children: [
+      jsxs('div', {
+        style: { alignItems: 'baseline', display: 'flex', flexWrap: 'wrap', gap: '0.3rem 0.75rem', justifyContent: 'space-between' },
+        children: [
+          jsx('h3', { style: { color: color.primary, fontSize: '0.8125rem', fontWeight: 650, margin: 0 }, children: 'Best current evidence by task type' }),
+          jsx('span', {
+            style: { color: color.quaternary, fontSize: '0.625rem' },
+            children: anyGatePassed
+              ? 'Ranked by lowest 95% Wilson upper failure bound per task type.'
+              : `Provisional — no model has ${formatCount(threshold)} eligible tasks in any single type yet.`
+          })
+        ]
+      }),
+      jsx('div', {
+        style: { display: 'grid', gap: '0.6rem', gridTemplateColumns: 'repeat(auto-fit, minmax(11rem, 1fr))' },
+        children: rows.map(({ taskType, best }) => {
+          if (!best) {
+            return jsxs('div', {
+              style: { display: 'grid', gap: '0.15rem' },
+              children: [
+                jsx('span', { style: { color: color.quaternary, fontSize: '0.625rem', fontWeight: 600 }, children: taskType }),
+                jsx('span', { style: { color: color.tertiary, fontSize: '0.6875rem', fontStyle: 'italic' }, children: 'no scored evidence yet' })
+              ]
+            }, taskType)
+          }
+          const eligible = Number(best.row.eligible_tasks) || 0
+          const completed = Number(best.row.completed_tasks) || 0
+          const bound = best.row.failure_rate_upper_bound_95
+          const gated = eligible >= threshold
+          const evidence = `${formatCount(completed)}/${formatCount(eligible)} completed${bound !== null && bound !== undefined ? ` · risk ≤ ${formatPercent(bound)}` : ''}`
+          const name = best.model.display_name
+          return jsxs('div', {
+            style: { display: 'grid', gap: '0.15rem', minWidth: 0 },
+            children: [
+              jsx('span', { style: { color: color.quaternary, fontSize: '0.625rem', fontWeight: 600 }, children: taskType }),
+              onDrill
+                ? jsx(EvidenceLink, {
+                    onClick: () => onDrill({ search: best.model.model_id }),
+                    title: `Open the Sessions view filtered to ${name}`,
+                    style: { fontSize: '0.75rem', fontWeight: 650, textAlign: 'left' },
+                    children: name
+                  })
+                : jsx('span', { style: { color: color.primary, fontSize: '0.75rem', fontWeight: 650 }, children: name }),
+              jsx('span', { style: { ...tabular, color: gated ? color.secondary : color.tertiary, fontSize: '0.625rem' }, children: evidence }),
+              gated
+                ? null
+                : jsx('span', { style: { color: color.quaternary, fontSize: '0.625rem', fontStyle: 'italic' }, children: `below the ${formatCount(threshold)}-task floor` })
+            ]
+          }, taskType)
+        })
+      })
+    ]
+  })
+}
+
 function AIModelsTable({ models, quotaData, coverage, narrow, onDrill }) {
   const [sortState, setSortState] = useState({ key: 'total_tokens', direction: 'desc' })
   const [expanded, setExpanded] = useState(() => new Set())
@@ -3118,6 +3201,7 @@ function AIModelsView({ query, quotaQuery, narrow, refreshError, onDrill }) {
         quotaQuery?.isError
           ? jsx('div', { role: 'status', style: { background: color.warningSoft, borderRadius: '5px', color: color.warning, fontSize: '0.6875rem', padding: '0.5rem 0.6rem' }, children: 'OAuth quota burn is temporarily unavailable; recorded model analytics remain visible.' })
           : null,
+        jsx(RoutingSummary, { models: data.models, coverage: data.coverage, onDrill }),
         jsx(AIModelsTable, { models: data.models, quotaData: quotaQuery?.data, coverage: data.coverage, narrow, onDrill }),
         jsxs('div', {
           style: { alignItems: 'flex-start', borderTop: border, color: color.tertiary, display: 'flex', fontSize: '0.6875rem', gap: '0.5rem', lineHeight: 1.5, paddingTop: '0.75rem' },
