@@ -462,6 +462,30 @@ class SessionLensApiTests(unittest.TestCase):
         paths = {item["path"] for item in detail["files"]}
         self.assertIn("C:\\work\\demo\\app.py", paths)
 
+    def test_benign_json_error_fields_are_not_failures(self):
+        benign = (
+            '{"output": "done", "exit_code": 0, "error": null}',
+            '{"error": false}',
+            '{"error": 0}',
+            '{"error": ""}',
+            '{"count": 3, "errors": null}',
+        )
+        real = (
+            '{"error": "Search failed: rg: unrecognized flag"}',
+            '{"errors": ["missing argument"]}',
+            '{"output": "", "exit_code": 127, "error": null}',
+        )
+        for content in benign:
+            self.assertFalse(
+                api._is_failure(role="tool", content=content),
+                f"benign payload misflagged: {content}",
+            )
+        for content in real:
+            self.assertTrue(
+                api._is_failure(role="tool", content=content),
+                f"real failure missed: {content}",
+            )
+
     def test_failure_sql_candidates_are_confirmed_by_shared_signature(self):
         corpus = (
             "0 errors",

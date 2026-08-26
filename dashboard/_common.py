@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-from __future__ import annotations
-
 import asyncio
 import copy
 import datetime as dt
@@ -65,7 +63,7 @@ def _plugin_version() -> str:
             return match.group(1)
     except OSError:
         pass
-    return "0.8.0"
+    return "0.8.1"
 
 
 PLUGIN_VERSION = _plugin_version()
@@ -91,7 +89,7 @@ _FAILURE_RE = re.compile(
     r"|\beconnrefused\b|\beaddrinuse\b|\bcommand not found\b"
     r"|\bno such file or directory\b|\bprocess exited with (?:code\s*)?[1-9]\d*\b"
     r"|\bexit[_ ]code[\"']?\s*[:=]\s*[1-9]\d*\b"
-    r"|\"(?:error|errors)\"\s*:\s*(?!null\b|false\b|0\b|\"\")",
+    r"|\"(?:error|errors)\"\s*:\s*(?!\s|null\b|false\b|0\b|\"\")",
 )
 _FAILURE_LINE_RE = re.compile(
     r"(?im)^[^\S\r\n]*(?:error(?!-free\b)|failed|failure|fatal|traceback|exception)\b"
@@ -107,7 +105,7 @@ _FAILURE_EXIT_CODE_RE = re.compile(
     r"(?i)\bexit[_ ]code[\"']?\s*[:=]\s*[1-9]\d*\b"
 )
 _FAILURE_JSON_RE = re.compile(
-    r"(?i)\"(?:error|errors)\"\s*:\s*(?!null\b|false\b|0\b|\"\")"
+    r"(?i)\"(?:error|errors)\"\s*:\s*(?!\s|null\b|false\b|0\b|\"\")"
 )
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
