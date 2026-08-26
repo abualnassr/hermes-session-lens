@@ -421,11 +421,20 @@ class SessionLensApiTests(unittest.TestCase):
         api._ai_usage_last_success.clear()
         api._ai_models_cache.clear()
         api._session_classification_cache.clear()
+        api._session_failure_cache.clear()
         if self.original_home is None:
             os.environ.pop("HERMES_HOME", None)
         else:
             os.environ["HERMES_HOME"] = self.original_home
         self.temp.cleanup()
+
+    def test_runtime_telemetry_route_is_registered(self):
+        routes = {
+            (route.path, method)
+            for route in api.router.routes
+            for method in (route.methods or set())
+        }
+        self.assertIn(("/telemetry", "GET"), routes)
 
     def test_list_uses_recorded_cost_and_failure_first(self):
         payload = api._list_sessions_sync(

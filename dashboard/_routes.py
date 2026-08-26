@@ -425,6 +425,8 @@ async def session_trace(
 ) -> Dict[str, Any]:
     return await asyncio.to_thread(_trace_sync, session_id, limit, offset)
 
+
+@router.get("/telemetry")
 async def telemetry(
     days: int = Query(30, ge=0, le=3650),
     start_at: Optional[float] = Query(None, ge=0),

@@ -81,6 +81,22 @@ _FAILURE_RE = re.compile(
     r"|\bexit[_ ]code[\"']?\s*[:=]\s*[1-9]\d*\b"
     r"|\"(?:error|errors)\"\s*:\s*(?!null\b|false\b|0\b|\"\")",
 )
+_FAILURE_LINE_RE = re.compile(
+    r"(?im)^[^\S\r\n]*(?:error(?!-free\b)|failed|failure|fatal|traceback|exception)\b"
+)
+_FAILURE_PHRASE_RE = re.compile(
+    r"(?i)\b(?:permission denied|access is denied|time(?:d)? out|econnrefused|eaddrinuse|"
+    r"command not found|no such file or directory)\b"
+)
+_FAILURE_PROCESS_EXIT_RE = re.compile(
+    r"(?i)\bprocess exited with (?:code\s*)?[1-9]\d*\b"
+)
+_FAILURE_EXIT_CODE_RE = re.compile(
+    r"(?i)\bexit[_ ]code[\"']?\s*[:=]\s*[1-9]\d*\b"
+)
+_FAILURE_JSON_RE = re.compile(
+    r"(?i)\"(?:error|errors)\"\s*:\s*(?!null\b|false\b|0\b|\"\")"
+)
 _ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 _CONTROL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 _SECRET_RE = re.compile(
@@ -244,6 +260,11 @@ _ai_models_cache_lock = threading.Lock()
 _ai_models_cache: Dict[Tuple[Any, ...], Tuple[float, Dict[str, Any]]] = {}
 _session_classification_cache_lock = threading.Lock()
 _session_classification_cache: Dict[Tuple[str, Any, int], Dict[str, Any]] = {}
+_session_failure_cache_lock = threading.Lock()
+_session_failure_cache: OrderedDict[
+    str, Tuple[Tuple[Any, int], Tuple[Dict[str, Any], ...]]
+] = OrderedDict()
+_SESSION_FAILURE_CACHE_MAX = 2000
 
 def _row_dict(row: Any) -> Dict[str, Any]:
     return dict(row) if row is not None else {}
@@ -444,7 +465,18 @@ def _is_failure(
     if str(role or "").strip().lower() != "tool":
         return False
     text = str(content or "")[:12000]
-    return bool(text and _FAILURE_RE.search(text))
+    if not text:
+        return False
+    lowered = text.lower()
+    if _FAILURE_LINE_RE.search(text) or _FAILURE_PHRASE_RE.search(text):
+        return True
+    if "process exited with" in lowered and _FAILURE_PROCESS_EXIT_RE.search(text):
+        return True
+    if ("exit_code" in lowered or "exit code" in lowered) and _FAILURE_EXIT_CODE_RE.search(text):
+        return True
+    if ('"error"' in lowered or '"errors"' in lowered) and _FAILURE_JSON_RE.search(text):
+        return True
+    return False
 
 
 def _parse_json(value: Any, fallback: Any) -> Any:
@@ -715,29 +747,69 @@ def _confirmed_failure_rows(
     session_where_sql: str,
     params: Iterable[Any] = (),
 ) -> List[Dict[str, Any]]:
-    """Return coarse SQL candidates that pass the shared failure predicate."""
-    candidates = connection.execute(
+    """Return confirmed failures, rescanning only sessions whose evidence changed."""
+    session_rows = connection.execute(
         f"""
-        SELECT m.id, m.session_id, m.role, m.content, m.tool_name,
-               m.finish_reason, m.effect_disposition, m.timestamp
-        FROM messages m
-        JOIN sessions s ON s.id=m.session_id
-        WHERE coalesce(m.active,1)=1
-          AND ({session_where_sql})
-          AND {_failure_sql('m')}
+        SELECT s.id, s.last_activity_at, s.message_count
+        FROM sessions s
+        WHERE ({session_where_sql})
         """,
         tuple(params),
     ).fetchall()
-    return [
-        material
-        for material in (_row_dict(row) for row in candidates)
-        if _is_failure(
-            role=material.get("role"),
-            content=material.get("content"),
-            finish_reason=material.get("finish_reason"),
-            effect_disposition=material.get("effect_disposition"),
-        )
-    ]
+    fingerprints = {
+        str(row["id"]): (row["last_activity_at"], _integer(row["message_count"]))
+        for row in session_rows
+    }
+    if not fingerprints:
+        return []
+
+    with _session_failure_cache_lock:
+        missing_ids = [
+            session_id
+            for session_id, fingerprint in fingerprints.items()
+            if session_id not in _session_failure_cache
+            or _session_failure_cache[session_id][0] != fingerprint
+        ]
+        for chunk_start in range(0, len(missing_ids), 900):
+            chunk = missing_ids[chunk_start : chunk_start + 900]
+            placeholders = ",".join("?" for _ in chunk)
+            candidates = connection.execute(
+                f"""
+                SELECT m.id, m.session_id, m.role, substr(m.content,1,12000) AS content,
+                       m.tool_name, m.finish_reason, m.effect_disposition, m.timestamp
+                FROM messages m
+                WHERE coalesce(m.active,1)=1
+                  AND m.session_id IN ({placeholders})
+                  AND {_failure_sql('m')}
+                """,
+                tuple(chunk),
+            ).fetchall()
+            confirmed_by_session: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+            for material in (_row_dict(row) for row in candidates):
+                if _is_failure(
+                    role=material.get("role"),
+                    content=material.get("content"),
+                    finish_reason=material.get("finish_reason"),
+                    effect_disposition=material.get("effect_disposition"),
+                ):
+                    confirmed_by_session[str(material.get("session_id") or "")].append(material)
+            for session_id in chunk:
+                _session_failure_cache[session_id] = (
+                    fingerprints[session_id],
+                    tuple(confirmed_by_session.get(session_id, ())),
+                )
+                _session_failure_cache.move_to_end(session_id)
+        while len(_session_failure_cache) > _SESSION_FAILURE_CACHE_MAX:
+            _session_failure_cache.popitem(last=False)
+
+        rows: List[Dict[str, Any]] = []
+        for session_id in fingerprints:
+            cached = _session_failure_cache.get(session_id)
+            if cached is None:
+                continue
+            _session_failure_cache.move_to_end(session_id)
+            rows.extend(dict(row) for row in cached[1])
+        return rows
 
 
 def _confirmed_failure_counts(
