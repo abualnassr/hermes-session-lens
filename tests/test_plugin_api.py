@@ -1501,9 +1501,6 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertEqual(schedules["totals"]["jobs"], 1)
         self.assertNotIn("prompt", schedules["schedules"][0])
         self.assertNotIn("must-not-leak", json.dumps(schedules))
-        kanban = api._kanban_sync()
-        self.assertEqual(kanban["totals"]["tasks"], 1)
-        self.assertEqual(kanban["boards"][0]["tasks"][0]["status"], "done")
 
 
 if __name__ == "__main__":

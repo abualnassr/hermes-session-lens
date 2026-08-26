@@ -1,7 +1,7 @@
 /*
 THESIS: One native observatory connects session evidence to Hermes operations without becoming a separate dashboard.
 OWN-WORLD: Hermes Desktop theme variables, SDK controls, codicons, compact borders, tabular data, and restrained status pills.
-STORY: Find a session, verify its trace and accounting, then inspect runtime, profile, schedule, or Kanban health without leaving Hermes.
+STORY: Find a session, verify its trace and accounting, then inspect runtime, profile, and schedule health without leaving Hermes.
 FIRST VIEWPORT: Native left navigation opens a compact header, four accounting signals, stable view tabs, and a dense evidence workspace.
 FORM: Operate surface; evidence remains primary, progressive disclosure carries density, and redacted read-only data sets the trust boundary.
 FINISH: unreviewed and undocumented is unfinished; this build ends with the finish review, the verdict, and DESIGN.md
@@ -62,7 +62,6 @@ const pageTabs = [
   { id: 'overview', label: 'Overview', codicon: 'graph' },
   { id: 'operations', label: 'Operations', codicon: 'pulse' },
   { id: 'tools', label: 'Tools', codicon: 'tools' },
-  { id: 'skills', label: 'Skills', codicon: 'sparkle' },
   { id: 'system', label: 'System', codicon: 'server-environment' },
   { id: 'ai-usage', label: 'AI Usage', codicon: 'dashboard' },
   { id: 'ai-models', label: 'AI Models', codicon: 'symbol-enum' }
@@ -864,229 +863,6 @@ function FilesView({ files, truncated }) {
   })
 }
 
-function AskLens({ detail, ctx }) {
-  const [question, setQuestion] = useState('What stands out in this session, and what should I improve next time?')
-  const session = detail.session
-  const prompt = useMemo(() => {
-    const toolCounts = new Map()
-    for (const event of detail.tools || []) toolCounts.set(event.name, (toolCounts.get(event.name) || 0) + 1)
-    const topTools = [...toolCounts.entries()]
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 12)
-      .map(([name, count]) => `${name} (${count})`)
-      .join(', ')
-    const skills = (detail.skills || []).map(item => item.name).join(', ')
-    const failures = (detail.failures || [])
-      .slice(0, 8)
-      .map(item => `- ${item.name}: ${item.result_snippet || item.status}`)
-      .join('\n')
-    return [
-      'Analyze this Hermes session using only the telemetry below. Distinguish recorded facts from inferences and do not invent missing pricing or intent.',
-      '',
-      `Question: ${question.trim() || 'Summarize the session.'}`,
-      '',
-      `Session: ${session.title}`,
-      `Session ID: ${session.id}`,
-      `Model: ${session.model || 'not recorded'}`,
-      `Tokens: ${session.total_tokens} total (${session.input_tokens} input, ${session.output_tokens} output, ${session.cache_read_tokens} cache read, ${session.cache_write_tokens} cache write)`,
-      `Cost: ${formatCost(session.display_cost_usd, session.cost_kind)} (${session.cost_kind})`,
-      `Messages: ${session.message_count}`,
-      `Tool calls: ${session.tool_call_count}`,
-      `Detected failures: ${session.failure_count}`,
-      `Duration: ${formatDuration(session.duration_seconds)}`,
-      `Top recorded tools: ${topTools || 'none'}`,
-      `Recorded skills invoked: ${skills || 'none'}`,
-      '',
-      failures ? `Failure evidence (bounded and redacted):\n${failures}` : 'Failure evidence: none detected',
-      '',
-      'Return: (1) concise assessment, (2) cost/token observations, (3) failure analysis, (4) three concrete improvements. State any uncertainty.'
-    ].join('\n')
-  }, [detail, question])
-
-  const copy = async openChat => {
-    const copied = await ctx.os.writeClipboard(prompt)
-    if (!copied) {
-      host.notify({ kind: 'error', message: 'Could not copy the Ask Lens prompt.' })
-      return
-    }
-    if (openChat) {
-      host.newChat()
-      host.notify({ kind: 'success', message: 'Ask Lens prompt copied. Paste it into the new chat.' })
-    } else {
-      host.notify({ kind: 'success', message: 'Ask Lens prompt copied.' })
-    }
-  }
-
-  return jsxs('div', {
-    style: { display: 'grid', gap: '0.85rem', padding: '1rem' },
-    children: [
-      jsx(SectionHeading, {
-        title: 'Ask Lens',
-        description: 'Builds a session-grounded prompt locally. Nothing is uploaded by this plugin.'
-      }),
-      jsx('label', {
-        style: { color: color.secondary, display: 'grid', fontSize: '0.75rem', gap: '0.35rem' },
-        children: jsxs(Fragment, {
-          children: [
-            jsx('span', { children: 'What do you want Hermes to analyze?' }),
-            jsx(Textarea, {
-              value: question,
-              onChange: event => setQuestion(event.target.value),
-              rows: 3,
-              maxLength: 500
-            })
-          ]
-        })
-      }),
-      jsx('details', {
-        children: [
-          jsx('summary', { style: { color: color.tertiary, cursor: 'pointer', fontSize: '0.6875rem' }, children: 'Preview generated prompt' }),
-          jsx('pre', {
-            style: {
-              background: color.surface,
-              border,
-              borderRadius: '5px',
-              color: color.secondary,
-              fontFamily: 'var(--font-mono)',
-              fontSize: '0.65625rem',
-              lineHeight: 1.5,
-              marginTop: '0.5rem',
-              maxHeight: '18rem',
-              overflow: 'auto',
-              padding: '0.7rem',
-              whiteSpace: 'pre-wrap'
-            },
-            children: prompt
-          })
-        ]
-      }),
-      jsxs('div', {
-        style: { display: 'flex', flexWrap: 'wrap', gap: '0.5rem' },
-        children: [
-          jsx(Button, { size: 'sm', onClick: () => copy(true), children: 'Copy and open new chat' }),
-          jsx(Button, { variant: 'outline', size: 'sm', onClick: () => copy(false), children: 'Copy prompt' })
-        ]
-      })
-    ]
-  })
-}
-
-function TraceView({ ctx, sessionId, period }) {
-  const [limit, setLimit] = useState(100)
-  useEffect(() => setLimit(100), [sessionId])
-  const traceQuery = useQuery({
-    queryKey: [PLUGIN_ID, 'trace', sessionId, limit],
-    queryFn: () => ctx.rest(apiPath(`/sessions/${encodeURIComponent(sessionId)}/trace`, { limit })),
-    enabled: Boolean(sessionId),
-    placeholderData: previous => previous
-  })
-  const telemetryQuery = useQuery({
-    queryKey: [PLUGIN_ID, 'session-telemetry', sessionId, period.days, period.start_at, period.end_at],
-    queryFn: () => ctx.rest(apiPath('/telemetry', { ...period, session_id: sessionId })),
-    enabled: Boolean(sessionId),
-    refetchInterval: 60_000
-  })
-  if (traceQuery.isLoading) return jsx(LoadingBlock, { rows: 9 })
-  if (traceQuery.isError) return jsx(ErrorBlock, { error: traceQuery.error, onRetry: traceQuery.refetch, title: 'Session trace unavailable' })
-  const data = traceQuery.data
-  const runtime = telemetryQuery.data?.summary
-  const kindMeta = {
-    user: ['account', 'User'],
-    assistant: ['hubot', 'Assistant'],
-    reasoning: ['lightbulb', 'Reasoning'],
-    tool_call: ['tools', 'Tool call'],
-    tool_result: ['terminal', 'Tool result']
-  }
-  return jsxs('div', {
-    style: { display: 'grid' },
-    children: [
-      runtime
-        ? jsx('div', {
-            style: { borderBottom: border, display: 'grid', gridTemplateColumns: 'repeat(4, minmax(7rem, 1fr))', overflowX: 'auto' },
-            children: [
-              jsx(Metric, { label: 'API calls in logs', value: formatCount(runtime.api_calls), detail: 'Session-attributed' }, 'calls'),
-              jsx(Metric, { label: 'Median latency', value: formatSeconds(runtime.latency_p50_seconds), detail: `p95 ${formatSeconds(runtime.latency_p95_seconds)}` }, 'latency'),
-              jsx(Metric, { label: 'Cache hit ratio', value: formatPercent(runtime.cache_hit_ratio), detail: `${formatCount(runtime.cache_read_tokens)} cache read` }, 'cache'),
-              jsx(Metric, { label: 'Timed tool runs', value: formatCount(runtime.tool_runs), detail: 'From local agent logs' }, 'tools')
-            ]
-          })
-        : null,
-      jsx('div', {
-        style: { background: color.surface, borderBottom: border, color: color.tertiary, fontSize: '0.6875rem', lineHeight: 1.5, padding: '0.55rem 1rem' },
-        children: 'Chronological active-message trace. System and scheduled-job prompts are excluded; recorded content is secret-redacted and bounded to 6,000 characters per event.'
-      }),
-      data.events?.length
-        ? jsx('ol', {
-            style: { listStyle: 'none', margin: 0, padding: 0 },
-            children: data.events.map(event => {
-              const [icon, label] = kindMeta[event.kind] || ['circle-outline', event.kind]
-              const failed = event.status === 'failed'
-              return jsx('li', {
-                style: { borderBottom: border, display: 'grid', gap: '0.45rem', padding: '0.8rem 1rem' },
-                children: [
-                  jsxs('div', {
-                    style: { alignItems: 'center', display: 'flex', flexWrap: 'wrap', gap: '0.4rem', justifyContent: 'space-between' },
-                    children: [
-                      jsxs('div', {
-                        style: { alignItems: 'center', display: 'flex', gap: '0.4rem', minWidth: 0 },
-                        children: [
-                          jsx(Codicon, { name: failed ? 'error' : icon, size: '0.78rem' }),
-                          jsx('strong', { style: { fontSize: '0.75rem', fontWeight: 650 }, children: event.tool_name || label }),
-                          event.kind === 'tool_call' ? jsx(Pill, { children: label }) : null,
-                          failed ? jsx(Pill, { tone: 'danger', children: 'Failed' }) : null
-                        ]
-                      }),
-                      jsx('time', { style: { color: color.quaternary, fontSize: '0.625rem' }, children: formatShortDate(event.timestamp) })
-                    ]
-                  }),
-                  event.kind === 'reasoning'
-                    ? jsxs('details', {
-                        children: [
-                          jsx('summary', { style: { color: color.tertiary, cursor: 'pointer', fontSize: '0.6875rem' }, children: 'Show recorded reasoning' }),
-                          jsx('pre', {
-                            style: { background: color.surface, borderRadius: '5px', color: color.secondary, fontFamily: 'var(--font-mono)', fontSize: '0.6875rem', lineHeight: 1.55, margin: '0.45rem 0 0', maxHeight: '24rem', overflow: 'auto', padding: '0.65rem', whiteSpace: 'pre-wrap' },
-                            children: event.content
-                          })
-                        ]
-                      })
-                    : jsx(event.kind === 'tool_result' ? 'pre' : 'div', {
-                        style: {
-                          background: event.kind === 'tool_result' ? color.surface : 'transparent',
-                          borderRadius: event.kind === 'tool_result' ? '5px' : 0,
-                          color: failed ? color.danger : color.secondary,
-                          fontFamily: event.kind === 'tool_result' ? 'var(--font-mono)' : 'inherit',
-                          fontSize: '0.71875rem',
-                          lineHeight: 1.55,
-                          margin: 0,
-                          maxHeight: event.kind === 'tool_result' ? '24rem' : 'none',
-                          overflow: event.kind === 'tool_result' ? 'auto' : 'visible',
-                          overflowWrap: 'anywhere',
-                          padding: event.kind === 'tool_result' ? '0.65rem' : 0,
-                          whiteSpace: 'pre-wrap'
-                        },
-                        children: event.content || 'No display content recorded.'
-                      })
-                ]
-              }, event.id)
-            })
-          })
-        : jsx(EmptyState, { title: 'No trace events', description: 'No active user, assistant, reasoning, or tool rows were recorded.' }),
-      data.pagination?.has_more
-        ? jsx('div', {
-            style: { padding: '0.75rem 1rem' },
-            children: jsx(Button, {
-              variant: 'outline',
-              size: 'sm',
-              disabled: traceQuery.isFetching || limit >= 200,
-              onClick: () => setLimit(value => Math.min(200, value + 100)),
-              children: limit >= 200 ? '200-message safety limit reached' : 'Load 100 more messages'
-            })
-          })
-        : null
-    ]
-  })
-}
-
 function SessionDetail({ query, detailTab, setDetailTab, ctx, period, onBack }) {
   if (!query) {
     return jsx(EmptyState, { title: 'Choose a session', description: 'Select a session to inspect its recorded evidence.' })
@@ -1100,15 +876,13 @@ function SessionDetail({ query, detailTab, setDetailTab, ctx, period, onBack }) 
     { id: 'trace', label: 'Trace' },
     { id: 'tools', label: `Tools ${detail.tools?.length || 0}` },
     { id: 'failures', label: `Failures ${session.failure_count || 0}` },
-    { id: 'files', label: `Files ${detail.files?.length || 0}` },
-    { id: 'ask', label: 'Ask Lens' }
+    { id: 'files', label: `Files ${detail.files?.length || 0}` }
   ]
   let content = jsx(SessionSummary, { detail })
   if (detailTab === 'trace') content = jsx(TraceView, { ctx, sessionId: session.id, period })
   if (detailTab === 'tools') content = jsx(ToolEvents, { events: detail.tools })
   if (detailTab === 'failures') content = jsx(FailureInspector, { failures: detail.failures, detectedTotal: session.failure_count })
   if (detailTab === 'files') content = jsx(FilesView, { files: detail.files, truncated: detail.analysis?.truncated })
-  if (detailTab === 'ask') content = jsx(AskLens, { detail, ctx })
 
   return jsxs('div', {
     style: { display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 },
@@ -1162,7 +936,7 @@ function SessionDetail({ query, detailTab, setDetailTab, ctx, period, onBack }) 
   })
 }
 
-function SessionsView({ ctx, period, narrow }) {
+function SessionsView({ ctx, period, narrow, drill }) {
   const [search, setSearch] = useState('')
   const [sort, setSort] = useState('failures')
   const [failuresOnly, setFailuresOnly] = useState(false)
@@ -1176,6 +950,13 @@ function SessionsView({ ctx, period, narrow }) {
   useEffect(() => {
     if (narrow) setNarrowPane('list')
   }, [narrow])
+  useEffect(() => {
+    if (!drill) return
+    setSearch(drill.search || '')
+    setFailuresOnly(Boolean(drill.failuresOnly))
+    setSort('failures')
+    setNarrowPane('list')
+  }, [drill])
 
   const listQuery = useQuery({
     queryKey: [PLUGIN_ID, 'sessions', period.days, period.start_at, period.end_at, debouncedSearch, sort, failuresOnly, limit],
@@ -1433,13 +1214,19 @@ function ToolsView({ ctx, period }) {
     queryFn: () => ctx.rest(apiPath('/tools', period)),
     refetchInterval: 60_000
   })
+  const skillsQuery = useQuery({
+    queryKey: [PLUGIN_ID, 'skills', period.days, period.start_at, period.end_at],
+    queryFn: () => ctx.rest(apiPath('/skills', period)),
+    refetchInterval: 60_000
+  })
   if (query.isLoading) return jsx(LoadingBlock, { rows: 8 })
   if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'Tool analytics unavailable' })
   const data = query.data
+  const skills = skillsQuery.data
   return jsx('div', {
     style: { flex: 1, minHeight: 0, overflow: 'auto', padding: '1rem' },
     children: jsxs('div', {
-      style: { margin: '0 auto', maxWidth: '78rem' },
+      style: { display: 'grid', gap: '1.5rem', margin: '0 auto', maxWidth: '78rem' },
       children: [
         jsx(SectionHeading, {
           title: 'Tool reliability',
@@ -1465,42 +1252,31 @@ function ToolsView({ ctx, period }) {
         }),
         data.truncated
           ? jsx('p', { style: { color: color.tertiary, fontSize: '0.6875rem' }, children: 'The aggregate scan reached its 50,000-row safety limit.' })
-          : null
-      ]
-    })
-  })
-}
-
-function SkillsViewPanel({ ctx, period }) {
-  const query = useQuery({
-    queryKey: [PLUGIN_ID, 'skills', period.days, period.start_at, period.end_at],
-    queryFn: () => ctx.rest(apiPath('/skills', period)),
-    refetchInterval: 60_000
-  })
-  if (query.isLoading) return jsx(LoadingBlock, { rows: 8 })
-  if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'Skill analytics unavailable' })
-  const data = query.data
-  return jsx('div', {
-    style: { flex: 1, minHeight: 0, overflow: 'auto', padding: '1rem' },
-    children: jsxs('div', {
-      style: { margin: '0 auto', maxWidth: '72rem' },
-      children: [
-        jsx(SectionHeading, {
-          title: 'Skills actually invoked',
-          description: data.definition
-        }),
-        jsx(SimpleTable, {
-          columns: [
-            { key: 'name', label: 'Skill' },
-            { key: 'view_count', label: 'Loads', align: 'right', render: row => formatCount(row.view_count) },
-            { key: 'manage_count', label: 'Management', align: 'right', render: row => formatCount(row.manage_count) },
-            { key: 'sessions', label: 'Sessions', align: 'right', render: row => formatCount(row.sessions) },
-            { key: 'last_used_at', label: 'Last invoked', render: row => formatShortDate(row.last_used_at), muted: true }
-          ],
-          rows: data.skills,
-          emptyTitle: 'No explicit skill invocations',
-          emptyDescription: 'Available or loaded skills are intentionally not presented as used.'
-        })
+          : null,
+        skills
+          ? jsxs('section', {
+              children: [
+                jsx(SectionHeading, {
+                  title: 'Skills actually invoked',
+                  description: skills.definition
+                }),
+                jsx(SimpleTable, {
+                  columns: [
+                    { key: 'name', label: 'Skill' },
+                    { key: 'view_count', label: 'Loads', align: 'right', render: row => formatCount(row.view_count) },
+                    { key: 'manage_count', label: 'Management', align: 'right', render: row => formatCount(row.manage_count) },
+                    { key: 'sessions', label: 'Sessions', align: 'right', render: row => formatCount(row.sessions) },
+                    { key: 'last_used_at', label: 'Last invoked', render: row => formatShortDate(row.last_used_at), muted: true }
+                  ],
+                  rows: skills.skills,
+                  emptyTitle: 'No explicit skill invocations',
+                  emptyDescription: 'Available or loaded skills are intentionally not presented as used.'
+                })
+              ]
+            })
+          : skillsQuery.isError
+            ? jsx('p', { style: { color: color.tertiary, fontSize: '0.6875rem' }, children: 'Skill analytics are temporarily unavailable.' })
+            : null
       ]
     })
   })
@@ -1659,53 +1435,16 @@ function SchedulesView({ ctx }) {
   })
 }
 
-function KanbanView({ ctx }) {
-  const query = useQuery({
-    queryKey: [PLUGIN_ID, 'kanban'],
-    queryFn: () => ctx.rest('/kanban'),
-    refetchInterval: 30_000
-  })
-  if (query.isLoading) return jsx(LoadingBlock, { rows: 8 })
-  if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'Kanban operations unavailable' })
-  const data = query.data
-  const tasks = (data.boards || []).flatMap(board => board.tasks.map(task => ({ ...task, id: `${board.name}:${task.id}`, board: board.name })))
-  return jsxs('div', {
-    style: { display: 'grid', gap: '1rem' },
-    children: [
-      jsx(SectionHeading, {
-        title: 'Kanban execution',
-        description: `${formatCount(data.totals.tasks)} tasks and ${formatCount(data.totals.runs)} execution runs across ${formatCount(data.totals.boards)} boards.`
-      }),
-      jsx(SimpleTable, {
-        columns: [
-          { key: 'title', label: 'Task' },
-          { key: 'board', label: 'Board', muted: true },
-          { key: 'status', label: 'Status', render: row => jsx(Pill, { tone: row.status === 'done' || row.status === 'completed' ? 'accent' : row.consecutive_failures ? 'danger' : 'neutral', children: row.status }) },
-          { key: 'assignee', label: 'Assignee', sortValue: row => row.assignee || '', render: row => row.assignee || '—' },
-          { key: 'priority', label: 'Priority', align: 'right' },
-          { key: 'consecutive_failures', label: 'Failures', align: 'right', render: row => row.consecutive_failures ? jsx(Pill, { tone: 'danger', title: row.last_failure_error, children: formatCount(row.consecutive_failures) }) : '0' },
-          { key: 'completed_at', label: 'Updated', sortValue: row => row.completed_at || row.started_at || row.created_at, render: row => formatShortDate(row.completed_at || row.started_at || row.created_at), muted: true }
-        ],
-        rows: tasks,
-        emptyTitle: 'No Kanban tasks',
-        emptyDescription: 'No tasks were found in the shared Hermes Kanban stores.'
-      })
-    ]
-  })
-}
-
 function OperationsView({ ctx, period }) {
   const [section, setSection] = useState('health')
   const options = [
     { id: 'health', label: 'Health' },
     { id: 'profiles', label: 'Profiles' },
-    { id: 'schedules', label: 'Schedules' },
-    { id: 'kanban', label: 'Kanban' }
+    { id: 'schedules', label: 'Schedules' }
   ]
   let content = jsx(RuntimeHealth, { ctx, period })
   if (section === 'profiles') content = jsx(ProfilesView, { ctx, period })
   if (section === 'schedules') content = jsx(SchedulesView, { ctx })
-  if (section === 'kanban') content = jsx(KanbanView, { ctx })
   return jsx('div', {
     style: { flex: 1, minHeight: 0, overflow: 'auto', padding: '1rem' },
     children: jsxs('div', {
@@ -1714,7 +1453,7 @@ function OperationsView({ ctx, period }) {
         jsxs('div', {
           style: { alignItems: 'center', display: 'flex', flexWrap: 'wrap', gap: '0.75rem', justifyContent: 'space-between' },
           children: [
-            jsx(SectionHeading, { title: 'Operations', description: 'Runtime health and work orchestration across Hermes profiles.' }),
+            jsx(SectionHeading, { title: 'Operations', description: 'Runtime health, profiles, and schedules for the Hermes agent.' }),
             jsx(SegmentedControl, { options, value: section, onChange: setSection })
           ]
         }),
@@ -2101,6 +1840,7 @@ function SessionLensPage({ ctx }) {
   const viewport = useValue(host.state.viewport)
   const queryClient = useQueryClient()
   const [tab, setTab] = useState(() => ctx.storage.get('activeTab', 'sessions'))
+  const [drill, setDrill] = useState(null)
   const [aiManualRefreshing, setAiManualRefreshing] = useState(false)
   const [aiRefreshError, setAiRefreshError] = useState('')
   const [daysText, setDaysText] = useState(() => {
@@ -2181,11 +1921,14 @@ function SessionLensPage({ ctx }) {
     setCustomEnd(value)
     if (value < customStart) setCustomStart(value)
   }
-  let content = jsx(SessionsView, { ctx, period, narrow: Boolean(viewport?.narrow) })
+  const drillToSessions = filters => {
+    setDrill({ ...filters, key: Date.now() })
+    setTab('sessions')
+  }
+  let content = jsx(SessionsView, { ctx, period, narrow: Boolean(viewport?.narrow), drill })
   if (tab === 'overview') content = jsx(OverviewView, { query: overviewQuery })
   if (tab === 'operations') content = jsx(OperationsView, { ctx, period })
   if (tab === 'tools') content = jsx(ToolsView, { ctx, period })
-  if (tab === 'skills') content = jsx(SkillsViewPanel, { ctx, period })
   if (tab === 'system') content = jsx(SystemView, { ctx })
   if (tab === 'ai-usage') content = jsx(AIUsageView, {
     query: aiUsageQuery,
@@ -2193,6 +1936,7 @@ function SessionLensPage({ ctx }) {
     refreshError: aiRefreshError
   })
   if (tab === 'ai-models') content = jsx(AIModelsView, {
+    onDrill: drillToSessions,
     query: aiModelsQuery,
     quotaQuery: aiUsageQuery,
     narrow: Boolean(viewport?.narrow),
@@ -2232,8 +1976,8 @@ function SessionLensPage({ ctx }) {
                     'aria-label': 'Custom date range',
                     style: { alignItems: 'center', display: 'flex', flexWrap: 'wrap', gap: '0.45rem' },
                     children: [
-                      jsx(DateField, { label: 'Start', value: customStart, max: customEnd, onChange: updateCustomStart }),
-                      jsx(DateField, { label: 'End', value: customEnd, min: customStart, onChange: updateCustomEnd })
+                      jsx(DateField, { label: 'Start', value: customStart, onChange: updateCustomStart }),
+                      jsx(DateField, { label: 'End', value: customEnd, onChange: updateCustomEnd })
                     ]
                   })
                 : null,
@@ -2582,7 +2326,29 @@ function LayerPane({ title, meta, children }) {
   })
 }
 
-function ApiLayerPane({ model, coverage }) {
+function EvidenceLink({ onClick, title, children, style }) {
+  return jsx('button', {
+    type: 'button',
+    onClick,
+    title,
+    style: {
+      background: 'transparent',
+      border: 'none',
+      color: color.accent,
+      cursor: 'pointer',
+      font: 'inherit',
+      outlineColor: color.accent,
+      padding: 0,
+      textAlign: 'right',
+      textDecoration: 'underline',
+      textUnderlineOffset: '2px',
+      ...style
+    },
+    children
+  })
+}
+
+function ApiLayerPane({ model, coverage, onDrill }) {
   const failures = model.failures || {}
   const logSamples = Number(failures.samples) || 0
   const window = formatLogWindow(coverage)
@@ -2647,12 +2413,20 @@ function ApiLayerPane({ model, coverage }) {
         style: { alignItems: 'baseline', display: 'flex', gap: '0.75rem', justifyContent: 'space-between' },
         children: [
           jsx('span', { style: { color: color.tertiary, fontSize: '0.6875rem' }, children: 'Tool failures (session records)' }),
-          jsx('span', {
-            style: { ...tabular, color: toolFailures > 0 ? color.danger : color.primary, fontSize: '0.75rem', fontWeight: 650 },
-            children: toolCalls > 0
+          (() => {
+            const label = toolCalls > 0
               ? `${formatCount(toolFailures)} of ${formatCount(toolCalls)} tool calls · ${((toolFailures / toolCalls) * 100).toFixed(1)}%`
               : formatCount(toolFailures)
-          })
+            const valueStyle = { ...tabular, color: toolFailures > 0 ? color.danger : color.primary, fontSize: '0.75rem', fontWeight: 650 }
+            return onDrill && toolFailures > 0
+              ? jsx(EvidenceLink, {
+                  onClick: () => onDrill({ search: model.model_id, failuresOnly: true }),
+                  title: 'Open the Sessions view filtered to this model with failures only',
+                  style: valueStyle,
+                  children: label
+                })
+              : jsx('span', { style: valueStyle, children: label })
+          })()
         ]
       }),
       jsxs('div', {
@@ -2710,7 +2484,7 @@ function WorkLedgerRow({ row, acceptance }) {
   }, row.label)
 }
 
-function WorkLedgerPane({ model, quota }) {
+function WorkLedgerPane({ model, quota, onDrill }) {
   const reliability = model.work_reliability || {}
   const eligible = Number(reliability.eligible_tasks) || 0
   const bound = reliability.failure_rate_upper_bound_95
@@ -2732,7 +2506,14 @@ function WorkLedgerPane({ model, quota }) {
   })
   return jsxs(LayerPane, {
     title: 'Work ledger',
-    meta: `${formatCount(eligible)} eligible tasks`,
+    meta: onDrill && eligible > 0
+      ? jsx(EvidenceLink, {
+          onClick: () => onDrill({ search: model.model_id }),
+          title: "Open the Sessions view filtered to this model's sessions",
+          style: { ...tabular, fontSize: '0.625rem' },
+          children: `${formatCount(eligible)} eligible tasks`
+        })
+      : `${formatCount(eligible)} eligible tasks`,
     children: [
       ranked
         ? jsxs('div', {
@@ -2807,7 +2588,7 @@ function WorkLedgerPane({ model, quota }) {
   })
 }
 
-function ModelExpanded({ model, quota, coverage, narrow }) {
+function ModelExpanded({ model, quota, coverage, narrow, onDrill }) {
   const reliability = model.work_reliability || {}
   const eligible = Number(reliability.eligible_tasks) || 0
   const gate = Math.max(1, Number(reliability.sample_threshold) || Number(coverage?.rate_sample_threshold) || 20)
@@ -2845,7 +2626,7 @@ function ModelExpanded({ model, quota, coverage, narrow }) {
   ])
   return jsxs('div', {
     style: {
-      background: color.surface,
+      background: 'transparent',
       borderTop: border,
       boxSizing: 'border-box',
       display: 'grid',
@@ -2876,8 +2657,8 @@ function ModelExpanded({ model, quota, coverage, narrow }) {
       jsxs('div', {
         style: { display: 'grid', gap: '0.85rem', gridTemplateColumns: narrow ? '1fr' : 'minmax(19rem, 1fr) minmax(19rem, 1fr)' },
         children: [
-          jsx(ApiLayerPane, { model, coverage }),
-          jsx(WorkLedgerPane, { model, quota })
+          jsx(ApiLayerPane, { model, coverage, onDrill }),
+          jsx(WorkLedgerPane, { model, quota, onDrill })
         ]
       }),
       insight
@@ -2907,7 +2688,7 @@ function ModelExpanded({ model, quota, coverage, narrow }) {
   })
 }
 
-function AIModelsTable({ models, quotaData, coverage, narrow }) {
+function AIModelsTable({ models, quotaData, coverage, narrow, onDrill }) {
   const [sortState, setSortState] = useState({ key: 'total_tokens', direction: 'desc' })
   const [expanded, setExpanded] = useState(() => new Set())
   const rateSampleThreshold = Math.max(1, Number(coverage?.rate_sample_threshold) || 20)
@@ -3057,7 +2838,7 @@ function AIModelsTable({ models, quotaData, coverage, narrow }) {
                     id: detailId,
                     colSpan: columns.length,
                     style: { borderBottom: border, padding: 0 },
-                    children: jsx(ModelExpanded, { model, quota: item.quota, coverage, narrow })
+                    children: jsx(ModelExpanded, { model, quota: item.quota, coverage, narrow, onDrill })
                   })
                 }, `${model.model_id}-detail`)
               : null
@@ -3087,7 +2868,7 @@ function AIModelsStatStrip({ data }) {
   })
 }
 
-function AIModelsView({ query, quotaQuery, narrow, refreshError }) {
+function AIModelsView({ query, quotaQuery, narrow, refreshError, onDrill }) {
   if (query.isLoading) return jsx(LoadingBlock, { rows: 9 })
   if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'AI model analytics are unavailable' })
   const data = query.data
@@ -3115,7 +2896,7 @@ function AIModelsView({ query, quotaQuery, narrow, refreshError }) {
         quotaQuery?.isError
           ? jsx('div', { role: 'status', style: { background: color.warningSoft, borderRadius: '5px', color: color.warning, fontSize: '0.6875rem', padding: '0.5rem 0.6rem' }, children: 'OAuth quota burn is temporarily unavailable; recorded model analytics remain visible.' })
           : null,
-        jsx(AIModelsTable, { models: data.models, quotaData: quotaQuery?.data, coverage: data.coverage, narrow }),
+        jsx(AIModelsTable, { models: data.models, quotaData: quotaQuery?.data, coverage: data.coverage, narrow, onDrill }),
         jsxs('div', {
           style: { alignItems: 'flex-start', borderTop: border, color: color.tertiary, display: 'flex', fontSize: '0.6875rem', gap: '0.5rem', lineHeight: 1.5, paddingTop: '0.75rem' },
           children: [
@@ -3133,7 +2914,7 @@ function AIModelsView({ query, quotaQuery, narrow, refreshError }) {
 export default {
   id: PLUGIN_ID,
   name: 'Hermes Session Lens',
-  description: 'Native read-only session telemetry, account usage, trace, runtime health, profiles, schedules, and Kanban operations.',
+  description: 'Native read-only session telemetry, account usage, trace, runtime health, profiles, and schedules.',
   defaultEnabled: true,
   register(ctx) {
     ctx.registerMany([
@@ -3155,7 +2936,7 @@ export default {
         data: {
           id: 'session-lens.open',
           label: 'Session Lens: Open telemetry',
-          keywords: ['sessions', 'models', 'tokens', 'cost', 'usage', 'quota', 'codex', 'grok', 'nous', 'openrouter', 'tools', 'skills', 'failures', 'latency', 'telemetry', 'profiles', 'gateway', 'schedules', 'kanban'],
+          keywords: ['sessions', 'models', 'tokens', 'cost', 'usage', 'quota', 'codex', 'grok', 'nous', 'openrouter', 'tools', 'skills', 'failures', 'latency', 'telemetry', 'profiles', 'gateway', 'schedules'],
           run: () => host.navigate(ROUTE)
         }
       }

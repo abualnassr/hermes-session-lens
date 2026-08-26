@@ -1,10 +1,10 @@
 # Hermes Session Lens
 
-Hermes Session Lens is a native observability page for Hermes Desktop. It appears in the left sidebar and explains what each session consumed and did, shows current provider allowances and balances, then connects that evidence to runtime health, profiles, schedules, and Kanban execution.
+Hermes Session Lens is a native observability page for Hermes Desktop. It appears in the left sidebar and explains what each session consumed and did, shows current provider allowances and balances, then connects that evidence to runtime health, profiles, and schedules.
 
 It is a unified Hermes plugin—one install contains the native Desktop page and its namespaced Python API. There is no iframe, separate dashboard, Node server, or third-party telemetry service.
 
-This documentation describes Hermes Session Lens `0.8.1`.
+This documentation describes Hermes Session Lens `0.9.0`.
 
 ## What it includes
 
@@ -23,12 +23,10 @@ This documentation describes Hermes Session Lens `0.8.1`.
 - Cross-profile session, token, cost, model, and outcome totals.
 - Gateway and platform health for the default and named profiles.
 - Schedule status, next/last run, delivery errors, and failure streaks without exposing schedule prompts.
-- Shared Kanban task and run status with bounded failure evidence.
-- Overview, Operations, Tools, Skills, System, AI Usage, and AI Models views.
+- Overview, Operations, Tools (with skill invocations), System, AI Usage, and AI Models views. Aggregates on AI Models drill through to the filtered Sessions view.
 - Live account-level usage for OpenAI Codex, Anthropic Claude, Nous Research Portal, OpenRouter, DeepSeek, Grok, Kimi Code Plan, and Z.AI GLM Coding Plan using credentials already configured in Hermes.
 - Five-minute in-memory provider cache, explicit partial/stale states, and a manual fresh refresh.
 - AI Models caches immutable closed-session classification facts in memory and reuses unchanged period payloads for 60 seconds. The Desktop polls every five minutes; manual refresh bypasses the payload cache immediately. No cache file is written.
-- Ask Lens: builds a grounded analysis prompt locally, copies it, and opens a new Hermes chat.
 - Failure-first, recent, cost, token, and tool-call sorting; pagination grows to a 500-session safety limit.
 - Tools aggregation scans at most the latest 50,000 assistant rows and explicitly reports truncation. Search snippet IDs are queried in chunks of at most 900 parameters for older SQLite builds.
 - Click-to-sort headers on every evidence table, with visible direction and keyboard-accessible controls.
@@ -87,9 +85,9 @@ plugins:
 
 ## Privacy and safety
 
-- Session stores use Hermes' `SessionDB(read_only=True)` contract. Kanban stores use SQLite `mode=ro`; dormant profile stores may use SQLite immutable mode only when no WAL exists.
+- Session stores use Hermes' `SessionDB(read_only=True)` contract; dormant profile stores may use SQLite immutable mode only when no WAL exists.
 - The API defines no archive, rename, delete, import, export, or other mutation route.
-- Tool results, transcript events, schedule errors, gateway errors, and Kanban evidence are secret-redacted and length-bounded before reaching the Desktop page.
+- Tool results, transcript events, schedule errors, and gateway errors are secret-redacted and length-bounded before reaching the Desktop page.
 - Schedule and system prompts are never returned by the API.
 - Runtime logs and AI Models classification/payloads use bounded in-memory caching only; no new cache file is written.
 - Session content, prompts, and local telemetry are never sent to a third-party analytics service.
@@ -97,7 +95,6 @@ plugins:
 - AI Models reads model IDs, routes, accounting, and session evidence locally. Session Lens—not Hermes—assigns one primary session type using first-match precedence: Orchestration, Coding, Writing, Analysis, then General. Classification uses recorded tool calls and arguments, including code-mutating commands and artifact paths; read-only Git/GitHub inspection does not imply Coding, cron, Telegram, webhook, desktop, and schedule remain sources, and auxiliary jobs retain separate unscored labels. OAuth quota is shared at provider-account level, suppresses pace judgments during the first 10% of a billing period, and only shows per-accepted-task efficiency after ten valid accepted tasks. General and Analysis use the conservative first-attempt proxy; Coding requires a resolved session with a successful code artifact save or commit; Writing requires a resolved session with a successful non-code artifact write; Orchestration and auxiliary jobs show `n/a`. Retry/switch counts rewinds, near-identical same-model prompt resends within five minutes, and same-role model changes. The table's Fail rate remains an API-attempt metric from bounded logs. Expanded work reliability instead scores completed main-role tasks, recovered tasks, clean completions, and terminal model/API failures; open, cancelled, orchestration, auxiliary, ambiguous, switched-away, and uncovered runs cannot improve the rate. Models with at least the configurable sample threshold rank by the lowest 95% Wilson upper failure bound. Fail and retry/switch cells display their own denominators; samples below the threshold render as neutral fractions and sort after adequately sampled rows. Models below the eligible-task floor open with a not-rankable banner stating the 95% Wilson upper bound rather than a headline completion percentage. Zero-request rows suppress bounded-log failure and latency values to avoid mixing windows. Recorded tool-call failures are reconciled separately against the recorded tool-call total. Unknown routes first use explicit mappings, then distinct historical routes for the model or family, and otherwise become actionable `Unmapped (edit in config)` labels. Cost preserves recorded actual, estimated, free, subscription, mixed, or unpriced state; cached tokens show zero only after the route demonstrates cache reporting. TTFT is unavailable because Hermes does not record it.
 - Provider checks do not read browser cookies. Anthropic reuses Hermes OAuth, Grok reuses Hermes `xai-oauth`, and Kimi/Z.AI reuse Hermes API keys; no provider CLI needs to remain running.
 - Usage checks accept provider credentials only when Hermes resolves them for the official provider host. Z.AI credential resolution deliberately avoids Hermes inference probes.
-- Ask Lens copies a locally generated prompt; the user decides whether to paste and submit it in Hermes.
 
 Failure detection combines authoritative Hermes finish/effect states with conservative signatures in tool results. SQL signatures only identify candidates; the Python signature confirms content before any API metric counts it. The inspector distinguishes the bounded evidence currently shown from the confirmed full-session total so users can verify it. File paths are observed evidence, not a guaranteed audit of every filesystem operation.
 
