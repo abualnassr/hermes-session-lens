@@ -2128,13 +2128,19 @@ function SessionLensPage({ ctx }) {
     refetchInterval: tab === 'ai-models' ? 300_000 : false
   })
 
-  useEffect(() => ctx.storage.set('activeTab', tab), [ctx, tab])
+  useEffect(() => {
+    ctx.storage.set('activeTab', tab)
+  }, [ctx, tab])
   useEffect(() => {
     ctx.storage.set('timeRange', daysText)
     if (daysText !== 'custom') ctx.storage.set('days', Number(daysText) || 0)
   }, [ctx, daysText])
-  useEffect(() => ctx.storage.set('customStart', customStart), [ctx, customStart])
-  useEffect(() => ctx.storage.set('customEnd', customEnd), [ctx, customEnd])
+  useEffect(() => {
+    ctx.storage.set('customStart', customStart)
+  }, [ctx, customStart])
+  useEffect(() => {
+    ctx.storage.set('customEnd', customEnd)
+  }, [ctx, customEnd])
 
   const refresh = async () => {
     if (tab !== 'ai-usage' && tab !== 'ai-models') {
@@ -2640,7 +2646,7 @@ function ModelExpanded({ model, quota, coverage, narrow }) {
     'Work reliability scores completed main-role tasks and terminal model/API failures. Open, cancelled, orchestration, auxiliary, ambiguous, and uncovered runs are excluded; missing evidence is never treated as success.',
     `Comparable models require n=${formatCount(coverage?.rate_sample_threshold || 20)} eligible tasks and rank by the lowest 95% Wilson upper failure bound.`,
     'Retry/switch counts rewinds, near-identical prompts resent to the same model within five minutes, and model changes within the same task role; models on different roles are not switches.',
-    'Session Lens assigns one primary type in this order: Orchestration, Coding, Writing, Analysis, General. General and Analysis use the existing proxy; Coding requires a resolved code-shaped save or commit; Writing requires a resolved non-code artifact write; Orchestration and auxiliary jobs are n/a.'
+    'Session Lens assigns one primary type in this order: Orchestration, Coding, Writing, Analysis, General. General and Analysis use the existing proxy; Coding requires a resolved code artifact save or commit; Writing requires a resolved non-code artifact write; Orchestration and auxiliary jobs are n/a.'
   ])
   return jsxs('div', {
     style: {
@@ -2649,11 +2655,9 @@ function ModelExpanded({ model, quota, coverage, narrow }) {
       boxSizing: 'border-box',
       display: 'grid',
       gap: '1rem',
-      left: narrow ? 0 : undefined,
-      maxWidth: narrow ? 'calc(100vw - 2rem)' : undefined,
       padding: '0.9rem 1rem',
-      position: narrow ? 'sticky' : 'static',
-      width: narrow ? 'calc(100vw - 2rem)' : 'auto'
+      position: 'static',
+      width: '100%'
     },
     children: [
       jsx('div', {

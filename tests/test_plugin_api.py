@@ -475,6 +475,20 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertEqual(payload["pagination"]["total"], 1)
         self.assertIn("plugin", payload["sessions"][0]["search_snippet"].lower())
 
+    def test_search_snippet_ids_are_queried_in_sql_safe_chunks(self):
+        snippets = {f"missing-session-{index}": "match" for index in range(1801)}
+        with patch.object(api, "_search_hits", return_value=snippets):
+            payload = api._list_sessions_sync(
+                days=0,
+                query="match",
+                sort="recent",
+                failures_only=False,
+                include_archived=False,
+                limit=50,
+                offset=0,
+            )
+        self.assertEqual(payload["sessions"], [])
+
     def test_aggregate_tools_and_skills_use_recorded_events(self):
         tools = api._tools_sync(0)
         by_name = {item["name"]: item for item in tools["tools"]}
@@ -763,6 +777,47 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertEqual(telemetry["summary"]["latency_p95_seconds"], 2.5)
         self.assertEqual(telemetry["summary"]["cache_hit_ratio"], 0.5)
         self.assertEqual(telemetry["tools"][0]["failed"], 1)
+
+    def test_log_window_uses_all_parsed_lines_and_cache_is_lru_bounded(self):
+        log_path = self.home / "logs" / "agent.log"
+        original = log_path.read_text(encoding="utf-8")
+        log_path.write_text(
+            "2027-01-15 07:59:00,000 INFO [session-1] agent.lifecycle: startup complete\n"
+            + original
+            + "2027-01-15 08:01:00,000 INFO [session-1] agent.lifecycle: shutdown complete\n",
+            encoding="utf-8",
+        )
+        api._log_file_cache.clear()
+        payload = api._ai_models_sync(0, fresh=True)
+        self.assertEqual(payload["coverage"]["log_start_at"], api._timestamp_from_log("2027-01-15 07:59:00,000"))
+        self.assertEqual(payload["coverage"]["log_end_at"], api._timestamp_from_log("2027-01-15 08:01:00,000"))
+
+        for index in range(11):
+            rotated = self.home / "logs" / f"rotated-{index}.log"
+            rotated.write_text(f"2027-01-15 09:00:{index:02d},000 INFO line\n", encoding="utf-8")
+            api._parse_log_file(rotated)
+        self.assertEqual(len(api._log_file_cache), 10)
+        self.assertNotIn(str(self.home / "logs" / "rotated-0.log"), api._log_file_cache)
+
+    def test_tools_scan_enforces_real_assistant_row_cap(self):
+        calls = json.dumps([{
+            "id": "call-cap",
+            "type": "function",
+            "function": {"name": "capped_tool", "arguments": "{}"},
+        }])
+        connection = sqlite3.connect(self.db_path)
+        try:
+            connection.executemany(
+                "INSERT INTO messages (session_id,role,tool_calls,timestamp,active) VALUES ('session-1','assistant',?,?,1)",
+                ((calls, 1_800_000_030 + index) for index in range(50001)),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        payload = api._tools_sync(0)
+        capped = next(item for item in payload["tools"] if item["name"] == "capped_tool")
+        self.assertTrue(payload["truncated"])
+        self.assertEqual(capped["calls"], 50000)
 
     def test_session_task_type_uses_five_path_aware_types_in_precedence_order(self):
         self.assertEqual(api._session_task_type(tool_rows("delegate_task", {"prompt": "work"})), "Orchestration")

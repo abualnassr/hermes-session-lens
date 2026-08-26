@@ -67,28 +67,11 @@ def _list_sessions_sync(
         where = [period_sql, "coalesce(s.hidden, 0) = 0"]
         if not include_archived:
             where.append("coalesce(s.archived, 0) = 0")
-        if query:
-            like = f"%{query.strip().lower()}%"
-            text_filters = [
-                "lower(s.id) LIKE ?",
-                "lower(coalesce(s.title, '')) LIKE ?",
-                "lower(coalesce(s.model, '')) LIKE ?",
-                "lower(coalesce(s.cwd, '')) LIKE ?",
-                "lower(coalesce(s.source, '')) LIKE ?",
-            ]
-            params.extend([like] * len(text_filters))
-            if snippets:
-                placeholders = ",".join("?" for _ in snippets)
-                text_filters.append(f"s.id IN ({placeholders})")
-                params.extend(snippets.keys())
-            where.append("(" + " OR ".join(text_filters) + ")")
-
         from_where = f"""
             FROM sessions s
             WHERE {' AND '.join(where)}
         """
-        rows = _db_connection(db).execute(
-            """
+        select_sql = """
             SELECT s.id, s.source, s.display_name, s.model, s.started_at, s.ended_at,
                    s.end_reason, s.parent_session_id,
                    s.message_count, s.tool_call_count, s.input_tokens, s.output_tokens,
@@ -99,10 +82,35 @@ def _list_sessions_sync(
                    s.last_activity_description, s.api_call_count, s.profile_name,
                    s.archived, s.pinned
             """
-            + from_where
-            ,
-            tuple(params),
-        ).fetchall()
+        connection = _db_connection(db)
+        if query:
+            like = f"%{query.strip().lower()}%"
+            text_filters = [
+                "lower(s.id) LIKE ?",
+                "lower(coalesce(s.title, '')) LIKE ?",
+                "lower(coalesce(s.model, '')) LIKE ?",
+                "lower(coalesce(s.cwd, '')) LIKE ?",
+                "lower(coalesce(s.source, '')) LIKE ?",
+            ]
+            rows_by_id = {
+                str(row["id"]): row
+                for row in connection.execute(
+                    select_sql + from_where + " AND (" + " OR ".join(text_filters) + ")",
+                    tuple(params + [like] * len(text_filters)),
+                ).fetchall()
+            }
+            snippet_ids = list(snippets)
+            for chunk_start in range(0, len(snippet_ids), 900):
+                chunk = snippet_ids[chunk_start : chunk_start + 900]
+                placeholders = ",".join("?" for _ in chunk)
+                for row in connection.execute(
+                    select_sql + from_where + f" AND s.id IN ({placeholders})",
+                    tuple(params + chunk),
+                ).fetchall():
+                    rows_by_id[str(row["id"])] = row
+            rows = list(rows_by_id.values())
+        else:
+            rows = connection.execute(select_sql + from_where, tuple(params)).fetchall()
         failure_counts = _confirmed_failure_counts(
             _db_connection(db), " AND ".join(where), params
         )
@@ -1220,7 +1228,12 @@ def _ai_models_payload_sync(
     successes_by_model: Counter[str] = Counter()
     failures_by_model: Dict[str, Counter[str]] = defaultdict(Counter)
     reliability_events_by_session_model: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
-    observed_timestamps: List[float] = []
+    log_timestamps = [
+        _number(timestamp)
+        for timestamp in runtime.get("timestamps", [])
+        if _number(timestamp) >= period_start
+        and (period_end is None or _number(timestamp) < period_end)
+    ]
     for event in runtime.get("api", []):
         timestamp = _number(event.get("timestamp"), 0)
         if timestamp < period_start or (period_end is not None and timestamp >= period_end):
@@ -1230,7 +1243,6 @@ def _ai_models_payload_sync(
             continue
         successes_by_model[model_id] += 1
         latency_by_model[model_id].append(_number(event.get("latency_seconds")))
-        observed_timestamps.append(timestamp)
         session_id = str(event.get("session_id") or "")
         if session_id:
             reliability_events_by_session_model[(session_id, model_id)].append(
@@ -1253,7 +1265,6 @@ def _ai_models_payload_sync(
             unattributed_failures += 1
             continue
         failures_by_model[model_id][str(event.get("category") or "error")] += 1
-        observed_timestamps.append(timestamp)
         if session_id:
             reliability_events_by_session_model[(session_id, model_id)].append(
                 {
@@ -1632,8 +1643,8 @@ def _ai_models_payload_sync(
             ),
             "ttft_available": False,
             "cache": "a zero is shown only when the route has demonstrated cache reporting in the selected period; otherwise unavailable is returned",
-            "log_start_at": min(observed_timestamps) if observed_timestamps else None,
-            "log_end_at": max(observed_timestamps) if observed_timestamps else None,
+            "log_start_at": min(log_timestamps) if log_timestamps else None,
+            "log_end_at": max(log_timestamps) if log_timestamps else None,
             "unattributed_log_failures": unattributed_failures,
             "recorded_failure_events": sum(failure_counts.values()),
             "recorded_tool_failures": len(tool_failure_rows),
@@ -1740,9 +1751,12 @@ def _tools_sync(
             WHERE {period_sql} AND coalesce(s.hidden,0)=0
               AND coalesce(m.active,1)=1 AND m.role='assistant'
               AND m.tool_calls IS NOT NULL
+            ORDER BY m.id DESC LIMIT 50001
             """,
             tuple(period_params),
         ).fetchall()
+        truncated = len(assistant_rows) > 50000
+        assistant_rows = assistant_rows[:50000]
         assistant: Dict[str, Dict[str, Any]] = {}
         for row in assistant_rows:
             for call in _iter_tool_calls(row["tool_calls"]):
@@ -1817,7 +1831,7 @@ def _tools_sync(
                 "failures": sum(item["failures"] for item in tools),
                 "distinct_tools": len(tools),
             },
-            "truncated": False,
+            "truncated": truncated,
             "generated_at": time.time(),
         }
 

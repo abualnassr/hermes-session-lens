@@ -40,11 +40,13 @@ def _parse_log_file(path: Path) -> Dict[str, Any]:
     key = str(path)
     cached = _log_file_cache.get(key)
     if cached and cached[0] == signature:
+        _log_file_cache.move_to_end(key)
         return cached[1]
 
     api_events: List[Dict[str, Any]] = []
     api_errors: List[Dict[str, Any]] = []
     tool_events: List[Dict[str, Any]] = []
+    timestamps: List[float] = []
     seen_api_errors: set[Tuple[str, int, int]] = set()
     with path.open("rb") as handle:
         if stat.st_size > MAX_LOG_FILE_BYTES:
@@ -56,6 +58,8 @@ def _parse_log_file(path: Path) -> Dict[str, Any]:
         if not envelope:
             continue
         timestamp = _timestamp_from_log(envelope.group("stamp"))
+        if timestamp:
+            timestamps.append(timestamp)
         message = envelope.group("message")
         api_match = _API_METRIC_RE.search(message)
         if api_match:
@@ -107,8 +111,11 @@ def _parse_log_file(path: Path) -> Dict[str, Any]:
                     "output_chars": _integer(tool_match.group("chars")),
                 }
             )
-    parsed = {"api": api_events, "errors": api_errors, "tools": tool_events}
+    parsed = {"api": api_events, "errors": api_errors, "tools": tool_events, "timestamps": timestamps}
     _log_file_cache[key] = (signature, parsed)
+    _log_file_cache.move_to_end(key)
+    while len(_log_file_cache) > 10:
+        _log_file_cache.popitem(last=False)
     return parsed
 
 
@@ -123,7 +130,7 @@ def _percentile(values: Iterable[float], percentile: float) -> Optional[float]:
 def _runtime_events() -> Dict[str, Any]:
     log_dir = _hermes_home() / "logs"
     if not log_dir.exists():
-        return {"api": [], "errors": [], "tools": [], "files": []}
+        return {"api": [], "errors": [], "tools": [], "timestamps": [], "files": []}
     candidates = sorted(
         (path for path in log_dir.glob("agent.log*") if path.is_file()),
         key=lambda path: path.stat().st_mtime,
@@ -132,6 +139,7 @@ def _runtime_events() -> Dict[str, Any]:
     api_events: List[Dict[str, Any]] = []
     api_errors: List[Dict[str, Any]] = []
     tool_events: List[Dict[str, Any]] = []
+    timestamps: List[float] = []
     files = []
     for path in reversed(candidates):
         try:
@@ -141,8 +149,9 @@ def _runtime_events() -> Dict[str, Any]:
         api_events.extend(parsed["api"])
         api_errors.extend(parsed.get("errors", []))
         tool_events.extend(parsed["tools"])
+        timestamps.extend(parsed.get("timestamps", []))
         files.append({"name": path.name, "size_bytes": path.stat().st_size, "updated_at": path.stat().st_mtime})
-    return {"api": api_events, "errors": api_errors, "tools": tool_events, "files": files}
+    return {"api": api_events, "errors": api_errors, "tools": tool_events, "timestamps": timestamps, "files": files}
 
 
 def _metric_groups(rows: List[Dict[str, Any]], key: str) -> List[Dict[str, Any]]:

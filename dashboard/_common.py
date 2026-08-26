@@ -16,7 +16,7 @@ import re
 import sqlite3
 import threading
 import time
-from collections import Counter, defaultdict
+from collections import Counter, OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from difflib import SequenceMatcher
@@ -211,7 +211,7 @@ _WORKER_COMMAND_RE = re.compile(
     r"(?i)(?:^|[;&|]\s*)(?:(?:npx\s+)?(?:claude(?:\s+code)?|codex(?:\.exe)?|openhands))\b"
 )
 
-_log_file_cache: Dict[str, Tuple[Tuple[int, int], Dict[str, Any]]] = {}
+_log_file_cache: OrderedDict[str, Tuple[Tuple[int, int], Dict[str, Any]]] = OrderedDict()
 _ai_usage_cache_lock = threading.Lock()
 _ai_usage_cache: Optional[Tuple[float, Dict[str, Any]]] = None
 _ai_usage_last_success: Dict[str, Dict[str, Any]] = {}
