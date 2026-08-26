@@ -27,9 +27,21 @@ from urllib.parse import urlparse
 try:
     from fastapi import APIRouter, HTTPException, Query
 except ImportError:  # pragma: no cover - supports dependency-free compatibility tests.
+    class _StubRoute:
+        def __init__(self, path: str, methods: set):
+            self.path = path
+            self.methods = methods
+
     class APIRouter:  # type: ignore[no-redef]
-        def get(self, _path: str):
-            return lambda function: function
+        def __init__(self) -> None:
+            self.routes: List[Any] = []
+
+        def get(self, path: str):
+            def register(function):
+                self.routes.append(_StubRoute(path, {"GET"}))
+                return function
+
+            return register
 
     class HTTPException(Exception):  # type: ignore[no-redef]
         def __init__(self, status_code: int, detail: str):
