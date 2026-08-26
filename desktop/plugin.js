@@ -2413,7 +2413,7 @@ function RateValue({ value, numerator, label, sampleCount = 0, sampleThreshold =
     style: { display: 'grid', gap: '0.08rem', justifyItems: 'end' },
     children: [
       jsx('span', { style: { ...tabular, color: toneColor(metricTone(value)), fontWeight: 650 }, children: `${(Number(value) * 100).toFixed(1)}%` }),
-      jsx('span', { style: { ...tabular, color: color.quaternary, fontSize: '0.625rem' }, children: `of ${formatCount(samples)} ${sampleNoun}` })
+      jsx('span', { style: { ...tabular, color: color.quaternary, fontSize: '0.625rem', whiteSpace: 'nowrap' }, children: `of ${formatCount(samples)} ${sampleNoun}` })
     ]
   })
 }
