@@ -1709,6 +1709,7 @@ function UsageWindow({ window }) {
   const usedAmount = formatUsageAmount(window.used, window.unit)
   const limitAmount = formatUsageAmount(window.limit, window.unit)
   const value = remainingAmount || (remainingPercent !== null ? `${Math.round(remainingPercent)}% remaining` : 'Recorded balance')
+  const exhaustAt = window.kind === 'quota' && hasPercent ? quotaExhaustAt(window, used) : null
   const detailParts = []
   if (usedAmount && limitAmount) detailParts.push(`${usedAmount} used of ${limitAmount}`)
   if (window.detail) detailParts.push(window.detail)
@@ -1742,6 +1743,13 @@ function UsageWindow({ window }) {
                 width: `${Math.max(0, Math.min(100, used))}%`
               }
             })
+          })
+        : null,
+      exhaustAt
+        ? jsx('div', {
+            title: 'Linear extrapolation of the current burn rate over the elapsed share of this window.',
+            style: { color: used >= 90 ? color.danger : color.warning, fontSize: '0.6875rem', fontWeight: 600 },
+            children: `At this pace, empty ~${formatShortDate(exhaustAt)} — before the reset.`
           })
         : null,
       detailParts.length
@@ -2254,6 +2262,22 @@ function quotaWindowDurationSeconds(label) {
   return null
 }
 
+function quotaExhaustAt(window, burnPercent) {
+  const duration = quotaWindowDurationSeconds(window?.label)
+  const reset = timestampDate(window?.reset_at)
+  const burn = Number(burnPercent)
+  if (!duration || !reset || !Number.isFinite(burn) || burn <= 0) return null
+  const startedAtMs = reset.getTime() - duration * 1000
+  const elapsedMs = Date.now() - startedAtMs
+  if (elapsedMs <= 0) return null
+  const elapsedPercent = (elapsedMs / (duration * 1000)) * 100
+  if (elapsedPercent < 10) return null
+  if (burn <= elapsedPercent) return null
+  const exhaustMs = startedAtMs + elapsedMs * (100 / burn)
+  if (exhaustMs >= reset.getTime()) return null
+  return exhaustMs / 1000
+}
+
 function modelQuota(model, quotaData, allModels) {
   const routes = model.routes || []
   const oauthInventoryRoutes = routes.filter(route => route.oauth && route.subscription)
@@ -2305,7 +2329,8 @@ function modelQuota(model, quotaData, allModels) {
     window,
     provider,
     route,
-    capPerAcceptedTask
+    capPerAcceptedTask,
+    exhaustAt: quotaExhaustAt(window, burn)
   }
 }
 
@@ -2372,11 +2397,15 @@ function QuotaBurn({ quota }) {
   const label = quota.elapsed === null
     ? `${Math.round(quota.burn)}% used`
     : `${Math.round(quota.burn)}% / ${Math.round(quota.elapsed)}% elapsed${paceLabel ? ` · ${paceLabel}` : ''}`
+  const forecast = quota.exhaustAt ? `at this pace, empty ~${formatShortDate(quota.exhaustAt)}` : null
   return jsxs('div', {
-    title: `${quota.window.label}: ${label}. The tick marks billing-period elapsed time; this quota is shared at provider-account level.`,
+    title: `${quota.window.label}: ${label}.${forecast ? ` At the current burn rate this window runs out around ${formatDate(quota.exhaustAt)}, before it resets.` : ''} The tick marks billing-period elapsed time; this quota is shared at provider-account level.`,
     style: { display: 'grid', gap: '0.28rem', minWidth: '8.5rem' },
     children: [
       jsx('span', { style: { ...tabular, color: toneColor(quota.tone), fontSize: '0.6875rem', fontWeight: 650 }, children: label }),
+      forecast
+        ? jsx('span', { style: { ...tabular, color: toneColor(quota.tone), fontSize: '0.625rem' }, children: forecast })
+        : null,
       jsxs('div', {
         role: 'progressbar',
         'aria-label': `${quota.window.label} quota burn`,

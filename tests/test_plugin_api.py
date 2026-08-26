@@ -1501,6 +1501,7 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertIn("risk ≤ ${formatPercent(bound)}", source)
         self.assertIn("of ${formatCount(toolCalls)} tool calls", source)
         self.assertIn("Work ledger: scores completed main-role tasks", source)
+        self.assertIn("at this pace, empty ~${formatShortDate(quota.exhaustAt)}", source)
         self.assertIn("API attempt failure rate", source)
 
     def test_custom_period_is_inclusive_by_start_and_exclusive_by_end(self):
