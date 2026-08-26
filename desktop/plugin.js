@@ -3081,7 +3081,7 @@ function AIModelsStatStrip({ data }) {
     children: [
       jsx(Metric, { label: 'Model inventory', value: data ? formatCount(summary.inventory_models ?? summary.models) : '—', detail: data ? `${formatCount(summary.active_models)} active in this period` : null }, 'models'),
       jsx(Metric, { label: 'Requests', value: data ? formatCount(summary.requests) : '—', detail: data ? 'Successful calls recorded by Hermes' : null }, 'requests'),
-      jsx(Metric, { label: 'Tokens', value: data ? formatCount(summary.total_tokens) : '—', detail: data ? 'Input + output + recorded cache' : null }, 'tokens'),
+      jsx(Metric, { label: 'Tokens', value: data ? formatCount(summary.total_tokens) : '—', detail: data ? 'Input + output + recorded cache, including auxiliary jobs' : null }, 'tokens'),
       jsx(Metric, { label: 'Known API cost', value: data ? formatCost(summary.cost_usd, 'actual') : '—', detail: data ? `${formatCount(summary.subscription_models)} subscription models` : null }, 'cost')
     ]
   })
