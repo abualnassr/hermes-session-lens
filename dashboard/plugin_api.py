@@ -49,6 +49,7 @@ MAX_TRACE_CONTENT_CHARS = 6000
 MAX_LOG_FILES = 5
 MAX_LOG_FILE_BYTES = 6 * 1024 * 1024
 AI_USAGE_CACHE_TTL_SECONDS = 300
+AI_MODELS_CACHE_TTL_SECONDS = 60
 AI_USAGE_PROVIDER_TIMEOUT_SECONDS = 12
 DEFAULT_RATE_SAMPLE_THRESHOLD = 20
 MAX_ROUTE_MAPPINGS = 200
@@ -214,6 +215,10 @@ _log_file_cache: Dict[str, Tuple[Tuple[int, int], Dict[str, Any]]] = {}
 _ai_usage_cache_lock = threading.Lock()
 _ai_usage_cache: Optional[Tuple[float, Dict[str, Any]]] = None
 _ai_usage_last_success: Dict[str, Dict[str, Any]] = {}
+_ai_models_cache_lock = threading.Lock()
+_ai_models_cache: Dict[Tuple[Any, ...], Tuple[float, Dict[str, Any]]] = {}
+_session_classification_cache_lock = threading.Lock()
+_session_classification_cache: Dict[Tuple[str, Any, int], Dict[str, Any]] = {}
 
 
 def _hermes_home() -> Path:
@@ -1931,21 +1936,33 @@ def _is_analysis_call(call: Mapping[str, Any]) -> bool:
     )
 
 
-def _session_task_type(rows: Iterable[Mapping[str, Any]]) -> str:
+def _enriched_session_calls(
+    rows: Iterable[Mapping[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
     material = [dict(row) for row in rows]
     results_by_call = {
-        str(row.get("tool_call_id")): str(row.get("content") or "")
+        str(row.get("tool_call_id")): row
         for row in material
         if str(row.get("role") or "").lower() == "tool" and row.get("tool_call_id")
     }
-    calls = []
+    calls: List[Dict[str, Any]] = []
     for row in material:
         if str(row.get("role") or "").lower() != "assistant":
             continue
         for call in _iter_tool_calls(row.get("tool_calls")):
             enriched = dict(call)
-            enriched["result_content"] = results_by_call.get(str(call.get("call_id") or ""), "")
+            result = results_by_call.get(str(call.get("call_id") or ""))
+            enriched["result"] = result
+            enriched["result_content"] = str((result or {}).get("content") or "")
             calls.append(enriched)
+    return material, calls
+
+
+def _session_task_type(
+    rows: Iterable[Mapping[str, Any]],
+    enriched_calls: Optional[Iterable[Mapping[str, Any]]] = None,
+) -> str:
+    calls = list(enriched_calls) if enriched_calls is not None else _enriched_session_calls(rows)[1]
     checks = (
         ("Orchestration", _is_orchestration_call),
         ("Coding", _is_coding_call),
@@ -1966,7 +1983,7 @@ def _normalised_retry_prompt(value: Any) -> str:
     text = _clean_text(value, 12000).strip().lower()
     if not text or text.startswith("[important: you are running as a scheduled cron job."):
         return ""
-    return " ".join(re.findall(r"[\w]+", text, flags=re.UNICODE))
+    return " ".join(re.findall(r"[\w]+", text, flags=re.UNICODE))[:500]
 
 
 def _has_near_identical_prompt_retry(rows: Iterable[Mapping[str, Any]]) -> bool:
@@ -1986,55 +2003,54 @@ def _has_near_identical_prompt_retry(rows: Iterable[Mapping[str, Any]]) -> bool:
                 break
             if age <= 0:
                 continue
+            shorter = min(len(prompt), len(prior_prompt))
+            longer = max(len(prompt), len(prior_prompt))
+            if not shorter or longer / shorter > 1.20:
+                continue
             if prompt == prior_prompt or SequenceMatcher(None, prior_prompt, prompt).ratio() >= 0.90:
                 return True
     return False
 
 
-def _change_evidence_by_type(rows: Iterable[Mapping[str, Any]]) -> Dict[str, Optional[bool]]:
-    material = [dict(row) for row in rows]
-    results_by_call: Dict[str, Mapping[str, Any]] = {}
-    for row in material:
-        if str(row.get("role") or "").lower() == "tool" and row.get("tool_call_id"):
-            results_by_call[str(row.get("tool_call_id"))] = row
-
+def _change_evidence_by_type(
+    rows: Iterable[Mapping[str, Any]],
+    enriched_calls: Optional[Iterable[Mapping[str, Any]]] = None,
+) -> Dict[str, Optional[bool]]:
+    calls = list(enriched_calls) if enriched_calls is not None else _enriched_session_calls(rows)[1]
     detected_results = {"Coding": 0, "Writing": 0}
     successful_change = {"Coding": False, "Writing": False}
-    for row in material:
-        if str(row.get("role") or "").lower() != "assistant" or not row.get("tool_calls"):
+    for call in calls:
+        result = call.get("result")
+        if not isinstance(result, Mapping):
             continue
-        for call in _iter_tool_calls(row.get("tool_calls")):
-            result = results_by_call.get(str(call.get("call_id") or ""))
-            if not result:
-                continue
-            result_content = str(result.get("content") or "")
-            paths = _paths_from_tool_call(call, result_content if _is_git_commit_call(call) else None)
-            kinds = {_path_artifact_kind(path) for path in paths}
-            kinds.discard(None)
-            if "skill_manage" in str(call.get("name") or "").lower() and _is_coding_call(call):
-                kinds.add("Coding")
-            writing_artifact_change = _is_writing_call(call)
-            if writing_artifact_change and not paths:
-                kinds.add("Writing")
-            if not (
-                _is_file_mutation(call)
-                or _is_git_commit_call(call)
-                or writing_artifact_change
-                or "skill_manage" in str(call.get("name") or "").lower()
-            ):
-                kinds.clear()
-            if not kinds:
-                continue
-            failed = _is_failure(
-                role="tool",
-                content=result.get("content"),
-                finish_reason=result.get("finish_reason"),
-                effect_disposition=result.get("effect_disposition"),
-            )
-            for kind in kinds & {"Coding", "Writing"}:
-                detected_results[kind] += 1
-                if not failed and not _NO_FILE_CHANGE_RE.search(result_content):
-                    successful_change[kind] = True
+        result_content = str(result.get("content") or "")
+        paths = _paths_from_tool_call(call, result_content if _is_git_commit_call(call) else None)
+        kinds = {_path_artifact_kind(path) for path in paths}
+        kinds.discard(None)
+        if "skill_manage" in str(call.get("name") or "").lower() and _is_coding_call(call):
+            kinds.add("Coding")
+        writing_artifact_change = _is_writing_call(call)
+        if writing_artifact_change and not paths:
+            kinds.add("Writing")
+        if not (
+            _is_file_mutation(call)
+            or _is_git_commit_call(call)
+            or writing_artifact_change
+            or "skill_manage" in str(call.get("name") or "").lower()
+        ):
+            kinds.clear()
+        if not kinds:
+            continue
+        failed = _is_failure(
+            role="tool",
+            content=result.get("content"),
+            finish_reason=result.get("finish_reason"),
+            effect_disposition=result.get("effect_disposition"),
+        )
+        for kind in kinds & {"Coding", "Writing"}:
+            detected_results[kind] += 1
+            if not failed and not _NO_FILE_CHANGE_RE.search(result_content):
+                successful_change[kind] = True
     return {
         kind: True if successful_change[kind] else (False if detected_results[kind] else None)
         for kind in ("Coding", "Writing")
@@ -2047,6 +2063,50 @@ def _coding_change_evidence(rows: Iterable[Mapping[str, Any]]) -> Optional[bool]
 
 def _writing_change_evidence(rows: Iterable[Mapping[str, Any]]) -> Optional[bool]:
     return _change_evidence_by_type(rows)["Writing"]
+
+
+def _classification_facts(
+    session: Mapping[str, Any],
+    rows: Iterable[Mapping[str, Any]],
+) -> Dict[str, Any]:
+    session_id = str(session.get("id") or "")
+    ended_at = session.get("ended_at")
+    cache_key = (session_id, ended_at, _integer(session.get("message_count")))
+    if ended_at is not None:
+        with _session_classification_cache_lock:
+            cached = _session_classification_cache.get(cache_key)
+            if cached is not None:
+                return dict(cached)
+
+    material, calls = _enriched_session_calls(rows)
+    change_evidence = _change_evidence_by_type(material, calls)
+    facts = {
+        "outcome": _session_outcome(session)["outcome"],
+        "task_type": _session_task_type(material, calls),
+        "coding_change": change_evidence["Coding"],
+        "writing_change": change_evidence["Writing"],
+        "near_identical_prompt_retry": _has_near_identical_prompt_retry(material),
+    }
+    if ended_at is not None:
+        with _session_classification_cache_lock:
+            for existing_key in list(_session_classification_cache):
+                if existing_key[0] == session_id and existing_key != cache_key:
+                    _session_classification_cache.pop(existing_key, None)
+            _session_classification_cache[cache_key] = dict(facts)
+    return facts
+
+
+def _cached_classification_facts(session: Mapping[str, Any]) -> Optional[Dict[str, Any]]:
+    if session.get("ended_at") is None:
+        return None
+    cache_key = (
+        str(session.get("id") or ""),
+        session.get("ended_at"),
+        _integer(session.get("message_count")),
+    )
+    with _session_classification_cache_lock:
+        cached = _session_classification_cache.get(cache_key)
+        return dict(cached) if cached is not None else None
 
 
 def _acceptance_for_task(task_type: str, facts: Mapping[str, Any]) -> Tuple[bool, bool]:
@@ -2205,12 +2265,14 @@ def _has_work_reliability_coverage(runs: Iterable[Mapping[str, Any]]) -> bool:
     return any(str(run.get("status") or "") in _WORK_RELIABILITY_ELIGIBLE_STATUSES | {"unknown"} for run in runs)
 
 
-def _ai_models_sync(
+def _ai_models_payload_sync(
     days: int,
     start_at: Optional[float] = None,
     end_at: Optional[float] = None,
+    *,
+    settings: Optional[Mapping[str, Any]] = None,
 ) -> Dict[str, Any]:
-    settings = _plugin_settings()
+    settings = dict(settings or {})
     rate_sample_threshold = _rate_sample_threshold(settings)
     configured_route_mappings = _configured_route_mappings(settings)
     period_start, period_end = _period_bounds(days, start_at, end_at)
@@ -2234,7 +2296,8 @@ def _ai_models_sync(
                        s.cache_read_tokens, s.cache_write_tokens, s.reasoning_tokens,
                        s.api_call_count, s.billing_provider, s.billing_base_url,
                        s.billing_mode, s.estimated_cost_usd, s.actual_cost_usd,
-                       s.cost_status, s.cost_source, {rewind_expr} AS rewind_count
+                       s.cost_status, s.cost_source, s.message_count,
+                       {rewind_expr} AS rewind_count
                 FROM sessions s
                 WHERE {period_sql} AND coalesce(s.hidden,0)=0
                 """,
@@ -2337,43 +2400,51 @@ def _ai_models_sync(
                 }
             )
 
-        failure_counts = (
-            _confirmed_failure_counts(
+        confirmed_failure_rows = (
+            _confirmed_failure_rows(
                 connection,
                 period_sql + " AND coalesce(s.hidden,0)=0",
                 period_params,
             )
             if session_rows
-            else {}
+            else []
+        )
+        failure_counts: Counter[str] = Counter(
+            str(row.get("session_id") or "") for row in confirmed_failure_rows
         )
 
         message_rows_by_session: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
-        tool_failure_rows: List[Dict[str, Any]] = []
-        if session_rows:
+        tool_failure_rows = [
+            row
+            for row in confirmed_failure_rows
+            if str(row.get("role") or "").lower() == "tool"
+        ]
+        cached_facts_by_session: Dict[str, Dict[str, Any]] = {}
+        classification_session_ids: List[str] = []
+        for session_id, session in sessions_by_id.items():
+            cached = _cached_classification_facts(session)
+            if cached is None:
+                classification_session_ids.append(session_id)
+            else:
+                cached_facts_by_session[session_id] = cached
+        for chunk_start in range(0, len(classification_session_ids), 900):
+            chunk = classification_session_ids[chunk_start : chunk_start + 900]
+            placeholders = ",".join("?" for _ in chunk)
             for row in connection.execute(
                 f"""
                 SELECT m.id, m.session_id, m.role, m.content, m.tool_call_id,
                        m.tool_calls, m.tool_name, m.effect_disposition,
                        m.timestamp, m.finish_reason
                 FROM messages m
-                JOIN sessions s ON s.id=m.session_id
-                WHERE {period_sql} AND coalesce(s.hidden,0)=0
+                WHERE m.session_id IN ({placeholders})
                   AND coalesce(m.active,1)=1
                   AND (m.role IN ('user','tool') OR m.tool_calls IS NOT NULL)
                 ORDER BY m.timestamp ASC, m.id ASC
                 """,
-                tuple(period_params),
+                tuple(chunk),
             ).fetchall():
                 material = _row_dict(row)
-                session_id = str(material.get("session_id") or "")
-                message_rows_by_session[session_id].append(material)
-                if str(material.get("role") or "").lower() == "tool" and _is_failure(
-                    role="tool",
-                    content=material.get("content"),
-                    finish_reason=material.get("finish_reason"),
-                    effect_disposition=material.get("effect_disposition"),
-                ):
-                    tool_failure_rows.append(material)
+                message_rows_by_session[str(material.get("session_id") or "")].append(material)
 
     role_models_by_session: Dict[str, Dict[str, set[str]]] = defaultdict(lambda: defaultdict(set))
     usage_by_session: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
@@ -2388,6 +2459,11 @@ def _ai_models_sync(
             cache_reporting_providers.add(str(usage.get("billing_provider") or "").strip().lower())
 
     retry_switch_models_by_session: Dict[str, set[str]] = defaultdict(set)
+    for session_id in classification_session_ids:
+        cached_facts_by_session[session_id] = _classification_facts(
+            sessions_by_id.get(session_id, {}),
+            message_rows_by_session.get(session_id, []),
+        )
     for session_id, roles in role_models_by_session.items():
         for role, role_models in roles.items():
             if len(role_models) > 1:
@@ -2396,17 +2472,15 @@ def _ai_models_sync(
         session = sessions_by_id.get(session_id, {})
         if _integer(session.get("rewind_count")) > 0:
             retry_switch_models_by_session[session_id].update(main_models)
-        elif len(main_models) == 1 and _has_near_identical_prompt_retry(
-            message_rows_by_session.get(session_id, [])
+        elif len(main_models) == 1 and cached_facts_by_session.get(session_id, {}).get(
+            "near_identical_prompt_retry"
         ):
             retry_switch_models_by_session[session_id].update(main_models)
 
     session_facts: Dict[str, Dict[str, Any]] = {}
     for session_id, session in sessions_by_id.items():
-        outcome = _session_outcome(session)["outcome"]
-        message_rows = message_rows_by_session.get(session_id, [])
-        task_type = _session_task_type(message_rows)
-        change_evidence = _change_evidence_by_type(message_rows)
+        cached_facts = cached_facts_by_session.get(session_id, {})
+        outcome = str(cached_facts.get("outcome") or "unknown")
         closed = session.get("ended_at") is not None and outcome not in {"open", "running"}
         resolved = closed and outcome not in {"failed", "cancelled"}
         eligible_proxy = resolved
@@ -2421,9 +2495,9 @@ def _ai_models_sync(
             "resolved": resolved,
             "eligible_proxy": eligible_proxy,
             "proxy_accepted": proxy_accepted,
-            "coding_change": change_evidence["Coding"],
-            "writing_change": change_evidence["Writing"],
-            "task_type": task_type,
+            "coding_change": cached_facts.get("coding_change"),
+            "writing_change": cached_facts.get("writing_change"),
+            "task_type": cached_facts.get("task_type", "General"),
         }
 
     tool_failures_by_model: Counter[str] = Counter()
@@ -3023,13 +3097,75 @@ def _ai_models_sync(
     }
 
 
+def _ai_models_database_revision() -> Tuple[Any, ...]:
+    with _database() as db:
+        last_activity = db._conn.execute(
+            "SELECT MAX(coalesce(last_activity_at, started_at)) FROM sessions"
+        ).fetchone()[0]
+    database_path = _hermes_home() / "state.db"
+    wal_path = Path(str(database_path) + "-wal")
+
+    def signature(path: Path) -> Tuple[int, int]:
+        try:
+            stat = path.stat()
+            return (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            return (0, 0)
+
+    return (_number(last_activity, 0), *signature(database_path), *signature(wal_path))
+
+
+def _ai_models_sync(
+    days: int,
+    start_at: Optional[float] = None,
+    end_at: Optional[float] = None,
+    fresh: bool = False,
+) -> Dict[str, Any]:
+    settings = _plugin_settings()
+    _period_bounds(days, start_at, end_at)
+    settings_hash = hashlib.sha256(
+        json.dumps(settings, sort_keys=True, default=str).encode("utf-8")
+    ).hexdigest()
+    cache_key = (
+        days,
+        _number(start_at) if start_at is not None else None,
+        _number(end_at) if end_at is not None else None,
+        *_ai_models_database_revision(),
+        settings_hash,
+    )
+    now = time.time()
+    with _ai_models_cache_lock:
+        if not fresh:
+            cached = _ai_models_cache.get(cache_key)
+            if cached and now - cached[0] < AI_MODELS_CACHE_TTL_SECONDS:
+                payload = copy.deepcopy(cached[1])
+                payload["cached"] = True
+                return payload
+
+    payload = _ai_models_payload_sync(
+        days,
+        start_at,
+        end_at,
+        settings=settings,
+    )
+    payload["cached"] = False
+    payload["cache_ttl_seconds"] = AI_MODELS_CACHE_TTL_SECONDS
+    with _ai_models_cache_lock:
+        for key, (cached_at, _) in list(_ai_models_cache.items()):
+            if now - cached_at >= AI_MODELS_CACHE_TTL_SECONDS:
+                _ai_models_cache.pop(key, None)
+        _ai_models_cache[cache_key] = (time.time(), copy.deepcopy(payload))
+    return payload
+
+
 @router.get("/ai-models")
 async def ai_models(
     days: int = Query(30, ge=0, le=3650),
     start_at: Optional[float] = Query(None, ge=0),
     end_at: Optional[float] = Query(None, ge=0),
+    fresh: bool = False,
 ) -> Dict[str, Any]:
-    return await asyncio.to_thread(_ai_models_sync, days, start_at, end_at)
+    return await asyncio.to_thread(_ai_models_sync, days, start_at, end_at, fresh)
 
 
 def _tools_sync(

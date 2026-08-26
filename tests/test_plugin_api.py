@@ -363,6 +363,8 @@ class SessionLensApiTests(unittest.TestCase):
         api._log_file_cache.clear()
         api._ai_usage_cache = None
         api._ai_usage_last_success.clear()
+        api._ai_models_cache.clear()
+        api._session_classification_cache.clear()
         if self.original_home is None:
             os.environ.pop("HERMES_HOME", None)
         else:
@@ -901,6 +903,18 @@ class SessionLensApiTests(unittest.TestCase):
             connection.close()
         session_fallback = api._ai_models_sync(0, 1_800_001_000, 1_800_002_000)
         self.assertEqual(session_fallback["models"][0]["last_used_at"], 1_800_000_120)
+
+    def test_ai_models_cache_avoids_reclassifying_unchanged_history(self):
+        api._ai_models_cache.clear()
+        api._session_classification_cache.clear()
+        with patch.object(api, "_session_task_type", wraps=api._session_task_type) as classifier:
+            first = api._ai_models_sync(0)
+            first_call_count = classifier.call_count
+            second = api._ai_models_sync(0)
+        self.assertGreater(first_call_count, 0)
+        self.assertEqual(classifier.call_count, first_call_count)
+        self.assertFalse(first["cached"])
+        self.assertTrue(second["cached"])
 
     def test_ai_model_acceptance_is_task_specific_and_requires_coding_change_evidence(self):
         connection = sqlite3.connect(self.db_path)

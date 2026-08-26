@@ -2738,7 +2738,7 @@ function SessionLensPage({ ctx }) {
     queryKey: [PLUGIN_ID, 'ai-models', period.days, period.start_at, period.end_at],
     queryFn: () => ctx.rest(apiPath('/ai-models', period)),
     enabled: tab === 'ai-models',
-    refetchInterval: tab === 'ai-models' ? 60_000 : false
+    refetchInterval: tab === 'ai-models' ? 300_000 : false
   })
 
   useEffect(() => ctx.storage.set('activeTab', tab), [ctx, tab])
@@ -2759,7 +2759,11 @@ function SessionLensPage({ ctx }) {
     const refreshErrors = []
     if (tab === 'ai-models') {
       try {
-        await queryClient.invalidateQueries({ queryKey: [PLUGIN_ID, 'ai-models'] })
+        const data = await ctx.rest(apiPath('/ai-models', { ...period, fresh: true }))
+        queryClient.setQueryData(
+          [PLUGIN_ID, 'ai-models', period.days, period.start_at, period.end_at],
+          data
+        )
       } catch (error) {
         refreshErrors.push(`Model analytics: ${error?.message || String(error || 'refresh failed')}`)
       }
