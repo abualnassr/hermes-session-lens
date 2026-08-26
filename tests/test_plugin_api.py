@@ -6,6 +6,7 @@ import json
 import os
 import sqlite3
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -461,6 +462,49 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertEqual(detail["skills"][0]["name"], "hermes-desktop-plugins")
         paths = {item["path"] for item in detail["files"]}
         self.assertIn("C:\\work\\demo\\app.py", paths)
+
+    def test_attention_flags_runaway_and_reaped_sessions(self):
+        connection = sqlite3.connect(self.db_path)
+        try:
+            now = time.time()
+            connection.execute(
+                """
+                INSERT INTO sessions (id, source, model, started_at, last_activity_at,
+                                      input_tokens, output_tokens, message_count)
+                VALUES ('session-open', 'desktop', 'provider/model-a', ?, ?, 6000000, 500000, 4)
+                """,
+                (now - 3 * 86400, now - 2 * 86400),
+            )
+            connection.execute(
+                """
+                INSERT INTO sessions (id, source, model, started_at, ended_at,
+                                      last_activity_at, end_reason, input_tokens,
+                                      output_tokens, cache_read_tokens, message_count)
+                VALUES ('session-reaped', 'desktop', 'provider/model-a', ?, ?, ?,
+                        'startup_orphan_reap', 2000000, 1000000, 4000000, 9)
+                """,
+                (now - 10 * 86400, now - 3600, now - 3600),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+
+        payload = api._attention_sync(0)
+        by_id = {item["id"]: item for item in payload["sessions"]}
+        self.assertIn("session-open", by_id)
+        self.assertEqual(by_id["session-open"]["severity"], "warning")
+        self.assertIn("never closed", by_id["session-open"]["reason"])
+        self.assertIn("session-reaped", by_id)
+        self.assertIn("startup_orphan_reap", by_id["session-reaped"]["reason"])
+        self.assertEqual(by_id["session-reaped"]["total_tokens"], 7000000)
+        self.assertNotIn("session-1", by_id)
+        self.assertEqual(payload["totals"]["open_sessions"], 1)
+        self.assertEqual(payload["totals"]["reaped_sessions"], 1)
+
+        scoped = api._attention_sync(0, start_at=time.time() - 60, end_at=time.time())
+        scoped_ids = {item["id"] for item in scoped["sessions"]}
+        self.assertIn("session-open", scoped_ids)
+        self.assertNotIn("session-reaped", scoped_ids)
 
     def test_benign_json_error_fields_are_not_failures(self):
         benign = (

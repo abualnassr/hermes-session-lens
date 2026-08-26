@@ -936,6 +936,68 @@ function SessionDetail({ query, detailTab, setDetailTab, ctx, period, onBack }) 
   })
 }
 
+function AttentionBanner({ data, onSelect }) {
+  const sessions = data?.sessions || []
+  if (!sessions.length) return null
+  const totals = data.totals || {}
+  const summaryParts = []
+  if (totals.open_sessions) summaryParts.push(`${formatCount(totals.open_sessions)} open past ${formatCount(data.thresholds?.open_hours || 24)}h`)
+  if (totals.reaped_sessions) summaryParts.push(`${formatCount(totals.reaped_sessions)} reaped with heavy spend`)
+  return jsxs('div', {
+    role: 'status',
+    style: { background: color.warningSoft, borderBottom: border, display: 'grid', gap: '0.35rem', padding: '0.55rem 0.8rem' },
+    children: [
+      jsxs('div', {
+        style: { alignItems: 'center', color: color.warning, display: 'flex', fontSize: '0.6875rem', fontWeight: 650, gap: '0.4rem' },
+        children: [
+          jsx(Codicon, { name: 'warning', size: '0.75rem' }),
+          jsx('span', { children: `${formatCount(totals.flagged)} session${totals.flagged === 1 ? '' : 's'} need attention — ${summaryParts.join(' · ')}` })
+        ]
+      }),
+      jsx('div', {
+        style: { display: 'grid', gap: '0.15rem' },
+        children: sessions.slice(0, 5).map(session => jsxs('button', {
+          type: 'button',
+          onClick: () => onSelect(session.id),
+          title: 'Show this session in the list below',
+          style: {
+            alignItems: 'baseline',
+            background: 'transparent',
+            border: 'none',
+            color: color.secondary,
+            cursor: 'pointer',
+            display: 'flex',
+            font: 'inherit',
+            fontSize: '0.6875rem',
+            gap: '0.6rem',
+            justifyContent: 'space-between',
+            outlineColor: color.accent,
+            padding: '0.12rem 0',
+            textAlign: 'left',
+            width: '100%'
+          },
+          children: [
+            jsxs('span', {
+              style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+              children: [
+                jsx('span', { style: { color: session.severity === 'danger' ? color.danger : color.primary, fontWeight: 650 }, children: session.title || session.id }),
+                jsx('span', { style: { color: color.tertiary }, children: ` — ${session.reason}` })
+              ]
+            }),
+            jsx('span', {
+              style: { ...tabular, color: color.tertiary, flexShrink: 0 },
+              children: `${formatCount(session.total_tokens)} tok · ${formatCost(session.display_cost_usd, session.cost_kind)}`
+            })
+          ]
+        }, session.id))
+      }),
+      sessions.length > 5 || data.totals?.truncated
+        ? jsx('span', { style: { color: color.tertiary, fontSize: '0.625rem' }, children: `${formatCount(Math.max(0, (totals.flagged || 0) - 5))} more flagged; search or sort by tokens to review the rest.` })
+        : null
+    ]
+  })
+}
+
 function SessionsView({ ctx, period, narrow, drill }) {
   const [search, setSearch] = useState('')
   const [sort, setSort] = useState('failures')
@@ -958,6 +1020,11 @@ function SessionsView({ ctx, period, narrow, drill }) {
     setNarrowPane('list')
   }, [drill])
 
+  const attentionQuery = useQuery({
+    queryKey: [PLUGIN_ID, 'attention', period.days, period.start_at, period.end_at],
+    queryFn: () => ctx.rest(apiPath('/attention', period)),
+    refetchInterval: 120_000
+  })
   const listQuery = useQuery({
     queryKey: [PLUGIN_ID, 'sessions', period.days, period.start_at, period.end_at, debouncedSearch, sort, failuresOnly, limit],
     queryFn: () =>
@@ -995,6 +1062,16 @@ function SessionsView({ ctx, period, narrow, drill }) {
   return jsxs('div', {
     style: { display: 'flex', flex: 1, flexDirection: 'column', minHeight: 0 },
     children: [
+      narrow && narrowPane === 'detail'
+        ? null
+        : jsx(AttentionBanner, {
+            data: attentionQuery.data,
+            onSelect: id => {
+              setSearch(id)
+              setFailuresOnly(false)
+              setNarrowPane('list')
+            }
+          }),
       jsxs('div', {
         style: { alignItems: 'center', borderBottom: border, display: narrow && narrowPane === 'detail' ? 'none' : 'flex', flexWrap: 'wrap', gap: '0.5rem', padding: '0.65rem 0.8rem' },
         children: [

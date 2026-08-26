@@ -4,10 +4,11 @@ Hermes Session Lens is a native observability page for Hermes Desktop. It appear
 
 It is a unified Hermes plugin—one install contains the native Desktop page and its namespaced Python API. There is no iframe, separate dashboard, Node server, or third-party telemetry service.
 
-This documentation describes Hermes Session Lens `0.9.0`.
+This documentation describes Hermes Session Lens `0.10.0`.
 
 ## What it includes
 
+- An attention banner above the session list flags runaway work: sessions open past 24 hours that are either still active (destructive severity) or idle with five million tokens or more, and reaped or expired sessions (`startup_orphan_reap`, `max_runtime`, `timeout`) at the same token threshold. Each flagged row jumps to that session in the list; quiet histories render no banner.
 - Failure-first session browser with full-text search snippets. SQL performs only a coarse candidate scan; the shared Python signature confirms tool-result text before list, detail, overview, tool, or AI Models metrics count it. Recorded Hermes finish/effect states remain authoritative.
 - Recorded actual/estimated cost provenance, with **Included** and **Unpriced** states instead of a false `$0`.
 - Input, output, cache-read, cache-write, reasoning, and per-model usage.

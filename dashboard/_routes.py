@@ -426,6 +426,143 @@ async def session_trace(
     return await asyncio.to_thread(_trace_sync, session_id, limit, offset)
 
 
+ATTENTION_OPEN_HOURS = 24
+ATTENTION_MIN_TOKENS = 5_000_000
+_ATTENTION_REAPED_END_REASONS = {"startup_orphan_reap", "max_runtime", "timeout"}
+_ATTENTION_MAX_SESSIONS = 20
+
+
+def _attention_sync(
+    days: int,
+    start_at: Optional[float] = None,
+    end_at: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Flag sessions that look like runaway or orphaned work.
+
+    Open sessions are flagged regardless of the selected period: an old
+    session that never closed matters whenever it is noticed. Reaped or
+    expired sessions honor the period so history stays browsable.
+    """
+    period_start, period_end = _period_bounds(days, start_at, end_at)
+    now = time.time()
+    reaped_placeholders = ",".join("?" for _ in _ATTENTION_REAPED_END_REASONS)
+    with _database() as db:
+        rows = [
+            _row_dict(row)
+            for row in _db_connection(db).execute(
+                f"""
+                SELECT id, title, source, model, started_at, ended_at,
+                       last_activity_at, end_reason, message_count,
+                       input_tokens, output_tokens, cache_read_tokens,
+                       cache_write_tokens, estimated_cost_usd, actual_cost_usd,
+                       cost_status, cost_source
+                FROM sessions
+                WHERE coalesce(hidden,0)=0
+                  AND (
+                    ended_at IS NULL
+                    OR lower(coalesce(end_reason,'')) IN ({reaped_placeholders})
+                  )
+                """,
+                tuple(sorted(_ATTENTION_REAPED_END_REASONS)),
+            ).fetchall()
+        ]
+
+    flagged: List[Dict[str, Any]] = []
+    open_flagged = 0
+    reaped_flagged = 0
+    for session in rows:
+        started = _number(session.get("started_at"), 0)
+        last_activity = _number(session.get("last_activity_at"), started)
+        total_tokens = sum(
+            _integer(session.get(key))
+            for key in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
+        )
+        cost_view = _cost_view(session)
+        if session.get("ended_at") is None:
+            open_hours = (now - started) / 3600 if started else 0
+            if open_hours < ATTENTION_OPEN_HOURS:
+                continue
+            recently_active = now - last_activity < 3600
+            if recently_active:
+                severity = "danger"
+                reason = (
+                    f"Open for {open_hours / 24:.1f} days and still active in the last hour; "
+                    "it may be running unattended."
+                )
+            elif total_tokens >= ATTENTION_MIN_TOKENS:
+                severity = "warning"
+                idle_hours = (now - last_activity) / 3600
+                reason = (
+                    f"Open for {open_hours / 24:.1f} days with {total_tokens / 1_000_000:.1f}M tokens, "
+                    f"idle for {idle_hours / 24:.1f} days; it never closed."
+                )
+            else:
+                continue
+            open_flagged += 1
+        else:
+            ended = _number(session.get("ended_at"), 0)
+            if ended < period_start or (period_end is not None and ended >= period_end):
+                continue
+            if total_tokens < ATTENTION_MIN_TOKENS:
+                continue
+            severity = "warning"
+            run_hours = max(0.0, (ended - started) / 3600) if started else 0.0
+            reason = (
+                f"Ended by {session.get('end_reason')} after {run_hours / 24:.1f} days "
+                f"with {total_tokens / 1_000_000:.1f}M tokens; nobody closed it deliberately."
+            )
+            reaped_flagged += 1
+        flagged.append(
+            {
+                "id": str(session.get("id")),
+                "title": _clean_text(session.get("title"), 120),
+                "source": session.get("source"),
+                "model": session.get("model"),
+                "started_at": session.get("started_at"),
+                "ended_at": session.get("ended_at"),
+                "last_activity_at": session.get("last_activity_at"),
+                "end_reason": session.get("end_reason"),
+                "total_tokens": total_tokens,
+                "display_cost_usd": cost_view.get("display_cost_usd"),
+                "cost_kind": cost_view.get("cost_kind"),
+                "severity": severity,
+                "reason": reason,
+            }
+        )
+
+    flagged.sort(
+        key=lambda item: (
+            0 if item["severity"] == "danger" else 1,
+            -_integer(item.get("total_tokens")),
+        )
+    )
+    truncated = len(flagged) > _ATTENTION_MAX_SESSIONS
+    return {
+        "sessions": flagged[:_ATTENTION_MAX_SESSIONS],
+        "totals": {
+            "flagged": len(flagged),
+            "open_sessions": open_flagged,
+            "reaped_sessions": reaped_flagged,
+            "truncated": truncated,
+        },
+        "thresholds": {
+            "open_hours": ATTENTION_OPEN_HOURS,
+            "min_tokens": ATTENTION_MIN_TOKENS,
+            "reaped_end_reasons": sorted(_ATTENTION_REAPED_END_REASONS),
+        },
+        "generated_at": now,
+    }
+
+
+@router.get("/attention")
+async def attention(
+    days: int = Query(30, ge=0, le=3650),
+    start_at: Optional[float] = Query(None, ge=0),
+    end_at: Optional[float] = Query(None, ge=0),
+) -> Dict[str, Any]:
+    return await asyncio.to_thread(_attention_sync, days, start_at, end_at)
+
+
 @router.get("/telemetry")
 async def telemetry(
     days: int = Query(30, ge=0, le=3650),
