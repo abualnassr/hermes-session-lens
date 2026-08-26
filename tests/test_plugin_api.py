@@ -31,6 +31,22 @@ def tool_rows(name: str, arguments: dict | None = None, result: str = "Done!"):
     ]
 
 
+SESSION_MODEL_USAGE_INSERT_SQL = """
+    INSERT INTO session_model_usage (
+        session_id,model,billing_provider,billing_mode,task,api_call_count,
+        input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,
+        reasoning_tokens,estimated_cost_usd,actual_cost_usd,cost_status,
+        cost_source,first_seen,last_seen
+    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+"""
+ASYNC_DELEGATION_INSERT_SQL = """
+    INSERT INTO async_delegations (
+        delegation_id,origin_session,parent_session_id,state,dispatched_at,
+        completed_at,updated_at,delivery_state
+    ) VALUES (?,?,?,?,?,?,?,?)
+"""
+
+
 class FakeSessionDB:
     path: Path
 
@@ -76,13 +92,22 @@ class SessionLensApiTests(unittest.TestCase):
 
             CREATE TABLE sessions (
                 id TEXT PRIMARY KEY,
-                source TEXT,
+                source TEXT NOT NULL,
+                user_id TEXT,
+                session_key TEXT,
+                chat_id TEXT,
+                chat_type TEXT,
+                thread_id TEXT,
                 display_name TEXT,
+                origin_json TEXT,
+                expiry_finalized INTEGER DEFAULT 0,
                 model TEXT,
-                started_at REAL,
+                model_config TEXT,
+                system_prompt TEXT,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
                 ended_at REAL,
                 end_reason TEXT,
-                parent_session_id TEXT,
                 message_count INTEGER DEFAULT 0,
                 tool_call_count INTEGER DEFAULT 0,
                 input_tokens INTEGER DEFAULT 0,
@@ -102,62 +127,97 @@ class SessionLensApiTests(unittest.TestCase):
                 cost_source TEXT,
                 pricing_version TEXT,
                 title TEXT,
+                api_call_count INTEGER DEFAULT 0,
+                handoff_state TEXT,
+                handoff_platform TEXT,
+                handoff_error TEXT,
+                compression_failure_cooldown_until REAL,
+                compression_failure_error TEXT,
+                compression_fallback_streak INTEGER NOT NULL DEFAULT 0,
+                profile_name TEXT,
+                rewind_count INTEGER NOT NULL DEFAULT 0,
+                archived INTEGER NOT NULL DEFAULT 0,
+                compression_ineffective_count INTEGER NOT NULL DEFAULT 0,
+                pinned INTEGER NOT NULL DEFAULT 0,
+                system_prompt_hash TEXT,
                 last_activity_at REAL,
                 last_activity_description TEXT,
-                api_call_count INTEGER DEFAULT 0,
-                profile_name TEXT,
-                archived INTEGER DEFAULT 0,
-                pinned INTEGER DEFAULT 0,
-                hidden INTEGER DEFAULT 0
+                last_activity_provenance TEXT,
+                last_read_at REAL,
+                git_metadata_generation INTEGER NOT NULL DEFAULT 0,
+                title_source TEXT,
+                hidden INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                session_id TEXT,
-                role TEXT,
+                id INTEGER PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
                 content TEXT,
                 tool_call_id TEXT,
                 tool_calls TEXT,
                 tool_name TEXT,
                 effect_disposition TEXT,
-                timestamp REAL,
+                timestamp REAL NOT NULL,
+                token_count INTEGER,
                 finish_reason TEXT,
-                token_count INTEGER DEFAULT 0,
+                reasoning TEXT,
                 reasoning_content TEXT,
-                compacted INTEGER DEFAULT 0,
+                reasoning_details TEXT,
+                codex_reasoning_items TEXT,
+                codex_message_items TEXT,
+                platform_message_id TEXT,
+                observed INTEGER DEFAULT 0,
+                active INTEGER NOT NULL DEFAULT 1,
+                compacted INTEGER NOT NULL DEFAULT 0,
+                api_content TEXT,
                 display_kind TEXT,
-                active INTEGER DEFAULT 1
+                display_metadata TEXT,
+                _compressed_summary INTEGER NOT NULL DEFAULT 0
             );
 
             CREATE TABLE session_model_usage (
-                session_id TEXT,
-                model TEXT,
-                billing_provider TEXT,
-                billing_mode TEXT,
-                task TEXT,
-                api_call_count INTEGER,
-                input_tokens INTEGER,
-                output_tokens INTEGER,
-                cache_read_tokens INTEGER,
-                cache_write_tokens INTEGER,
-                reasoning_tokens INTEGER,
-                estimated_cost_usd REAL,
-                actual_cost_usd REAL,
+                session_id TEXT NOT NULL,
+                model TEXT NOT NULL,
+                billing_provider TEXT NOT NULL DEFAULT '',
+                billing_base_url TEXT NOT NULL DEFAULT '',
+                billing_mode TEXT NOT NULL DEFAULT '',
+                task TEXT NOT NULL DEFAULT '',
+                api_call_count INTEGER NOT NULL DEFAULT 0,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_read_tokens INTEGER NOT NULL DEFAULT 0,
+                cache_write_tokens INTEGER NOT NULL DEFAULT 0,
+                reasoning_tokens INTEGER NOT NULL DEFAULT 0,
+                estimated_cost_usd REAL NOT NULL DEFAULT 0,
+                actual_cost_usd REAL NOT NULL DEFAULT 0,
                 cost_status TEXT,
                 cost_source TEXT,
                 first_seen REAL,
-                last_seen REAL
+                last_seen REAL,
+                PRIMARY KEY (session_id, model, billing_provider, billing_base_url, billing_mode, task)
             );
 
             CREATE TABLE async_delegations (
-                delegation_id TEXT,
-                origin_session TEXT,
+                delegation_id TEXT PRIMARY KEY,
+                origin_session TEXT NOT NULL,
+                origin_ui_session_id TEXT NOT NULL DEFAULT '',
                 parent_session_id TEXT,
-                state TEXT,
-                dispatched_at REAL,
+                state TEXT NOT NULL,
+                dispatched_at REAL NOT NULL,
                 completed_at REAL,
-                updated_at REAL,
-                delivery_state TEXT
+                updated_at REAL NOT NULL,
+                event_json TEXT,
+                result_json TEXT,
+                delivery_state TEXT NOT NULL DEFAULT 'pending',
+                delivery_attempts INTEGER NOT NULL DEFAULT 0,
+                delivered_at REAL,
+                owner_pid INTEGER,
+                owner_started_at INTEGER,
+                task_json TEXT,
+                delivery_claim TEXT,
+                delivery_claimed_at REAL,
+                origin_session_id TEXT
             );
 
             CREATE VIRTUAL TABLE messages_fts USING fts5(content);
@@ -199,9 +259,7 @@ class SessionLensApiTests(unittest.TestCase):
             ),
         )
         connection.execute(
-            """
-            INSERT INTO session_model_usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
-            """,
+            SESSION_MODEL_USAGE_INSERT_SQL,
             (
                 "session-1",
                 "provider/model-a",
@@ -505,6 +563,23 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertFalse(system["privacy"]["provider_credentials_returned_to_desktop"])
         self.assertEqual(system["database"]["schema_version"], 26)
         self.assertIn(system["capabilities"]["key_resolution"], {"unknown", "available", "unavailable"})
+
+    def test_fake_schema_matches_recorded_hermes_v26_fixture(self):
+        # Regenerate this fixture from the installed read-only Hermes state.db
+        # whenever Hermes bumps its schema version.
+        fixture_path = Path(__file__).parent / "fixtures" / "schema_v26.json"
+        fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
+        keys = ("cid", "name", "type", "notnull", "default", "pk")
+        connection = sqlite3.connect(self.db_path)
+        try:
+            for table, expected in fixture.items():
+                actual = [
+                    dict(zip(keys, row))
+                    for row in connection.execute(f"PRAGMA table_info({table})").fetchall()
+                ]
+                self.assertEqual(actual, expected, table)
+        finally:
+            connection.close()
 
     def test_account_usage_snapshot_is_normalised_and_secret_redacted(self):
         snapshot = SimpleNamespace(
@@ -922,7 +997,7 @@ class SessionLensApiTests(unittest.TestCase):
         connection = sqlite3.connect(self.db_path)
         try:
             connection.execute(
-                "INSERT INTO session_model_usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                SESSION_MODEL_USAGE_INSERT_SQL,
                 (
                     "session-1", "provider/model-a", "provider", "metered", "title_generation",
                     1, 20, 5, 0, 0, 0, 0.0001, 0, "estimated", "test",
@@ -1022,7 +1097,7 @@ class SessionLensApiTests(unittest.TestCase):
                     (session_id, "desktop", model, started_at, started_at + 60, reason, "provider", "metered", started_at + 60, 1),
                 )
                 connection.execute(
-                    "INSERT INTO session_model_usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    SESSION_MODEL_USAGE_INSERT_SQL,
                     (session_id, model, "provider", "metered", "", 1, 100, 20, 0, 0, 0, 0.001, 0, "estimated", "test", started_at, started_at + 50),
                 )
 
@@ -1052,7 +1127,7 @@ class SessionLensApiTests(unittest.TestCase):
                 ("orchestration", "assistant", json.dumps(delegate_call), 1_800_000_410),
             )
             connection.execute(
-                "INSERT INTO async_delegations VALUES (?,?,?,?,?,?,?,?)",
+                ASYNC_DELEGATION_INSERT_SQL,
                 ("delegation-2", "orchestration", None, "completed", 1_800_000_401, 1_800_000_450, 1_800_000_450, "delivered"),
             )
             connection.commit()
@@ -1094,7 +1169,7 @@ class SessionLensApiTests(unittest.TestCase):
                 )
             for session_id, model, task, started_at in rows:
                 connection.execute(
-                    "INSERT INTO session_model_usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                    SESSION_MODEL_USAGE_INSERT_SQL,
                     (session_id, model, "provider", "metered", task, 1, 100, 20, 0, 0, 0, 0.001, 0, "estimated", "test", started_at + 5, started_at + 90),
                 )
             repeated = "Please inspect the provider configuration and explain the result"
@@ -1191,7 +1266,7 @@ class SessionLensApiTests(unittest.TestCase):
                     usage = [(model, started_at + 2, started_at + 50)]
                 for usage_model, first_seen, last_seen in usage:
                     connection.execute(
-                        "INSERT INTO session_model_usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        SESSION_MODEL_USAGE_INSERT_SQL,
                         (session_id, usage_model, "provider", "metered", "", 1, 100, 20, 0, 0, 0, 0.001, 0, "estimated", "test", first_seen, last_seen),
                     )
 

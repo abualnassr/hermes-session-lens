@@ -24,7 +24,21 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
 from urllib.parse import urlparse
 
-from fastapi import APIRouter, HTTPException, Query
+try:
+    from fastapi import APIRouter, HTTPException, Query
+except ImportError:  # pragma: no cover - supports dependency-free compatibility tests.
+    class APIRouter:  # type: ignore[no-redef]
+        def get(self, _path: str):
+            return lambda function: function
+
+    class HTTPException(Exception):  # type: ignore[no-redef]
+        def __init__(self, status_code: int, detail: str):
+            super().__init__(detail)
+            self.status_code = status_code
+            self.detail = detail
+
+    def Query(default: Any, **_constraints: Any) -> Any:  # type: ignore[misc]
+        return default
 
 try:
     from ._hermes_compat import *

@@ -1,0 +1,946 @@
+{
+  "sessions": [
+    {
+      "cid": 0,
+      "name": "id",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 1
+    },
+    {
+      "cid": 1,
+      "name": "source",
+      "type": "TEXT",
+      "notnull": 1,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 2,
+      "name": "user_id",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 3,
+      "name": "session_key",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 4,
+      "name": "chat_id",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 5,
+      "name": "chat_type",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 6,
+      "name": "thread_id",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 7,
+      "name": "display_name",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 8,
+      "name": "origin_json",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 9,
+      "name": "expiry_finalized",
+      "type": "INTEGER",
+      "notnull": 0,
+      "default": "0",
+      "pk": 0
+    },
+    {
+      "cid": 10,
+      "name": "model",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 11,
+      "name": "model_config",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 12,
+      "name": "system_prompt",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 13,
+      "name": "parent_session_id",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 14,
+      "name": "started_at",
+      "type": "REAL",
+      "notnull": 1,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 15,
+      "name": "ended_at",
+      "type": "REAL",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 16,
+      "name": "end_reason",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 17,
+      "name": "message_count",
+      "type": "INTEGER",
+      "notnull": 0,
+      "default": "0",
+      "pk": 0
+    },
+    {
+      "cid": 18,
+      "name": "tool_call_count",
+      "type": "INTEGER",
+      "notnull": 0,
+      "default": "0",
+      "pk": 0
+    },
+    {
+      "cid": 19,
+      "name": "input_tokens",
+      "type": "INTEGER",
+      "notnull": 0,
+      "default": "0",
+      "pk": 0
+    },
+    {
+      "cid": 20,
+      "name": "output_tokens",
+      "type": "INTEGER",
+      "notnull": 0,
+      "default": "0",
+      "pk": 0
+    },
+    {
+      "cid": 21,
+      "name": "cache_read_tokens",
+      "type": "INTEGER",
+      "notnull": 0,
+      "default": "0",
+      "pk": 0
+    },
+    {
+      "cid": 22,
+      "name": "cache_write_tokens",
+      "type": "INTEGER",
+      "notnull": 0,
+      "default": "0",
+      "pk": 0
+    },
+    {
+      "cid": 23,
+      "name": "reasoning_tokens",
+      "type": "INTEGER",
+      "notnull": 0,
+      "default": "0",
+      "pk": 0
+    },
+    {
+      "cid": 24,
+      "name": "cwd",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 25,
+      "name": "git_branch",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 26,
+      "name": "git_repo_root",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 27,
+      "name": "billing_provider",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 28,
+      "name": "billing_base_url",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 29,
+      "name": "billing_mode",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 30,
+      "name": "estimated_cost_usd",
+      "type": "REAL",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 31,
+      "name": "actual_cost_usd",
+      "type": "REAL",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 32,
+      "name": "cost_status",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 33,
+      "name": "cost_source",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 34,
+      "name": "pricing_version",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 35,
+      "name": "title",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 36,
+      "name": "api_call_count",
+      "type": "INTEGER",
+      "notnull": 0,
+      "default": "0",
+      "pk": 0
+    },
+    {
+      "cid": 37,
+      "name": "handoff_state",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 38,
+      "name": "handoff_platform",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 39,
+      "name": "handoff_error",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 40,
+      "name": "compression_failure_cooldown_until",
+      "type": "REAL",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 41,
+      "name": "compression_failure_error",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 42,
+      "name": "compression_fallback_streak",
+      "type": "INTEGER",
+      "notnull": 1,
+      "default": "0",
+      "pk": 0
+    },
+    {
+      "cid": 43,
+      "name": "profile_name",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 44,
+      "name": "rewind_count",
+      "type": "INTEGER",
+      "notnull": 1,
+      "default": "0",
+      "pk": 0
+    },
+    {
+      "cid": 45,
+      "name": "archived",
+      "type": "INTEGER",
+      "notnull": 1,
+      "default": "0",
+      "pk": 0
+    },
+    {
+      "cid": 46,
+      "name": "compression_ineffective_count",
+      "type": "INTEGER",
+      "notnull": 1,
+      "default": "0",
+      "pk": 0
+    },
+    {
+      "cid": 47,
+      "name": "pinned",
+      "type": "INTEGER",
+      "notnull": 1,
+      "default": "0",
+      "pk": 0
+    },
+    {
+      "cid": 48,
+      "name": "system_prompt_hash",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 49,
+      "name": "last_activity_at",
+      "type": "REAL",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 50,
+      "name": "last_activity_description",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 51,
+      "name": "last_activity_provenance",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 52,
+      "name": "last_read_at",
+      "type": "REAL",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 53,
+      "name": "git_metadata_generation",
+      "type": "INTEGER",
+      "notnull": 1,
+      "default": "0",
+      "pk": 0
+    },
+    {
+      "cid": 54,
+      "name": "title_source",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 55,
+      "name": "hidden",
+      "type": "INTEGER",
+      "notnull": 1,
+      "default": "0",
+      "pk": 0
+    }
+  ],
+  "messages": [
+    {
+      "cid": 0,
+      "name": "id",
+      "type": "INTEGER",
+      "notnull": 0,
+      "default": null,
+      "pk": 1
+    },
+    {
+      "cid": 1,
+      "name": "session_id",
+      "type": "TEXT",
+      "notnull": 1,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 2,
+      "name": "role",
+      "type": "TEXT",
+      "notnull": 1,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 3,
+      "name": "content",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 4,
+      "name": "tool_call_id",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 5,
+      "name": "tool_calls",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 6,
+      "name": "tool_name",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 7,
+      "name": "effect_disposition",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 8,
+      "name": "timestamp",
+      "type": "REAL",
+      "notnull": 1,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 9,
+      "name": "token_count",
+      "type": "INTEGER",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 10,
+      "name": "finish_reason",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 11,
+      "name": "reasoning",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 12,
+      "name": "reasoning_content",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 13,
+      "name": "reasoning_details",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 14,
+      "name": "codex_reasoning_items",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 15,
+      "name": "codex_message_items",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 16,
+      "name": "platform_message_id",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 17,
+      "name": "observed",
+      "type": "INTEGER",
+      "notnull": 0,
+      "default": "0",
+      "pk": 0
+    },
+    {
+      "cid": 18,
+      "name": "active",
+      "type": "INTEGER",
+      "notnull": 1,
+      "default": "1",
+      "pk": 0
+    },
+    {
+      "cid": 19,
+      "name": "compacted",
+      "type": "INTEGER",
+      "notnull": 1,
+      "default": "0",
+      "pk": 0
+    },
+    {
+      "cid": 20,
+      "name": "api_content",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 21,
+      "name": "display_kind",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 22,
+      "name": "display_metadata",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 23,
+      "name": "_compressed_summary",
+      "type": "INTEGER",
+      "notnull": 1,
+      "default": "0",
+      "pk": 0
+    }
+  ],
+  "session_model_usage": [
+    {
+      "cid": 0,
+      "name": "session_id",
+      "type": "TEXT",
+      "notnull": 1,
+      "default": null,
+      "pk": 1
+    },
+    {
+      "cid": 1,
+      "name": "model",
+      "type": "TEXT",
+      "notnull": 1,
+      "default": null,
+      "pk": 2
+    },
+    {
+      "cid": 2,
+      "name": "billing_provider",
+      "type": "TEXT",
+      "notnull": 1,
+      "default": "''",
+      "pk": 3
+    },
+    {
+      "cid": 3,
+      "name": "billing_base_url",
+      "type": "TEXT",
+      "notnull": 1,
+      "default": "''",
+      "pk": 4
+    },
+    {
+      "cid": 4,
+      "name": "billing_mode",
+      "type": "TEXT",
+      "notnull": 1,
+      "default": "''",
+      "pk": 5
+    },
+    {
+      "cid": 5,
+      "name": "task",
+      "type": "TEXT",
+      "notnull": 1,
+      "default": "''",
+      "pk": 6
+    },
+    {
+      "cid": 6,
+      "name": "api_call_count",
+      "type": "INTEGER",
+      "notnull": 1,
+      "default": "0",
+      "pk": 0
+    },
+    {
+      "cid": 7,
+      "name": "input_tokens",
+      "type": "INTEGER",
+      "notnull": 1,
+      "default": "0",
+      "pk": 0
+    },
+    {
+      "cid": 8,
+      "name": "output_tokens",
+      "type": "INTEGER",
+      "notnull": 1,
+      "default": "0",
+      "pk": 0
+    },
+    {
+      "cid": 9,
+      "name": "cache_read_tokens",
+      "type": "INTEGER",
+      "notnull": 1,
+      "default": "0",
+      "pk": 0
+    },
+    {
+      "cid": 10,
+      "name": "cache_write_tokens",
+      "type": "INTEGER",
+      "notnull": 1,
+      "default": "0",
+      "pk": 0
+    },
+    {
+      "cid": 11,
+      "name": "reasoning_tokens",
+      "type": "INTEGER",
+      "notnull": 1,
+      "default": "0",
+      "pk": 0
+    },
+    {
+      "cid": 12,
+      "name": "estimated_cost_usd",
+      "type": "REAL",
+      "notnull": 1,
+      "default": "0",
+      "pk": 0
+    },
+    {
+      "cid": 13,
+      "name": "actual_cost_usd",
+      "type": "REAL",
+      "notnull": 1,
+      "default": "0",
+      "pk": 0
+    },
+    {
+      "cid": 14,
+      "name": "cost_status",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 15,
+      "name": "cost_source",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 16,
+      "name": "first_seen",
+      "type": "REAL",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 17,
+      "name": "last_seen",
+      "type": "REAL",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    }
+  ],
+  "async_delegations": [
+    {
+      "cid": 0,
+      "name": "delegation_id",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 1
+    },
+    {
+      "cid": 1,
+      "name": "origin_session",
+      "type": "TEXT",
+      "notnull": 1,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 2,
+      "name": "origin_ui_session_id",
+      "type": "TEXT",
+      "notnull": 1,
+      "default": "''",
+      "pk": 0
+    },
+    {
+      "cid": 3,
+      "name": "parent_session_id",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 4,
+      "name": "state",
+      "type": "TEXT",
+      "notnull": 1,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 5,
+      "name": "dispatched_at",
+      "type": "REAL",
+      "notnull": 1,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 6,
+      "name": "completed_at",
+      "type": "REAL",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 7,
+      "name": "updated_at",
+      "type": "REAL",
+      "notnull": 1,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 8,
+      "name": "event_json",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 9,
+      "name": "result_json",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 10,
+      "name": "delivery_state",
+      "type": "TEXT",
+      "notnull": 1,
+      "default": "'pending'",
+      "pk": 0
+    },
+    {
+      "cid": 11,
+      "name": "delivery_attempts",
+      "type": "INTEGER",
+      "notnull": 1,
+      "default": "0",
+      "pk": 0
+    },
+    {
+      "cid": 12,
+      "name": "delivered_at",
+      "type": "REAL",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 13,
+      "name": "owner_pid",
+      "type": "INTEGER",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 14,
+      "name": "owner_started_at",
+      "type": "INTEGER",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 15,
+      "name": "task_json",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 16,
+      "name": "delivery_claim",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 17,
+      "name": "delivery_claimed_at",
+      "type": "REAL",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    },
+    {
+      "cid": 18,
+      "name": "origin_session_id",
+      "type": "TEXT",
+      "notnull": 0,
+      "default": null,
+      "pk": 0
+    }
+  ]
+}
