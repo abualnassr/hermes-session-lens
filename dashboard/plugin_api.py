@@ -2043,6 +2043,105 @@ def _model_match(raw_model: Any, known_models: Iterable[str]) -> Optional[str]:
     return matches[0] if len(matches) == 1 else None
 
 
+_WORK_RELIABILITY_ELIGIBLE_STATUSES = {"clean", "completed", "recovered", "unrecovered"}
+
+
+def _wilson_upper_bound(failures: int, samples: int, z_score: float = 1.96) -> Optional[float]:
+    """Return the upper Wilson bound for a binomial failure rate."""
+    if samples <= 0:
+        return None
+    failure_count = max(0, min(_integer(failures), _integer(samples)))
+    sample_count = _integer(samples)
+    proportion = failure_count / sample_count
+    z_squared = z_score * z_score
+    denominator = 1 + z_squared / sample_count
+    centre = proportion + z_squared / (2 * sample_count)
+    margin = z_score * math.sqrt(
+        proportion * (1 - proportion) / sample_count
+        + z_squared / (4 * sample_count * sample_count)
+    )
+    return max(0.0, min(1.0, (centre + margin) / denominator))
+
+
+def _work_reliability_counts(
+    runs: Iterable[Mapping[str, Any]],
+    sample_threshold: int,
+) -> Dict[str, Any]:
+    material = list(runs)
+    statuses = Counter(str(run.get("status") or "unknown") for run in material)
+    clean = statuses.get("clean", 0)
+    recovered = statuses.get("recovered", 0)
+    completed = clean + recovered + statuses.get("completed", 0)
+    unrecovered = statuses.get("unrecovered", 0)
+    eligible = completed + unrecovered
+    recovery_samples = recovered + unrecovered
+    threshold = max(1, _integer(sample_threshold, DEFAULT_RATE_SAMPLE_THRESHOLD))
+    return {
+        "eligible_tasks": eligible,
+        "completed_tasks": completed,
+        "clean_completions": clean,
+        "recovered_tasks": recovered,
+        "unrecovered_failures": unrecovered,
+        "switched_away_tasks": statuses.get("switched_away", 0),
+        "unknown_tasks": statuses.get("unknown", 0),
+        "excluded_tasks": statuses.get("excluded", 0),
+        "completion_rate": completed / eligible if eligible else None,
+        "clean_completion_rate": clean / eligible if eligible else None,
+        "unrecovered_failure_rate": unrecovered / eligible if eligible else None,
+        "recovery_samples": recovery_samples,
+        "recovery_rate": recovered / recovery_samples if recovery_samples else None,
+        "failure_rate_upper_bound_95": _wilson_upper_bound(unrecovered, eligible),
+        "rank_eligible": eligible >= threshold,
+        "sample_threshold": threshold,
+    }
+
+
+def _work_reliability_payload(
+    runs: Iterable[Mapping[str, Any]],
+    route_labels: Mapping[str, str],
+    sample_threshold: int,
+) -> Dict[str, Any]:
+    material = list(runs)
+    payload = _work_reliability_counts(material, sample_threshold)
+
+    by_task_type: Dict[str, List[Mapping[str, Any]]] = defaultdict(list)
+    by_route: Dict[str, List[Mapping[str, Any]]] = defaultdict(list)
+    for run in material:
+        by_task_type[str(run.get("task_type") or "General")].append(run)
+        route_key = str(run.get("route_key") or "")
+        by_route[route_labels.get(route_key) or "Unmapped (edit in config)"].append(run)
+
+    payload["by_task_type"] = [
+        {
+            "label": task_type,
+            **_work_reliability_counts(task_runs, sample_threshold),
+        }
+        for task_type, task_runs in sorted(
+            by_task_type.items(),
+            key=lambda item: (_SESSION_TASK_TYPES.index(item[0]) if item[0] in _SESSION_TASK_TYPE_SET else 99, item[0]),
+        )
+    ]
+    payload["by_route"] = [
+        {
+            "label": route_label,
+            **_work_reliability_counts(route_runs, sample_threshold),
+        }
+        for route_label, route_runs in sorted(
+            by_route.items(),
+            key=lambda item: (-len(item[1]), item[0].lower()),
+        )
+    ]
+    payload["rank"] = None
+    payload["ranked_models"] = 0
+    payload["confidence_level"] = 0.95
+    payload["coverage"] = "bounded_logs" if _has_work_reliability_coverage(material) else "unavailable"
+    return payload
+
+
+def _has_work_reliability_coverage(runs: Iterable[Mapping[str, Any]]) -> bool:
+    return any(str(run.get("status") or "") in _WORK_RELIABILITY_ELIGIBLE_STATUSES | {"unknown"} for run in runs)
+
+
 def _ai_models_sync(
     days: int,
     start_at: Optional[float] = None,
@@ -2259,6 +2358,7 @@ def _ai_models_sync(
             and failure_counts.get(session_id, 0) == 0
         )
         session_facts[session_id] = {
+            "outcome": outcome,
             "closed": closed,
             "resolved": resolved,
             "eligible_proxy": eligible_proxy,
@@ -2436,6 +2536,7 @@ def _ai_models_sync(
     latency_by_model: Dict[str, List[float]] = defaultdict(list)
     successes_by_model: Counter[str] = Counter()
     failures_by_model: Dict[str, Counter[str]] = defaultdict(Counter)
+    reliability_events_by_session_model: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
     observed_timestamps: List[float] = []
     for event in runtime.get("api", []):
         timestamp = _number(event.get("timestamp"), 0)
@@ -2447,6 +2548,11 @@ def _ai_models_sync(
         successes_by_model[model_id] += 1
         latency_by_model[model_id].append(_number(event.get("latency_seconds")))
         observed_timestamps.append(timestamp)
+        session_id = str(event.get("session_id") or "")
+        if session_id:
+            reliability_events_by_session_model[(session_id, model_id)].append(
+                {"timestamp": timestamp, "status": "success"}
+            )
 
     unattributed_failures = 0
     for event in runtime.get("errors", []):
@@ -2465,6 +2571,133 @@ def _ai_models_sync(
             continue
         failures_by_model[model_id][str(event.get("category") or "error")] += 1
         observed_timestamps.append(timestamp)
+        if session_id:
+            reliability_events_by_session_model[(session_id, model_id)].append(
+                {
+                    "timestamp": timestamp,
+                    "status": "failure",
+                    "category": str(event.get("category") or "error"),
+                }
+            )
+
+    work_runs_by_model: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+    for session_id, session in sessions_by_id.items():
+        main_usage = [
+            row
+            for row in usage_by_session.get(session_id, [])
+            if _task_role(row.get("task")) == "main"
+        ]
+        if not main_usage:
+            continue
+
+        usage_by_model: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for usage in main_usage:
+            usage_by_model[str(usage.get("model") or "unknown")].append(usage)
+
+        last_seen_by_model = {
+            model_id: max(
+                _number(row.get("last_seen") or row.get("first_seen"), 0)
+                for row in rows
+            )
+            for model_id, rows in usage_by_model.items()
+        }
+        latest_seen = max(last_seen_by_model.values(), default=0)
+        final_model_candidates = {
+            model_id
+            for model_id, last_seen in last_seen_by_model.items()
+            if last_seen == latest_seen
+        }
+        recorded_session_model = str(session.get("model") or "").strip()
+        if len(final_model_candidates) > 1 and recorded_session_model in final_model_candidates:
+            final_model_candidates = {recorded_session_model}
+        final_model = next(iter(final_model_candidates)) if len(final_model_candidates) == 1 else None
+        facts = session_facts.get(session_id, {})
+        task_type = str(facts.get("task_type") or "General")
+        outcome = str(facts.get("outcome") or "open")
+
+        for model_id, model_usage_rows in usage_by_model.items():
+            latest_usage = max(
+                model_usage_rows,
+                key=lambda row: (
+                    _number(row.get("last_seen") or row.get("first_seen"), 0),
+                    _number(row.get("first_seen"), 0),
+                ),
+            )
+            route = _route_descriptor(
+                latest_usage.get("billing_provider"),
+                latest_usage.get("billing_base_url"),
+                latest_usage.get("billing_mode"),
+            )
+            first_seen = min(
+                (_number(row.get("first_seen"), 0) for row in model_usage_rows),
+                default=0,
+            )
+            last_seen = max(
+                (
+                    _number(row.get("last_seen") or row.get("first_seen"), 0)
+                    for row in model_usage_rows
+                ),
+                default=first_seen,
+            )
+            events = sorted(
+                (
+                    event
+                    for event in reliability_events_by_session_model.get((session_id, model_id), [])
+                    if (not first_seen or _number(event.get("timestamp")) >= first_seen - 300)
+                    and (not last_seen or _number(event.get("timestamp")) <= last_seen + 300)
+                ),
+                key=lambda event: _number(event.get("timestamp")),
+            )
+            if task_type == "Orchestration":
+                status = "excluded"
+                reason = "orchestration ownership is not scored"
+            elif final_model is None:
+                status = "unknown"
+                reason = "final main-role model is ambiguous"
+            elif model_id != final_model:
+                status = "switched_away"
+                reason = "same task role finished on another model"
+            elif outcome not in {"completed", "failed"}:
+                status = "excluded"
+                reason = f"session outcome {outcome} is not eligible"
+            elif not events:
+                status = "unknown"
+                reason = "no attributable API event is available in bounded logs"
+            elif outcome == "completed":
+                if any(event.get("status") == "failure" for event in events):
+                    status = "recovered"
+                    reason = "task completed after an observed API failure on the same final model-role"
+                elif model_id in retry_switch_models_by_session.get(session_id, set()):
+                    status = "completed"
+                    reason = "task completed with a rewind, resend, or same-role switch"
+                else:
+                    status = "clean"
+                    reason = "task completed without an observed API failure, retry, or same-role switch"
+            else:
+                last_failure = max(
+                    (_number(event.get("timestamp")) for event in events if event.get("status") == "failure"),
+                    default=0,
+                )
+                last_success = max(
+                    (_number(event.get("timestamp")) for event in events if event.get("status") == "success"),
+                    default=0,
+                )
+                if last_failure and last_failure >= last_success:
+                    status = "unrecovered"
+                    reason = "session failed with no later successful API event on the final model-role"
+                else:
+                    status = "unknown"
+                    reason = "failed session is not attributable to an unrecovered model/API event"
+
+            work_runs_by_model[model_id].append(
+                {
+                    "session_id": session_id,
+                    "task_type": task_type,
+                    "route_key": route["key"],
+                    "status": status,
+                    "reason": reason,
+                }
+            )
 
     final_models: List[Dict[str, Any]] = []
     for model_id, model in models.items():
@@ -2482,6 +2715,15 @@ def _ai_models_sync(
             reverse=True,
         )
         primary_route = routes[0] if routes else _route_descriptor("unknown", "", "")
+        route_labels = {
+            str(route.get("key") or ""): str(route.get("label") or "Unmapped (edit in config)")
+            for route in routes
+        }
+        work_reliability = _work_reliability_payload(
+            work_runs_by_model.get(model_id, []),
+            route_labels,
+            rate_sample_threshold,
+        )
         route_providers = {str(route.get("provider") or "") for route in routes}
         reporting_routes = route_providers & cache_reporting_providers
         if model["cache_tokens_raw"] > 0 or reporting_routes:
@@ -2559,6 +2801,15 @@ def _ai_models_sync(
         retry_switch_samples = len(sessions_set)
         has_in_period_requests = _integer(model.get("requests")) > 0
         if (
+            work_reliability["rank_eligible"]
+            and work_reliability["unrecovered_failure_rate"] is not None
+            and work_reliability["unrecovered_failure_rate"] > 0.05
+        ):
+            insight = (
+                f"{work_reliability['unrecovered_failure_rate'] * 100:.1f}% of eligible main-role tasks ended with "
+                "an unrecovered model/API failure."
+            )
+        elif (
             has_in_period_requests
             and failure_samples >= rate_sample_threshold
             and failure_rate is not None
@@ -2596,6 +2847,7 @@ def _ai_models_sync(
                 "retry_switch_sessions": len(retry_sessions),
                 "retry_switch_samples": retry_switch_samples,
                 "retry_switch_rate": retry_switch_rate,
+                "work_reliability": work_reliability,
                 "task_types": task_types,
                 "auxiliary_tasks": auxiliary_tasks,
                 "failures": {
@@ -2624,6 +2876,25 @@ def _ai_models_sync(
         model.pop("trend_map", None)
         final_models.append(model)
 
+    comparable_models = sorted(
+        (
+            item
+            for item in final_models
+            if item.get("work_reliability", {}).get("rank_eligible")
+            and item.get("work_reliability", {}).get("failure_rate_upper_bound_95") is not None
+        ),
+        key=lambda item: (
+            _number(item["work_reliability"].get("failure_rate_upper_bound_95"), 1),
+            _number(item["work_reliability"].get("unrecovered_failure_rate"), 1),
+            -_integer(item["work_reliability"].get("eligible_tasks")),
+            str(item.get("display_name") or item.get("model_id") or "").lower(),
+        ),
+    )
+    for rank, item in enumerate(comparable_models, start=1):
+        item["work_reliability"]["rank"] = rank
+    for item in final_models:
+        item["work_reliability"]["ranked_models"] = len(comparable_models)
+
     final_models.sort(key=lambda item: item["total_tokens"], reverse=True)
     active_models = sum(1 for item in final_models if _integer(item.get("sessions")) > 0)
     known_cost_models = sum(
@@ -2650,6 +2921,7 @@ def _ai_models_sync(
                 if _integer(item.get("sessions")) > 0
                 and item["cost_kind"] in {"subscription", "mixed"}
             ),
+            "reliability_ranked_models": len(comparable_models),
         },
         "coverage": {
             "model_source": "all-time distinct model IDs from Hermes session_model_usage with session-row fallback; metrics honor the selected period",
@@ -2669,6 +2941,11 @@ def _ai_models_sync(
             "failure_latency": (
                 "fail rate counts API/request errors, timeouts, and rate limits from bounded local Hermes agent logs; "
                 "tool-call failures are counted separately from session records"
+            ),
+            "work_reliability": (
+                "main-role completed tasks are clean, recovered, or completed with intervention; a failed task is unrecovered only when its last "
+                "attributable bounded-log model event remains an API failure; orchestration, auxiliary, open, cancelled, ambiguous, and uncovered "
+                "runs are excluded from rates, and comparable models rank by the 95% Wilson upper bound after the sample floor"
             ),
             "ttft_available": False,
             "cache": "a zero is shown only when the route has demonstrated cache reporting in the selected period; otherwise unavailable is returned",

@@ -2211,6 +2211,107 @@ function TaskTypeBreakdown({ rows }) {
   })
 }
 
+function WorkReliabilityBreakdown({ title, rows }) {
+  if (!rows?.length) return null
+  return jsxs('div', {
+    style: { display: 'grid', gap: '0.35rem', minWidth: 0 },
+    children: [
+      jsx('div', { style: { color: color.quaternary, fontSize: '0.625rem', fontWeight: 600 }, children: title }),
+      jsx('div', {
+        style: { borderTop: border, display: 'grid' },
+        children: rows.map(row => {
+          const eligible = Number(row.eligible_tasks) || 0
+          const unknown = Number(row.unknown_tasks) || 0
+          const switched = Number(row.switched_away_tasks) || 0
+          const excluded = Number(row.excluded_tasks) || 0
+          const evidence = eligible > 0
+            ? `${formatPercent(row.completion_rate)} completed · ${formatCount(row.unrecovered_failures)} unrecovered · n=${formatCount(eligible)}`
+            : unknown > 0
+              ? `n/a · ${formatCount(unknown)} unknown`
+              : switched > 0
+                ? `n/a · ${formatCount(switched)} switched away`
+                : excluded > 0
+                  ? `n/a · ${formatCount(excluded)} not scored`
+                  : 'n/a'
+          return jsxs('div', {
+            title: eligible > 0 ? `${formatPercent(row.unrecovered_failure_rate)} unrecovered task failure rate` : undefined,
+            style: { alignItems: 'baseline', borderBottom: border, display: 'flex', gap: '0.75rem', justifyContent: 'space-between', minWidth: 0, padding: '0.38rem 0.1rem' },
+            children: [
+              jsx('span', { style: { color: color.secondary, fontSize: '0.6875rem', fontWeight: 600, minWidth: 0, overflowWrap: 'anywhere' }, children: row.label }),
+              jsx('span', { style: { ...tabular, color: color.tertiary, flexShrink: 0, fontSize: '0.625rem', textAlign: 'right' }, children: evidence })
+            ]
+          }, row.label)
+        })
+      })
+    ]
+  })
+}
+
+function WorkReliability({ reliability, sampleThreshold }) {
+  const data = reliability || {}
+  const eligible = Number(data.eligible_tasks) || 0
+  const threshold = Math.max(1, Number(sampleThreshold) || 20)
+  const lowSample = eligible < threshold
+  const rankAvailable = Number(data.rank) > 0 && Number(data.ranked_models) > 0
+  const rankText = rankAvailable
+    ? `Reliability rank #${formatCount(data.rank)} of ${formatCount(data.ranked_models)} comparable models`
+    : eligible > 0
+      ? `${formatCount(eligible)} eligible tasks; ${formatCount(threshold)} required for ranking`
+      : 'No comparable main-role task outcome in bounded logs'
+  const metrics = [
+    ['Task completion', data.completion_rate, `n=${formatCount(eligible)}`, 'Completion includes clean, recovered, and completed-with-intervention tasks.'],
+    ['Clean completion', data.clean_completion_rate, `${formatCount(data.clean_completions)} tasks`, 'Completed without an observed API failure, rewind, resend, or same-role switch.'],
+    ['Unrecovered', data.unrecovered_failure_rate, `${formatCount(data.unrecovered_failures)} tasks`, 'Failed with no later successful API event on the final model-role.'],
+    ['Recovery', data.recovery_rate, `n=${formatCount(data.recovery_samples)}`, 'Completed after an observed API failure on the same final model-role.']
+  ]
+  return jsxs('div', {
+    style: { display: 'grid', gap: '0.65rem' },
+    children: [
+      jsxs('div', {
+        style: { alignItems: 'baseline', display: 'flex', flexWrap: 'wrap', gap: '0.35rem 0.75rem', justifyContent: 'space-between' },
+        children: [
+          jsx('span', { style: { color: rankAvailable ? color.primary : color.tertiary, fontSize: '0.6875rem', fontWeight: rankAvailable ? 650 : 400 }, children: rankText }),
+          data.failure_rate_upper_bound_95 !== null && data.failure_rate_upper_bound_95 !== undefined
+            ? jsx('span', {
+                title: 'Models are ranked by the lowest 95% Wilson upper bound after the sample floor.',
+                style: { ...tabular, color: color.quaternary, fontSize: '0.625rem' },
+                children: `95% upper risk ${formatPercent(data.failure_rate_upper_bound_95)}`
+              })
+            : null
+        ]
+      }),
+      jsx('div', {
+        style: { borderTop: border, display: 'grid', gridTemplateColumns: 'repeat(2, minmax(7rem, 1fr))' },
+        children: metrics.map(([label, value, detail, title]) => {
+          const available = value !== null && value !== undefined
+          const isFailure = label === 'Unrecovered'
+          const metricColor = !available || lowSample
+            ? color.tertiary
+            : isFailure
+              ? toneColor(metricTone(value))
+              : color.primary
+          return jsxs('div', {
+            title,
+            style: { borderBottom: border, minWidth: 0, padding: '0.48rem 0.45rem' },
+            children: [
+              jsx('div', { style: { color: color.quaternary, fontSize: '0.625rem' }, children: label }),
+              jsxs('div', {
+                style: { alignItems: 'baseline', display: 'flex', flexWrap: 'wrap', gap: '0.2rem 0.4rem', marginTop: '0.12rem' },
+                children: [
+                  jsx('span', { style: { ...tabular, color: metricColor, fontSize: '0.8125rem', fontWeight: available ? 650 : 400 }, children: available ? formatPercent(value) : 'n/a' }),
+                  jsx('span', { style: { ...tabular, color: color.quaternary, fontSize: '0.625rem' }, children: detail })
+                ]
+              })
+            ]
+          }, label)
+        })
+      }),
+      jsx(WorkReliabilityBreakdown, { title: 'By task type', rows: data.by_task_type }),
+      data.by_route?.length > 1 ? jsx(WorkReliabilityBreakdown, { title: 'By route', rows: data.by_route }) : null
+    ]
+  })
+}
+
 function ModelExpanded({ model, quota, coverage, narrow }) {
   const failures = model.failures || {}
   const hasEnoughAcceptedTasks = Number(model.accepted_tasks) >= 10
@@ -2238,6 +2339,8 @@ function ModelExpanded({ model, quota, coverage, narrow }) {
     routeMappingNote,
     `Failure and total-latency samples come from bounded logs${coverage?.log_start_at ? ` (${formatShortDate(coverage.log_start_at)}–${formatShortDate(coverage.log_end_at)})` : ''}; time-to-first-token is not recorded by Hermes.`,
     'Counts API errors, timeouts, and rate limits; tool-call failures are shown separately.',
+    'Work reliability scores completed main-role tasks and terminal model/API failures. Open, cancelled, orchestration, auxiliary, ambiguous, and uncovered runs are excluded; missing evidence is never treated as success.',
+    `Comparable models require n=${formatCount(coverage?.rate_sample_threshold || 20)} eligible tasks and rank by the lowest 95% Wilson upper failure bound.`,
     'Retry/switch counts rewinds, near-identical prompts resent to the same model within five minutes, and model changes within the same task role; models on different roles are not switches.',
     'Session Lens assigns one primary type in this order: Orchestration, Coding, Writing, Analysis, General. General and Analysis use the existing proxy; Coding requires a resolved code-shaped save or commit; Writing requires a resolved non-code artifact write; Orchestration and auxiliary jobs are n/a.'
   ])
@@ -2267,8 +2370,9 @@ function ModelExpanded({ model, quota, coverage, narrow }) {
           jsxs('section', {
             children: [
               jsx('h3', { style: { color: color.primary, fontSize: '0.8125rem', fontWeight: 650, margin: '0 0 0.65rem' }, children: 'Reliability and efficiency' }),
+              jsx(WorkReliability, { reliability: model.work_reliability, sampleThreshold: coverage?.rate_sample_threshold }),
               jsx('div', {
-                style: { borderTop: border, display: 'grid', gridTemplateColumns: 'repeat(4, minmax(5rem, 1fr))' },
+                style: { borderTop: border, display: 'grid', gridTemplateColumns: 'repeat(4, minmax(5rem, 1fr))', marginTop: '0.75rem' },
                 children: [
                   ['Rate limits', failures.rate_limits],
                   ['Timeouts', failures.timeouts],
@@ -2448,7 +2552,7 @@ function AIModelsTable({ models, quotaData, coverage, narrow }) {
               jsx('td', { title: model.cache_coverage === 'partial' ? 'Cached-token coverage is partial across routes.' : model.cache_coverage === 'unavailable' ? 'This route has not demonstrated cached-token reporting in the selected period.' : undefined, style: { ...tabular, borderBottom: isExpanded ? 'none' : border, minWidth: '11rem', padding: '0.62rem 0.65rem', textAlign: 'right', verticalAlign: 'top' }, children: `${formatCount(model.input_tokens)} / ${formatCount(model.output_tokens)} / ${model.cache_tokens === null || model.cache_tokens === undefined ? '–' : formatCount(model.cache_tokens)}` }, 'tokens'),
               jsx('td', { style: { ...tabular, borderBottom: isExpanded ? 'none' : border, padding: '0.62rem 0.65rem', textAlign: 'right', verticalAlign: 'top' }, children: formatModelCost(model) }, 'cost'),
               jsx('td', { style: { borderBottom: isExpanded ? 'none' : border, padding: '0.58rem 0.65rem', verticalAlign: 'top' }, children: jsx(QuotaBurn, { quota: item.quota }) }, 'quota'),
-              jsx('td', { style: { borderBottom: isExpanded ? 'none' : border, padding: '0.62rem 0.65rem', textAlign: 'right', verticalAlign: 'top' }, children: jsx(RateValue, { value: model.failures?.rate, sampleCount: model.failures?.samples, sampleThreshold: rateSampleThreshold, unavailableReason: Number(model.requests) === 0 ? 'activity outside selected period; see bounded log note' : undefined, label: 'API error, timeout, or rate-limit response rate' }) }, 'failure'),
+              jsx('td', { style: { borderBottom: isExpanded ? 'none' : border, padding: '0.62rem 0.65rem', textAlign: 'right', verticalAlign: 'top' }, children: jsx(RateValue, { value: model.failures?.rate, sampleCount: model.failures?.samples, sampleThreshold: rateSampleThreshold, unavailableReason: Number(model.requests) === 0 ? 'activity outside selected period; see bounded log note' : undefined, label: 'API attempt failure rate: errors, timeouts, or rate-limit responses' }) }, 'failure'),
               jsx('td', { style: { borderBottom: isExpanded ? 'none' : border, padding: '0.62rem 0.65rem', textAlign: 'right', verticalAlign: 'top' }, children: jsx(RateValue, { value: model.retry_switch_rate, sampleCount: model.retry_switch_samples, sampleThreshold: rateSampleThreshold, label: 'Rewind, same-model prompt resend, or same-role model-switch session rate' }) }, 'retry'),
               jsx('td', { title: Number(model.requests) === 0 ? 'activity outside selected period; see bounded log note' : `${model.latency?.samples || 0} bounded-log samples. Hermes does not record time-to-first-token.`, style: { ...tabular, borderBottom: isExpanded ? 'none' : border, minWidth: '7rem', padding: '0.62rem 0.65rem', textAlign: 'right', verticalAlign: 'top' }, children: Number(model.requests) === 0 ? '–' : `– / ${formatSeconds(model.latency?.total_p50_seconds)}` }, 'latency'),
               jsx('td', { style: { borderBottom: isExpanded ? 'none' : border, padding: '0.54rem 0.65rem', verticalAlign: 'top' }, children: jsx(TrendBars, { rows: model.trend }) }, 'trend')
@@ -2514,7 +2618,7 @@ function AIModelsView({ query, quotaQuery, narrow, refreshError }) {
           children: [
             jsx(Codicon, { name: 'info', size: '0.75rem', style: { marginTop: '0.15rem' } }),
             jsx('span', {
-              children: `Requests, tokens, routes, and cost come from Hermes session accounting. Retry/switch counts rewinds, same-model near-identical prompt resends within five minutes, and same-role model changes. Acceptance is available for General and Analysis, plus Coding when saved/committed file-change evidence is recorded. Fail rate counts API errors, timeouts, and rate limits from bounded local logs; time-to-first-token is not recorded. Rate samples below n=${formatCount(data.coverage?.rate_sample_threshold || 20)} are neutral and sort below adequately sampled rows. Session records contain ${formatCount(data.coverage?.recorded_failure_events)} failure events in this period; ${formatCount(data.coverage?.recorded_tool_failures)} are tool-call failures (${formatCount(data.coverage?.attributed_tool_failures)} attributed to a model, ${formatCount(data.coverage?.unattributed_tool_failures)} unattributed).`
+              children: `Requests, tokens, routes, and cost come from Hermes session accounting. Work reliability evaluates completed main-role tasks and terminal model/API failures; incomplete or ambiguous evidence is excluded, and qualifying models rank by a confidence-adjusted upper failure bound. Retry/switch counts rewinds, same-model near-identical prompt resends within five minutes, and same-role model changes. Acceptance is available for General and Analysis, plus Coding and Writing when valid saved/committed artifact evidence is recorded. Fail rate is the API attempt failure rate from bounded local logs; time-to-first-token is not recorded. Rate samples below n=${formatCount(data.coverage?.rate_sample_threshold || 20)} are neutral. Session records contain ${formatCount(data.coverage?.recorded_failure_events)} failure events in this period; ${formatCount(data.coverage?.recorded_tool_failures)} are tool-call failures (${formatCount(data.coverage?.attributed_tool_failures)} attributed to a model, ${formatCount(data.coverage?.unattributed_tool_failures)} unattributed).`
             })
           ]
         })

@@ -964,6 +964,126 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertEqual(model["failures"]["tool_failures"], 1)
         self.assertAlmostEqual(model["failures"]["rate"], 2 / 3)
 
+    def test_work_reliability_uses_task_outcomes_and_confidence_adjustment(self):
+        counts = api._work_reliability_counts(
+            [
+                {"status": "clean"},
+                {"status": "recovered"},
+                {"status": "completed"},
+                {"status": "unrecovered"},
+                {"status": "unknown"},
+                {"status": "switched_away"},
+                {"status": "excluded"},
+            ],
+            sample_threshold=5,
+        )
+        self.assertEqual(counts["eligible_tasks"], 4)
+        self.assertEqual(counts["completed_tasks"], 3)
+        self.assertEqual(counts["clean_completions"], 1)
+        self.assertEqual(counts["recovered_tasks"], 1)
+        self.assertEqual(counts["unrecovered_failures"], 1)
+        self.assertEqual(counts["unknown_tasks"], 1)
+        self.assertEqual(counts["switched_away_tasks"], 1)
+        self.assertEqual(counts["excluded_tasks"], 1)
+        self.assertEqual(counts["completion_rate"], 0.75)
+        self.assertEqual(counts["clean_completion_rate"], 0.25)
+        self.assertEqual(counts["recovery_rate"], 0.5)
+        self.assertFalse(counts["rank_eligible"])
+        self.assertGreater(counts["failure_rate_upper_bound_95"], counts["unrecovered_failure_rate"])
+
+    def test_ai_model_work_reliability_distinguishes_recovery_terminal_failure_and_switches(self):
+        log_specs = []
+        connection = sqlite3.connect(self.db_path)
+        try:
+            sessions = [
+                ("recovered-task", "provider/model-r", "completed", "2027-01-15 09:00:00,000"),
+                ("unrecovered-task", "provider/model-u", "failed", "2027-01-15 09:10:00,000"),
+                ("clean-task", "provider/model-c", "completed", "2027-01-15 09:20:00,000"),
+                ("switched-task", "provider/model-b", "completed", "2027-01-15 09:30:00,000"),
+                ("tool-only-task", "provider/model-t", "failed", "2027-01-15 09:40:00,000"),
+            ]
+            for session_id, model, outcome, stamp in sessions:
+                started_at = api._timestamp_from_log(stamp)
+                connection.execute(
+                    """
+                    INSERT INTO sessions (
+                        id,source,model,started_at,ended_at,end_reason,billing_provider,
+                        billing_mode,last_activity_at,api_call_count
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (session_id, "desktop", model, started_at, started_at + 60, outcome, "provider", "metered", started_at + 60, 2),
+                )
+                if session_id == "switched-task":
+                    usage = [
+                        ("provider/model-a", started_at + 2, started_at + 20),
+                        ("provider/model-b", started_at + 25, started_at + 50),
+                    ]
+                else:
+                    usage = [(model, started_at + 2, started_at + 50)]
+                for usage_model, first_seen, last_seen in usage:
+                    connection.execute(
+                        "INSERT INTO session_model_usage VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                        (session_id, usage_model, "provider", "metered", "", 1, 100, 20, 0, 0, 0, 0.001, 0, "estimated", "test", first_seen, last_seen),
+                    )
+
+            tool_started = api._timestamp_from_log("2027-01-15 09:40:00,000")
+            connection.execute(
+                """
+                INSERT INTO messages (session_id,role,content,tool_call_id,tool_name,timestamp,active)
+                VALUES (?,?,?,?,?,?,1)
+                """,
+                ("tool-only-task", "tool", "Error: command failed", "tool-only", "terminal", tool_started + 30),
+            )
+            connection.commit()
+
+            log_specs = [
+                "2027-01-15 09:00:10,000 WARNING [recovered-task] agent.conversation_loop: API call failed (attempt 1/2) error_type=APITimeout provider=provider base_url=https://example.test model=provider/model-r summary=timeout\n",
+                "2027-01-15 09:00:20,000 INFO [recovered-task] agent.conversation_loop: API call #2: model=provider/model-r provider=provider in=100 out=20 total=120 latency=1.0s\n",
+                "2027-01-15 09:10:10,000 INFO [unrecovered-task] agent.conversation_loop: API call #1: model=provider/model-u provider=provider in=100 out=20 total=120 latency=1.0s\n",
+                "2027-01-15 09:10:20,000 WARNING [unrecovered-task] agent.conversation_loop: API call failed (attempt 1/1) error_type=APITimeout provider=provider base_url=https://example.test model=provider/model-u summary=timeout\n",
+                "2027-01-15 09:20:10,000 INFO [clean-task] agent.conversation_loop: API call #1: model=provider/model-c provider=provider in=100 out=20 total=120 latency=1.0s\n",
+                "2027-01-15 09:30:10,000 INFO [switched-task] agent.conversation_loop: API call #1: model=provider/model-a provider=provider in=100 out=20 total=120 latency=1.0s\n",
+                "2027-01-15 09:30:40,000 INFO [switched-task] agent.conversation_loop: API call #2: model=provider/model-b provider=provider in=100 out=20 total=120 latency=1.0s\n",
+                "2027-01-15 09:40:10,000 INFO [tool-only-task] agent.conversation_loop: API call #1: model=provider/model-t provider=provider in=100 out=20 total=120 latency=1.0s\n",
+            ]
+        finally:
+            connection.close()
+
+        log_path = self.home / "logs" / "agent.log"
+        log_path.write_text(log_path.read_text(encoding="utf-8") + "".join(log_specs), encoding="utf-8")
+        api._log_file_cache.clear()
+        with patch.object(api, "_plugin_settings", return_value={"rate_sample_threshold": 1}):
+            models = {item["model_id"]: item for item in api._ai_models_sync(0)["models"]}
+
+        recovered = models["provider/model-r"]["work_reliability"]
+        self.assertEqual(recovered["eligible_tasks"], 1)
+        self.assertEqual(recovered["recovered_tasks"], 1)
+        self.assertEqual(recovered["unrecovered_failures"], 0)
+        self.assertEqual(recovered["recovery_rate"], 1)
+
+        unrecovered = models["provider/model-u"]["work_reliability"]
+        self.assertEqual(unrecovered["eligible_tasks"], 1)
+        self.assertEqual(unrecovered["unrecovered_failures"], 1)
+        self.assertEqual(unrecovered["completion_rate"], 0)
+        self.assertGreater(unrecovered["rank"], recovered["rank"])
+
+        clean = models["provider/model-c"]["work_reliability"]
+        self.assertEqual(clean["clean_completions"], 1)
+        self.assertEqual(clean["completion_rate"], 1)
+        self.assertEqual(clean["by_route"][0]["label"], "Provider API")
+
+        switched_from = models["provider/model-a"]["work_reliability"]
+        switched_to = models["provider/model-b"]["work_reliability"]
+        self.assertEqual(switched_from["switched_away_tasks"], 1)
+        self.assertEqual(switched_from["eligible_tasks"], 0)
+        self.assertEqual(switched_to["completed_tasks"], 1)
+        self.assertEqual(switched_to["clean_completions"], 0)
+
+        tool_only = models["provider/model-t"]["work_reliability"]
+        self.assertEqual(tool_only["eligible_tasks"], 0)
+        self.assertEqual(tool_only["unknown_tasks"], 1)
+        self.assertEqual(models["provider/model-t"]["failures"]["tool_failures"], 1)
+
     def test_ai_models_ui_keeps_early_quota_neutral_and_enforces_sample_floor(self):
         source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
         self.assertIn("elapsed !== null && elapsed < 10", source)
@@ -1018,6 +1138,10 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertIn("if (!leftAdequate) return left.index - right.index", source)
         self.assertIn("activity outside selected period; see bounded log note", source)
         self.assertIn("Unmapped (edit in config)", source)
+        self.assertIn("Reliability rank #${formatCount(data.rank)}", source)
+        self.assertIn("95% upper risk", source)
+        self.assertIn("Work reliability scores completed main-role tasks", source)
+        self.assertIn("API attempt failure rate", source)
 
     def test_custom_period_is_inclusive_by_start_and_exclusive_by_end(self):
         start = 1_799_999_999
