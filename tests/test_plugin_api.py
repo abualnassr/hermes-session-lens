@@ -395,6 +395,73 @@ class SessionLensApiTests(unittest.TestCase):
         paths = {item["path"] for item in detail["files"]}
         self.assertIn("C:\\work\\demo\\app.py", paths)
 
+    def test_failure_sql_candidates_are_confirmed_by_shared_signature(self):
+        corpus = (
+            "0 errors",
+            "error-free",
+            "Traceback (most recent call last)",
+            "process exited with code 2",
+            "error_handler.py updated",
+            "All tests passed",
+        )
+        connection = sqlite3.connect(self.db_path)
+        try:
+            for index, content in enumerate(corpus):
+                connection.execute(
+                    """
+                    INSERT INTO messages (
+                        session_id,role,content,tool_name,timestamp,active
+                    ) VALUES (?,?,?,?,?,1)
+                    """,
+                    ("session-1", "tool", content, f"corpus-{index}", 1_800_000_020 + index),
+                )
+            connection.commit()
+            connection.row_factory = sqlite3.Row
+            candidates = {
+                row["content"]
+                for row in connection.execute(
+                    f"SELECT content FROM messages m WHERE m.role='tool' AND {api._failure_sql('m')}"
+                ).fetchall()
+                if row["content"] in corpus
+            }
+        finally:
+            connection.close()
+
+        matches = {content for content in corpus if api._FAILURE_RE.search(content)}
+        self.assertEqual(
+            matches,
+            {"Traceback (most recent call last)", "process exited with code 2"},
+        )
+        self.assertTrue(matches.issubset(candidates))
+
+        detail = api._session_detail_sync("session-1")
+        corpus_failures = [
+            failure
+            for failure in detail["failures"]
+            if str(failure.get("name") or "").startswith("corpus-")
+        ]
+        self.assertEqual(len(corpus_failures), len(matches))
+        for failure in corpus_failures:
+            self.assertIsNotNone(api._FAILURE_RE.search(failure["result_snippet"]))
+
+        session_list = api._list_sessions_sync(
+            days=0,
+            query="",
+            sort="failures",
+            failures_only=True,
+            include_archived=False,
+            limit=50,
+            offset=0,
+        )
+        self.assertEqual(
+            session_list["sessions"][0]["failure_count"],
+            len(detail["failures"]),
+        )
+        self.assertEqual(api._overview_sync(0)["totals"]["failures"], len(detail["failures"]))
+        tools = {item["name"]: item for item in api._tools_sync(0)["tools"]}
+        for index, content in enumerate(corpus):
+            self.assertEqual(tools[f"corpus-{index}"]["failures"], int(content in matches))
+
     def test_full_text_search_returns_bounded_snippet(self):
         payload = api._list_sessions_sync(
             days=0,

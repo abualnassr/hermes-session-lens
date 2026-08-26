@@ -56,7 +56,7 @@ MAX_ROUTE_MAPPINGS = 200
 _ERROR_FINISH_REASONS = {"error", "agent_error", "content_filter"}
 _ERROR_EFFECTS = {"blocked", "denied", "error", "failed", "failure"}
 _FAILURE_RE = re.compile(
-    r"(?im)(?:^|[\r\n])\s*(?:error|failed|failure|fatal|traceback|exception)\b"
+    r"(?im)(?:^|[\r\n])\s*(?:error(?!-free\b)|failed|failure|fatal|traceback|exception)\b"
     r"|\bpermission denied\b|\baccess is denied\b|\btimed? out\b"
     r"|\beconnrefused\b|\beaddrinuse\b|\bcommand not found\b"
     r"|\bno such file or directory\b|\bprocess exited with (?:code\s*)?[1-9]\d*\b"
@@ -680,15 +680,66 @@ def _failure_sql(alias: str = "m") -> str:
                 AND (
                     lower(substr(coalesce({alias}.content, ''), 1, 12000)) GLOB '*error*'
                     OR lower(substr(coalesce({alias}.content, ''), 1, 12000)) GLOB '*failed*'
+                    OR lower(substr(coalesce({alias}.content, ''), 1, 12000)) GLOB '*failure*'
+                    OR lower(substr(coalesce({alias}.content, ''), 1, 12000)) GLOB '*fatal*'
                     OR lower(substr(coalesce({alias}.content, ''), 1, 12000)) GLOB '*traceback*'
+                    OR lower(substr(coalesce({alias}.content, ''), 1, 12000)) GLOB '*exception*'
                     OR lower(substr(coalesce({alias}.content, ''), 1, 12000)) GLOB '*permission denied*'
+                    OR lower(substr(coalesce({alias}.content, ''), 1, 12000)) GLOB '*access is denied*'
                     OR lower(substr(coalesce({alias}.content, ''), 1, 12000)) GLOB '*timed out*'
+                    OR lower(substr(coalesce({alias}.content, ''), 1, 12000)) GLOB '*timeout*'
                     OR lower(substr(coalesce({alias}.content, ''), 1, 12000)) GLOB '*econnrefused*'
                     OR lower(substr(coalesce({alias}.content, ''), 1, 12000)) GLOB '*eaddrinuse*'
+                    OR lower(substr(coalesce({alias}.content, ''), 1, 12000)) GLOB '*command not found*'
+                    OR lower(substr(coalesce({alias}.content, ''), 1, 12000)) GLOB '*no such file or directory*'
+                    OR lower(substr(coalesce({alias}.content, ''), 1, 12000)) GLOB '*process exited with*'
+                    OR lower(substr(coalesce({alias}.content, ''), 1, 12000)) GLOB '*exit_code*'
+                    OR lower(substr(coalesce({alias}.content, ''), 1, 12000)) GLOB '*exit code*'
                 )
             )
         )
     """
+
+
+def _confirmed_failure_rows(
+    connection: sqlite3.Connection,
+    session_where_sql: str,
+    params: Iterable[Any] = (),
+) -> List[Dict[str, Any]]:
+    """Return coarse SQL candidates that pass the shared failure predicate."""
+    candidates = connection.execute(
+        f"""
+        SELECT m.id, m.session_id, m.role, m.content, m.tool_name,
+               m.finish_reason, m.effect_disposition, m.timestamp
+        FROM messages m
+        JOIN sessions s ON s.id=m.session_id
+        WHERE coalesce(m.active,1)=1
+          AND ({session_where_sql})
+          AND {_failure_sql('m')}
+        """,
+        tuple(params),
+    ).fetchall()
+    return [
+        material
+        for material in (_row_dict(row) for row in candidates)
+        if _is_failure(
+            role=material.get("role"),
+            content=material.get("content"),
+            finish_reason=material.get("finish_reason"),
+            effect_disposition=material.get("effect_disposition"),
+        )
+    ]
+
+
+def _confirmed_failure_counts(
+    connection: sqlite3.Connection,
+    session_where_sql: str,
+    params: Iterable[Any] = (),
+) -> Dict[str, int]:
+    counts: Counter[str] = Counter()
+    for row in _confirmed_failure_rows(connection, session_where_sql, params):
+        counts[str(row.get("session_id") or "")] += 1
+    return dict(counts)
 
 
 def _fts_query(raw: str) -> str:
@@ -741,8 +792,6 @@ def _list_sessions_sync(
         where = [period_sql, "coalesce(s.hidden, 0) = 0"]
         if not include_archived:
             where.append("coalesce(s.archived, 0) = 0")
-        if failures_only:
-            where.append("coalesce(f.failure_count, 0) > 0")
         if query:
             like = f"%{query.strip().lower()}%"
             text_filters = [
@@ -759,32 +808,12 @@ def _list_sessions_sync(
                 params.extend(snippets.keys())
             where.append("(" + " OR ".join(text_filters) + ")")
 
-        sort_sql = {
-            "recent": "coalesce(s.last_activity_at, s.started_at) DESC",
-            "cost": "coalesce(s.actual_cost_usd, s.estimated_cost_usd, -1) DESC, s.started_at DESC",
-            "tokens": "(coalesce(s.input_tokens,0) + coalesce(s.output_tokens,0) + coalesce(s.cache_read_tokens,0) + coalesce(s.cache_write_tokens,0)) DESC, s.started_at DESC",
-            "tools": "coalesce(s.tool_call_count,0) DESC, s.started_at DESC",
-            "failures": "coalesce(f.failure_count,0) DESC, coalesce(s.last_activity_at,s.started_at) DESC",
-        }.get(sort, "coalesce(f.failure_count,0) DESC, coalesce(s.last_activity_at,s.started_at) DESC")
-
-        failure_sql = _failure_sql("m")
-        cte = f"""
-            WITH failure_counts AS (
-                SELECT m.session_id, COUNT(*) AS failure_count
-                FROM messages m
-                WHERE coalesce(m.active, 1) = 1 AND {failure_sql}
-                GROUP BY m.session_id
-            )
-        """
         from_where = f"""
             FROM sessions s
-            LEFT JOIN failure_counts f ON f.session_id = s.id
             WHERE {' AND '.join(where)}
         """
-        total = db._conn.execute(cte + " SELECT COUNT(*) " + from_where, tuple(params)).fetchone()[0]
         rows = db._conn.execute(
-            cte
-            + """
+            """
             SELECT s.id, s.source, s.display_name, s.model, s.started_at, s.ended_at,
                    s.end_reason, s.parent_session_id,
                    s.message_count, s.tool_call_count, s.input_tokens, s.output_tokens,
@@ -793,15 +822,50 @@ def _list_sessions_sync(
                    s.billing_mode, s.estimated_cost_usd, s.actual_cost_usd,
                    s.cost_status, s.cost_source, s.title, s.last_activity_at,
                    s.last_activity_description, s.api_call_count, s.profile_name,
-                   s.archived, s.pinned, coalesce(f.failure_count, 0) AS failure_count
+                   s.archived, s.pinned
             """
             + from_where
-            + f" ORDER BY {sort_sql} LIMIT ? OFFSET ?",
-            tuple(params + [limit, offset]),
+            ,
+            tuple(params),
         ).fetchall()
-        sessions = []
+        failure_counts = _confirmed_failure_counts(
+            db._conn, " AND ".join(where), params
+        )
+        materials = []
         for row in rows:
-            item = _session_payload(_row_dict(row))
+            material = _row_dict(row)
+            material["failure_count"] = failure_counts.get(str(material.get("id")), 0)
+            if failures_only and not material["failure_count"]:
+                continue
+            materials.append(material)
+
+        def sort_key(material: Mapping[str, Any]) -> Tuple[Any, ...]:
+            started = _number(material.get("started_at"), 0)
+            recent = _number(material.get("last_activity_at"), started)
+            if sort == "recent":
+                return (recent,)
+            if sort == "cost":
+                actual = material.get("actual_cost_usd")
+                estimated = material.get("estimated_cost_usd")
+                cost = actual if actual is not None else (estimated if estimated is not None else -1)
+                return (_number(cost, -1), started)
+            if sort == "tokens":
+                return (
+                    sum(
+                        _integer(material.get(key))
+                        for key in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
+                    ),
+                    started,
+                )
+            if sort == "tools":
+                return (_integer(material.get("tool_call_count")), started)
+            return (_integer(material.get("failure_count")), recent)
+
+        materials.sort(key=sort_key, reverse=True)
+        total = len(materials)
+        sessions = []
+        for material in materials[offset : offset + limit]:
+            item = _session_payload(material)
             item["search_snippet"] = snippets.get(str(item.get("id")))
             sessions.append(item)
         return {
@@ -874,18 +938,16 @@ def _session_detail_sync(session_id: str) -> Dict[str, Any]:
         if not sid:
             raise HTTPException(status_code=404, detail="Session not found")
         row = db._conn.execute(
-            f"""
-            SELECT s.*, (
-                SELECT COUNT(*) FROM messages m
-                WHERE m.session_id = s.id AND coalesce(m.active,1) = 1
-                  AND {_failure_sql('m')}
-            ) AS failure_count
-            FROM sessions s WHERE s.id = ?
-            """,
+            "SELECT s.* FROM sessions s WHERE s.id = ?",
             (sid,),
         ).fetchone()
         if row is None:
             raise HTTPException(status_code=404, detail="Session not found")
+
+        session_material = _row_dict(row)
+        session_material["failure_count"] = _confirmed_failure_counts(
+            db._conn, "s.id = ?", (sid,)
+        ).get(str(sid), 0)
 
         usage_rows = [
             _row_dict(item)
@@ -952,7 +1014,7 @@ def _session_detail_sync(session_id: str) -> Dict[str, Any]:
         ]
 
         return {
-            "session": _session_payload(_row_dict(row)),
+            "session": _session_payload(session_material),
             "models": usage_rows,
             "message_roles": role_counts,
             "tools": analysis["events"],
@@ -1341,9 +1403,6 @@ def _overview_sync(
     joined_period_sql, joined_period_params = _period_sql(
         "s.started_at", period_start, period_end
     )
-    failure_period_sql, failure_period_params = _period_sql(
-        "sx.started_at", period_start, period_end
-    )
     with _database() as db:
         totals_row = db._conn.execute(
             f"""
@@ -1364,16 +1423,20 @@ def _overview_sync(
                    coalesce(SUM(CASE WHEN actual_cost_usd > 0 THEN 1 ELSE 0 END),0) AS actual_cost_sessions,
                    coalesce(SUM(CASE WHEN coalesce(actual_cost_usd,0) <= 0 AND estimated_cost_usd > 0 THEN 1 ELSE 0 END),0) AS estimated_cost_sessions,
                    coalesce(SUM(CASE WHEN lower(coalesce(cost_status,'')) IN ('included','subscription','free') THEN 1 ELSE 0 END),0) AS included_cost_sessions,
-                   coalesce(SUM(CASE WHEN coalesce(actual_cost_usd,0) <= 0 AND coalesce(estimated_cost_usd,0) <= 0 AND lower(coalesce(cost_status,'')) NOT IN ('included','subscription','free') THEN 1 ELSE 0 END),0) AS unpriced_sessions,
-                   (SELECT COUNT(*) FROM messages m
-                    JOIN sessions sx ON sx.id=m.session_id
-                     WHERE {failure_period_sql} AND coalesce(sx.hidden,0)=0 AND {_failure_sql('m')}) AS failures
+                    coalesce(SUM(CASE WHEN coalesce(actual_cost_usd,0) <= 0 AND coalesce(estimated_cost_usd,0) <= 0 AND lower(coalesce(cost_status,'')) NOT IN ('included','subscription','free') THEN 1 ELSE 0 END),0) AS unpriced_sessions
             FROM sessions
             WHERE {session_period_sql} AND coalesce(hidden,0)=0
             """,
-            tuple(failure_period_params + session_period_params),
+            tuple(session_period_params),
         ).fetchone()
         totals = _row_dict(totals_row)
+        totals["failures"] = sum(
+            _confirmed_failure_counts(
+                db._conn,
+                joined_period_sql + " AND coalesce(s.hidden,0)=0",
+                joined_period_params,
+            ).values()
+        )
         totals["total_tokens"] = sum(
             _integer(totals.get(key))
             for key in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
@@ -2274,20 +2337,15 @@ def _ai_models_sync(
                 }
             )
 
-        failure_counts: Dict[str, int] = {}
-        if session_rows:
-            for row in connection.execute(
-                f"""
-                SELECT m.session_id, COUNT(*) AS failures
-                FROM messages m
-                JOIN sessions s ON s.id=m.session_id
-                WHERE {period_sql} AND coalesce(s.hidden,0)=0
-                  AND coalesce(m.active,1)=1 AND {_failure_sql('m')}
-                GROUP BY m.session_id
-                """,
-                tuple(period_params),
-            ).fetchall():
-                failure_counts[str(row["session_id"])] = _integer(row["failures"])
+        failure_counts = (
+            _confirmed_failure_counts(
+                connection,
+                period_sql + " AND coalesce(s.hidden,0)=0",
+                period_params,
+            )
+            if session_rows
+            else {}
+        )
 
         message_rows_by_session: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
         tool_failure_rows: List[Dict[str, Any]] = []
@@ -2985,8 +3043,8 @@ def _tools_sync(
         # Match Hermes Insights' double-count protection: calls may be
         # represented on both the assistant envelope and the tool-result row,
         # so take the higher count per tool rather than summing both sources.
-        # Parsing only the compact JSON envelope is cheap; result bodies never
-        # leave SQLite for this aggregate view.
+        # Parsing only the compact JSON envelope is cheap; only coarse failure
+        # candidates bring bounded result bodies into Python for confirmation.
         assistant_rows = db._conn.execute(
             f"""
             SELECT m.session_id, m.tool_calls, m.timestamp
@@ -3012,11 +3070,9 @@ def _tools_sync(
                 if timestamp and (not entry["last_used_at"] or timestamp > entry["last_used_at"]):
                     entry["last_used_at"] = timestamp
 
-        failure_sql = _failure_sql("m")
         result_rows = db._conn.execute(
             f"""
             SELECT m.tool_name AS name, COUNT(*) AS calls,
-                   SUM(CASE WHEN {failure_sql} THEN 1 ELSE 0 END) AS failures,
                    COUNT(DISTINCT m.session_id) AS sessions,
                    MAX(m.timestamp) AS last_used_at
             FROM messages m
@@ -3029,6 +3085,15 @@ def _tools_sync(
             tuple(period_params),
         ).fetchall()
         results = {row["name"]: _row_dict(row) for row in result_rows}
+        failures_by_tool: Counter[str] = Counter()
+        for failure in _confirmed_failure_rows(
+            db._conn,
+            period_sql + " AND coalesce(s.hidden,0)=0",
+            period_params,
+        ):
+            tool_name = str(failure.get("tool_name") or "").strip()
+            if tool_name:
+                failures_by_tool[tool_name] += 1
 
         tools = []
         for name in set(assistant) | set(results):
@@ -3038,7 +3103,7 @@ def _tools_sync(
                 _integer(assistant_entry.get("calls")),
                 _integer(result_entry.get("calls")),
             )
-            failures = _integer(result_entry.get("failures"))
+            failures = failures_by_tool.get(name, 0)
             assistant_sessions = len(assistant_entry.get("sessions", set()))
             result_sessions = _integer(result_entry.get("sessions"))
             last_used_at = max(

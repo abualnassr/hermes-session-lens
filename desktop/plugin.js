@@ -816,7 +816,7 @@ function FailureInspector({ failures, detectedTotal = 0 }) {
     children: [
       jsx('div', {
         style: { background: color.dangerSoft, borderBottom: border, color: color.danger, fontSize: '0.6875rem', lineHeight: 1.5, padding: '0.65rem 1rem' },
-        children: `${formatCount(failures.length)} shown of ${formatCount(detectedTotal || failures.length)} detected failed call${detectedTotal === 1 ? '' : 's'}. Review the recorded result before drawing conclusions.`
+        children: `${formatCount(failures.length)} shown in the bounded event scan; ${formatCount(detectedTotal || failures.length)} confirmed failure${detectedTotal === 1 ? '' : 's'} in the full session. Review the recorded result before drawing conclusions.`
       }),
       jsx(ToolEvents, { events: failures })
     ]
