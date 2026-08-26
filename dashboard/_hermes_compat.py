@@ -1,0 +1,114 @@
+"""Compatibility boundary for Hermes private and version-sensitive APIs."""
+
+from __future__ import annotations
+
+import hashlib
+import os
+from contextlib import contextmanager
+from pathlib import Path
+from typing import Any, Dict, Iterator, Optional, Tuple
+
+try:
+    from hermes_constants import get_hermes_home
+    from hermes_state import SessionDB
+except ImportError:  # pragma: no cover
+    get_hermes_home = None  # type: ignore[assignment]
+    SessionDB = None  # type: ignore[assignment,misc]
+
+_CAPABILITIES: Dict[str, str] = {
+    "database": "available" if SessionDB is not None else "unavailable",
+    "hermes_home": "available" if get_hermes_home is not None else "fallback",
+    "key_resolution": "unknown",
+    "provider_state": "unknown",
+}
+
+
+def _hermes_home() -> Path:
+    if get_hermes_home is not None:
+        try:
+            return Path(get_hermes_home())
+        except Exception:
+            _CAPABILITIES["hermes_home"] = "fallback"
+    configured = os.environ.get("HERMES_HOME")
+    if configured:
+        return Path(configured)
+    return Path(os.environ.get("LOCALAPPDATA", Path.home())) / "hermes"
+
+
+@contextmanager
+def _database(db_path: Optional[Path] = None) -> Iterator[Any]:
+    if SessionDB is None:
+        _CAPABILITIES["database"] = "unavailable"
+        raise RuntimeError("Hermes SessionDB is unavailable in this process")
+    db = SessionDB(db_path=db_path, read_only=True) if db_path else SessionDB(read_only=True)
+    try:
+        yield db
+    finally:
+        db.close()
+
+
+def _db_connection(db: Any) -> Any:
+    connection = getattr(db, "_conn", None)
+    if connection is None:
+        _CAPABILITIES["database"] = "degraded"
+        raise RuntimeError("This Hermes version does not expose the session connection")
+    return connection
+
+
+def _resolve_hermes_api_key(provider_id: str) -> Tuple[str, str]:
+    """Resolve a configured provider key without triggering inference probes."""
+    try:
+        from hermes_cli import auth as hermes_auth
+
+        pconfig = hermes_auth.PROVIDER_REGISTRY.get(provider_id)
+        secret_resolver = getattr(hermes_auth, "_resolve_api_key_provider_secret", None)
+        if pconfig is None or not callable(secret_resolver):
+            _CAPABILITIES["key_resolution"] = "unavailable"
+            raise RuntimeError("This Hermes version does not expose safe API-key resolution.")
+        token, _source = secret_resolver(provider_id, pconfig)
+        status = hermes_auth.get_api_key_provider_status(provider_id)
+        base_url = str(status.get("base_url") or pconfig.inference_base_url or "").strip().rstrip("/")
+        _CAPABILITIES["key_resolution"] = "available"
+
+        if provider_id == "zai" and token:
+            try:
+                load_auth_store = getattr(hermes_auth, "_load_auth_store", None)
+                load_provider_state = getattr(hermes_auth, "_load_provider_state", None)
+                if not callable(load_auth_store) or not callable(load_provider_state):
+                    _CAPABILITIES["provider_state"] = "unavailable"
+                else:
+                    auth_store = load_auth_store()
+                    state = load_provider_state(auth_store, "zai") or {}
+                    detected = state.get("detected_endpoint") or {}
+                    expected_hash = hashlib.sha256(str(token).encode()).hexdigest()[:16]
+                    if detected.get("key_hash") == expected_hash and detected.get("base_url"):
+                        base_url = str(detected["base_url"]).strip().rstrip("/")
+                    _CAPABILITIES["provider_state"] = "available"
+            except Exception:
+                _CAPABILITIES["provider_state"] = "degraded"
+        return str(token or "").strip(), base_url
+    except RuntimeError:
+        raise
+    except Exception as error:
+        _CAPABILITIES["key_resolution"] = "unavailable"
+        raise RuntimeError("Hermes API-key resolution is unavailable") from error
+
+
+def _resolve_anthropic_oauth() -> Tuple[str, bool]:
+    try:
+        from agent import anthropic_adapter
+
+        token = str(anthropic_adapter.resolve_anthropic_token() or "").strip()
+        token_check = getattr(anthropic_adapter, "_is_oauth_token", None)
+        if not callable(token_check):
+            return token, False
+        return token, bool(token_check(token))
+    except Exception:
+        return "", False
+
+
+def _compat_capabilities() -> Dict[str, str]:
+    return dict(_CAPABILITIES)
+
+
+__all__ = [name for name in globals() if not name.startswith("__")]

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import importlib.util
 import json
 import os
 import sqlite3
@@ -13,11 +12,10 @@ from types import SimpleNamespace
 from unittest.mock import Mock, patch
 
 
-MODULE_PATH = Path(__file__).resolve().parents[1] / "dashboard" / "plugin_api.py"
-SPEC = importlib.util.spec_from_file_location("session_lens_test_api", MODULE_PATH)
-api = importlib.util.module_from_spec(SPEC)
-assert SPEC.loader is not None
-SPEC.loader.exec_module(api)
+MODULE_PATH = Path(__file__).resolve().parents[1] / "dashboard" / "_routes.py"
+from dashboard import _classify as classify
+from dashboard import _hermes_compat as hermes_compat
+from dashboard import _routes as api
 
 
 def tool_rows(name: str, arguments: dict | None = None, result: str = "Done!"):
@@ -355,11 +353,11 @@ class SessionLensApiTests(unittest.TestCase):
         kanban.close()
 
         FakeSessionDB.path = self.db_path
-        self.original_session_db = api.SessionDB
-        api.SessionDB = FakeSessionDB
+        self.original_session_db = hermes_compat.SessionDB
+        hermes_compat.SessionDB = FakeSessionDB
 
     def tearDown(self):
-        api.SessionDB = self.original_session_db
+        hermes_compat.SessionDB = self.original_session_db
         api._log_file_cache.clear()
         api._ai_usage_cache = None
         api._ai_usage_last_success.clear()
@@ -492,6 +490,7 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertEqual(system["privacy"]["mutation_endpoints"], 0)
         self.assertFalse(system["privacy"]["provider_credentials_returned_to_desktop"])
         self.assertEqual(system["database"]["schema_version"], 26)
+        self.assertIn(system["capabilities"]["key_resolution"], {"unknown", "available", "unavailable"})
 
     def test_account_usage_snapshot_is_normalised_and_secret_redacted(self):
         snapshot = SimpleNamespace(
@@ -941,7 +940,7 @@ class SessionLensApiTests(unittest.TestCase):
     def test_ai_models_cache_avoids_reclassifying_unchanged_history(self):
         api._ai_models_cache.clear()
         api._session_classification_cache.clear()
-        with patch.object(api, "_session_task_type", wraps=api._session_task_type) as classifier:
+        with patch.object(classify, "_session_task_type", wraps=classify._session_task_type) as classifier:
             first = api._ai_models_sync(0)
             first_call_count = classifier.call_count
             second = api._ai_models_sync(0)

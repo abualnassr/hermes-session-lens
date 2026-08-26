@@ -68,6 +68,10 @@ const pageTabs = [
   { id: 'ai-models', label: 'AI Models', codicon: 'symbol-enum' }
 ]
 
+// ============================================================================
+// SHARED FOUNDATION
+// ============================================================================
+
 function apiPath(path, params = {}) {
   const query = Object.entries(params)
     .filter(([, value]) => value !== undefined && value !== null && value !== '')
@@ -428,6 +432,10 @@ function OutcomePill({ session }) {
     })
   })
 }
+
+// ============================================================================
+// SESSIONS
+// ============================================================================
 
 function SessionRow({ session, selected, onSelect }) {
   return jsx('button', {
@@ -1327,6 +1335,10 @@ function useDebounced(value, delay) {
   return debounced
 }
 
+// ============================================================================
+// OVERVIEW AND OPERATIONS
+// ============================================================================
+
 function DailyBars({ rows }) {
   if (!rows?.length) return jsx(EmptyState, { title: 'No daily activity', description: 'No sessions were recorded in this period.' })
   const max = Math.max(...rows.map(row => Number(row.total_tokens) || 0), 1)
@@ -1723,6 +1735,10 @@ const usageProviderIcons = {
   zai: 'pulse'
 }
 
+// ============================================================================
+// AI USAGE
+// ============================================================================
+
 function usageStatus(provider) {
   const status = provider?.status || 'unavailable'
   if (status === 'ok') return { label: 'Connected', tone: 'accent', icon: 'pass' }
@@ -1989,6 +2005,288 @@ function AIUsageView({ query, narrow, refreshError }) {
     })
   })
 }
+
+// ============================================================================
+// SYSTEM
+// ============================================================================
+
+function DefinitionList({ rows }) {
+  return jsx('dl', {
+    style: { borderTop: border, margin: 0 },
+    children: rows.flatMap(([term, description]) => [
+      jsx('dt', {
+        style: { borderBottom: border, color: color.tertiary, fontSize: '0.6875rem', fontWeight: 600, padding: '0.65rem 0.75rem' },
+        children: term
+      }, `${term}-term`),
+      jsx('dd', {
+        style: { ...tabular, borderBottom: border, color: color.primary, fontSize: '0.75rem', margin: 0, overflowWrap: 'anywhere', padding: '0.65rem 0.75rem' },
+        children: description
+      }, `${term}-value`)
+    ])
+  })
+}
+
+function SystemView({ ctx }) {
+  const query = useQuery({
+    queryKey: [PLUGIN_ID, 'system'],
+    queryFn: () => ctx.rest('/system'),
+    refetchInterval: 60_000
+  })
+  if (query.isLoading) return jsx(LoadingBlock, { rows: 8 })
+  if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'System information unavailable' })
+  const data = query.data
+  const db = data.database
+  return jsx('div', {
+    style: { flex: 1, minHeight: 0, overflow: 'auto', padding: '1rem' },
+    children: jsxs('div', {
+      style: { display: 'grid', gap: '1.5rem', margin: '0 auto', maxWidth: '68rem' },
+      children: [
+        jsxs('section', {
+          children: [
+            jsx(SectionHeading, {
+              title: 'Data source',
+              description: 'The active profile database opened through Hermes in query-only mode.'
+            }),
+            jsx(DefinitionList, {
+              rows: [
+                ['Status', db.available && db.read_only ? 'Available · read-only' : 'Check configuration'],
+                ['Schema', `v${db.schema_version}`],
+                ['Database', db.path],
+                ['Size', `${formatCount(db.size_bytes)} bytes · WAL ${formatCount(db.wal_size_bytes)} bytes`],
+                ['Last modified', formatDate(db.last_modified_at)],
+                ['Search', `${db.fts_enabled ? 'FTS enabled' : 'FTS unavailable'} · ${db.trigram_fts_enabled ? 'trigram enabled' : 'trigram unavailable'}`]
+              ]
+            })
+          ]
+        }),
+        jsxs('section', {
+          children: [
+            jsx(SectionHeading, { title: 'Store counts', description: 'Raw rows in the active Hermes profile.' }),
+            jsx(DefinitionList, {
+              rows: [
+                ['Sessions', formatCount(data.counts.sessions)],
+                ['Messages', formatCount(data.counts.messages)],
+                ['Model usage rows', formatCount(data.counts.model_usage_rows)],
+                ['Delegations', formatCount(data.counts.delegations)]
+              ]
+            })
+          ]
+        }),
+        jsxs('section', {
+          children: [
+            jsx(SectionHeading, { title: 'Privacy posture', description: 'Design constraints enforced by the backend.' }),
+            jsx(DefinitionList, {
+              rows: [
+                ['Network upload', data.privacy.network_upload ? 'Enabled' : 'None'],
+                ['Provider usage checks', data.privacy.provider_usage_requests ? 'Direct to configured providers' : 'Disabled'],
+                ['Credentials in desktop UI', data.privacy.provider_credentials_returned_to_desktop ? 'Review required' : 'Never returned'],
+                ['Mutation endpoints', String(data.privacy.mutation_endpoints)],
+                ['Snippets', data.privacy.snippets_redacted_and_bounded ? 'Redacted and bounded' : 'Review required'],
+                ['Connection', data.privacy.database_connection],
+                ['Plugin version', data.plugin.version]
+              ]
+            })
+          ]
+        })
+      ]
+    })
+  })
+}
+
+// ============================================================================
+// APPLICATION SHELL
+// ============================================================================
+
+function SessionLensPage({ ctx }) {
+  const viewport = useValue(host.state.viewport)
+  const queryClient = useQueryClient()
+  const [tab, setTab] = useState(() => ctx.storage.get('activeTab', 'sessions'))
+  const [aiManualRefreshing, setAiManualRefreshing] = useState(false)
+  const [aiRefreshError, setAiRefreshError] = useState('')
+  const [daysText, setDaysText] = useState(() => {
+    const stored = String(ctx.storage.get('timeRange', ctx.storage.get('days', 30)))
+    return timeOptions.some(option => option.id === stored) ? stored : '30'
+  })
+  const [customStart, setCustomStart] = useState(() => normaliseDateInput(ctx.storage.get('customStart'), dateDaysAgo(29)))
+  const [customEnd, setCustomEnd] = useState(() => normaliseDateInput(ctx.storage.get('customEnd'), dateDaysAgo(0)))
+  const period = useMemo(() => periodParams(daysText, customStart, customEnd), [daysText, customStart, customEnd])
+  const overviewQuery = useQuery({
+    queryKey: [PLUGIN_ID, 'overview', period.days, period.start_at, period.end_at],
+    queryFn: () => ctx.rest(apiPath('/overview', period)),
+    refetchInterval: 60_000
+  })
+  const aiUsageQuery = useQuery({
+    queryKey: [PLUGIN_ID, 'ai-usage'],
+    queryFn: () => ctx.rest('/ai-usage'),
+    enabled: tab === 'ai-usage' || tab === 'ai-models',
+    refetchInterval: tab === 'ai-usage' || tab === 'ai-models' ? 300_000 : false
+  })
+  const aiModelsQuery = useQuery({
+    queryKey: [PLUGIN_ID, 'ai-models', period.days, period.start_at, period.end_at],
+    queryFn: () => ctx.rest(apiPath('/ai-models', period)),
+    enabled: tab === 'ai-models',
+    refetchInterval: tab === 'ai-models' ? 300_000 : false
+  })
+
+  useEffect(() => ctx.storage.set('activeTab', tab), [ctx, tab])
+  useEffect(() => {
+    ctx.storage.set('timeRange', daysText)
+    if (daysText !== 'custom') ctx.storage.set('days', Number(daysText) || 0)
+  }, [ctx, daysText])
+  useEffect(() => ctx.storage.set('customStart', customStart), [ctx, customStart])
+  useEffect(() => ctx.storage.set('customEnd', customEnd), [ctx, customEnd])
+
+  const refresh = async () => {
+    if (tab !== 'ai-usage' && tab !== 'ai-models') {
+      queryClient.invalidateQueries({ queryKey: [PLUGIN_ID] })
+      return
+    }
+    setAiManualRefreshing(true)
+    setAiRefreshError('')
+    const refreshErrors = []
+    if (tab === 'ai-models') {
+      try {
+        const data = await ctx.rest(apiPath('/ai-models', { ...period, fresh: true }))
+        queryClient.setQueryData(
+          [PLUGIN_ID, 'ai-models', period.days, period.start_at, period.end_at],
+          data
+        )
+      } catch (error) {
+        refreshErrors.push(`Model analytics: ${error?.message || String(error || 'refresh failed')}`)
+      }
+    }
+    try {
+      const data = await ctx.rest('/ai-usage?fresh=true')
+      queryClient.setQueryData([PLUGIN_ID, 'ai-usage'], data)
+    } catch (error) {
+      refreshErrors.push(`OAuth quotas: ${error?.message || String(error || 'the backend did not return data')}`)
+    } finally {
+      if (refreshErrors.length) setAiRefreshError(refreshErrors.join(' · '))
+      setAiManualRefreshing(false)
+    }
+  }
+  const updateCustomStart = value => {
+    if (!value) return
+    setCustomStart(value)
+    if (value > customEnd) setCustomEnd(value)
+  }
+  const updateCustomEnd = value => {
+    if (!value) return
+    setCustomEnd(value)
+    if (value < customStart) setCustomStart(value)
+  }
+  let content = jsx(SessionsView, { ctx, period, narrow: Boolean(viewport?.narrow) })
+  if (tab === 'overview') content = jsx(OverviewView, { query: overviewQuery })
+  if (tab === 'operations') content = jsx(OperationsView, { ctx, period })
+  if (tab === 'tools') content = jsx(ToolsView, { ctx, period })
+  if (tab === 'skills') content = jsx(SkillsViewPanel, { ctx, period })
+  if (tab === 'system') content = jsx(SystemView, { ctx })
+  if (tab === 'ai-usage') content = jsx(AIUsageView, {
+    query: aiUsageQuery,
+    narrow: Boolean(viewport?.narrow),
+    refreshError: aiRefreshError
+  })
+  if (tab === 'ai-models') content = jsx(AIModelsView, {
+    query: aiModelsQuery,
+    quotaQuery: aiUsageQuery,
+    narrow: Boolean(viewport?.narrow),
+    refreshError: aiRefreshError
+  })
+
+  return jsxs('div', {
+    style: { color: color.primary, display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, minWidth: 0 },
+    children: [
+      jsxs('header', {
+        style: { alignItems: 'center', display: 'flex', flexWrap: 'wrap', gap: '0.75rem 1rem', justifyContent: 'space-between', padding: '0.75rem 1rem' },
+        children: [
+          jsxs('div', {
+            style: { minWidth: 0 },
+            children: [
+              jsx('h1', {
+                style: { fontSize: '1.0625rem', fontWeight: 680, letterSpacing: '-0.015em', lineHeight: 1.3, margin: 0 },
+                children: 'Session Lens'
+              }),
+              jsx('p', {
+                style: { color: color.tertiary, fontSize: '0.6875rem', lineHeight: 1.4, margin: '0.12rem 0 0' },
+                children: 'Session evidence, account usage, runtime health, and work orchestration—grounded in Hermes records.'
+              })
+            ]
+          }),
+          jsxs('div', {
+            style: { alignItems: 'center', display: 'flex', flex: '1 1 auto', flexWrap: 'wrap', gap: '0.5rem', justifyContent: 'flex-end' },
+            children: [
+              tab === 'ai-usage'
+                ? jsx(Pill, {
+                    tone: 'accent',
+                    children: jsxs(Fragment, { children: [jsx(Codicon, { name: 'pulse', size: '0.65rem' }), 'Live account quotas'] })
+                  })
+                : jsx(SegmentedControl, { options: timeOptions, value: daysText, onChange: setDaysText }),
+              tab !== 'ai-usage' && daysText === 'custom'
+                ? jsxs('div', {
+                    'aria-label': 'Custom date range',
+                    style: { alignItems: 'center', display: 'flex', flexWrap: 'wrap', gap: '0.45rem' },
+                    children: [
+                      jsx(DateField, { label: 'Start', value: customStart, max: customEnd, onChange: updateCustomStart }),
+                      jsx(DateField, { label: 'End', value: customEnd, min: customStart, onChange: updateCustomEnd })
+                    ]
+                  })
+                : null,
+              jsx(Button, {
+                variant: 'outline',
+                size: 'icon-xs',
+                onClick: refresh,
+                'aria-label': 'Refresh Session Lens',
+                title: 'Refresh Session Lens',
+                disabled: aiManualRefreshing,
+                children: jsx(Codicon, {
+                  name: (tab === 'ai-usage' || tab === 'ai-models'
+                    ? aiManualRefreshing || aiUsageQuery.isFetching || (tab === 'ai-models' && aiModelsQuery.isFetching)
+                    : overviewQuery.isFetching) ? 'sync~spin' : 'refresh'
+                })
+              })
+            ]
+          })
+        ]
+      }),
+      tab === 'ai-usage'
+        ? jsx(AIUsageStatStrip, { data: aiUsageQuery.data })
+        : tab === 'ai-models'
+          ? jsx(AIModelsStatStrip, { data: aiModelsQuery.data })
+          : jsx(StatStrip, { overview: overviewQuery.data }),
+      jsx('nav', {
+        'aria-label': 'Session Lens views',
+        style: { borderBottom: border, display: 'flex', overflowX: 'auto', padding: '0 0.65rem' },
+        children: pageTabs.map(item =>
+          jsx('button', {
+            type: 'button',
+            onClick: () => setTab(item.id),
+            'aria-current': tab === item.id ? 'page' : undefined,
+            style: {
+              alignItems: 'center',
+              background: 'transparent',
+              border: 'none',
+              borderBottom: tab === item.id ? `2px solid ${color.accent}` : '2px solid transparent',
+              color: tab === item.id ? color.primary : color.tertiary,
+              cursor: 'pointer',
+              display: 'inline-flex',
+              fontSize: '0.75rem',
+              fontWeight: tab === item.id ? 650 : 500,
+              gap: '0.35rem',
+              padding: '0.62rem 0.7rem',
+              whiteSpace: 'nowrap'
+            },
+            children: jsxs(Fragment, { children: [jsx(Codicon, { name: item.codicon, size: '0.75rem' }), item.label] })
+          }, item.id)
+        )
+      }),
+      jsx('div', { style: { display: 'flex', flex: 1, minHeight: 0, overflow: 'hidden' }, children: content })
+    ]
+  })
+}
+
+// ============================================================================
+// AI MODELS
+// ============================================================================
 
 function formatModelCost(model) {
   if (model.cost_kind === 'subscription') return 'sub.'
@@ -2624,276 +2922,6 @@ function AIModelsView({ query, quotaQuery, narrow, refreshError }) {
         })
       ]
     })
-  })
-}
-
-function DefinitionList({ rows }) {
-  return jsx('dl', {
-    style: { borderTop: border, margin: 0 },
-    children: rows.flatMap(([term, description]) => [
-      jsx('dt', {
-        style: { borderBottom: border, color: color.tertiary, fontSize: '0.6875rem', fontWeight: 600, padding: '0.65rem 0.75rem' },
-        children: term
-      }, `${term}-term`),
-      jsx('dd', {
-        style: { ...tabular, borderBottom: border, color: color.primary, fontSize: '0.75rem', margin: 0, overflowWrap: 'anywhere', padding: '0.65rem 0.75rem' },
-        children: description
-      }, `${term}-value`)
-    ])
-  })
-}
-
-function SystemView({ ctx }) {
-  const query = useQuery({
-    queryKey: [PLUGIN_ID, 'system'],
-    queryFn: () => ctx.rest('/system'),
-    refetchInterval: 60_000
-  })
-  if (query.isLoading) return jsx(LoadingBlock, { rows: 8 })
-  if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'System information unavailable' })
-  const data = query.data
-  const db = data.database
-  return jsx('div', {
-    style: { flex: 1, minHeight: 0, overflow: 'auto', padding: '1rem' },
-    children: jsxs('div', {
-      style: { display: 'grid', gap: '1.5rem', margin: '0 auto', maxWidth: '68rem' },
-      children: [
-        jsxs('section', {
-          children: [
-            jsx(SectionHeading, {
-              title: 'Data source',
-              description: 'The active profile database opened through Hermes in query-only mode.'
-            }),
-            jsx(DefinitionList, {
-              rows: [
-                ['Status', db.available && db.read_only ? 'Available · read-only' : 'Check configuration'],
-                ['Schema', `v${db.schema_version}`],
-                ['Database', db.path],
-                ['Size', `${formatCount(db.size_bytes)} bytes · WAL ${formatCount(db.wal_size_bytes)} bytes`],
-                ['Last modified', formatDate(db.last_modified_at)],
-                ['Search', `${db.fts_enabled ? 'FTS enabled' : 'FTS unavailable'} · ${db.trigram_fts_enabled ? 'trigram enabled' : 'trigram unavailable'}`]
-              ]
-            })
-          ]
-        }),
-        jsxs('section', {
-          children: [
-            jsx(SectionHeading, { title: 'Store counts', description: 'Raw rows in the active Hermes profile.' }),
-            jsx(DefinitionList, {
-              rows: [
-                ['Sessions', formatCount(data.counts.sessions)],
-                ['Messages', formatCount(data.counts.messages)],
-                ['Model usage rows', formatCount(data.counts.model_usage_rows)],
-                ['Delegations', formatCount(data.counts.delegations)]
-              ]
-            })
-          ]
-        }),
-        jsxs('section', {
-          children: [
-            jsx(SectionHeading, { title: 'Privacy posture', description: 'Design constraints enforced by the backend.' }),
-            jsx(DefinitionList, {
-              rows: [
-                ['Network upload', data.privacy.network_upload ? 'Enabled' : 'None'],
-                ['Provider usage checks', data.privacy.provider_usage_requests ? 'Direct to configured providers' : 'Disabled'],
-                ['Credentials in desktop UI', data.privacy.provider_credentials_returned_to_desktop ? 'Review required' : 'Never returned'],
-                ['Mutation endpoints', String(data.privacy.mutation_endpoints)],
-                ['Snippets', data.privacy.snippets_redacted_and_bounded ? 'Redacted and bounded' : 'Review required'],
-                ['Connection', data.privacy.database_connection],
-                ['Plugin version', data.plugin.version]
-              ]
-            })
-          ]
-        })
-      ]
-    })
-  })
-}
-
-function SessionLensPage({ ctx }) {
-  const viewport = useValue(host.state.viewport)
-  const queryClient = useQueryClient()
-  const [tab, setTab] = useState(() => ctx.storage.get('activeTab', 'sessions'))
-  const [aiManualRefreshing, setAiManualRefreshing] = useState(false)
-  const [aiRefreshError, setAiRefreshError] = useState('')
-  const [daysText, setDaysText] = useState(() => {
-    const stored = String(ctx.storage.get('timeRange', ctx.storage.get('days', 30)))
-    return timeOptions.some(option => option.id === stored) ? stored : '30'
-  })
-  const [customStart, setCustomStart] = useState(() => normaliseDateInput(ctx.storage.get('customStart'), dateDaysAgo(29)))
-  const [customEnd, setCustomEnd] = useState(() => normaliseDateInput(ctx.storage.get('customEnd'), dateDaysAgo(0)))
-  const period = useMemo(() => periodParams(daysText, customStart, customEnd), [daysText, customStart, customEnd])
-  const overviewQuery = useQuery({
-    queryKey: [PLUGIN_ID, 'overview', period.days, period.start_at, period.end_at],
-    queryFn: () => ctx.rest(apiPath('/overview', period)),
-    refetchInterval: 60_000
-  })
-  const aiUsageQuery = useQuery({
-    queryKey: [PLUGIN_ID, 'ai-usage'],
-    queryFn: () => ctx.rest('/ai-usage'),
-    enabled: tab === 'ai-usage' || tab === 'ai-models',
-    refetchInterval: tab === 'ai-usage' || tab === 'ai-models' ? 300_000 : false
-  })
-  const aiModelsQuery = useQuery({
-    queryKey: [PLUGIN_ID, 'ai-models', period.days, period.start_at, period.end_at],
-    queryFn: () => ctx.rest(apiPath('/ai-models', period)),
-    enabled: tab === 'ai-models',
-    refetchInterval: tab === 'ai-models' ? 300_000 : false
-  })
-
-  useEffect(() => ctx.storage.set('activeTab', tab), [ctx, tab])
-  useEffect(() => {
-    ctx.storage.set('timeRange', daysText)
-    if (daysText !== 'custom') ctx.storage.set('days', Number(daysText) || 0)
-  }, [ctx, daysText])
-  useEffect(() => ctx.storage.set('customStart', customStart), [ctx, customStart])
-  useEffect(() => ctx.storage.set('customEnd', customEnd), [ctx, customEnd])
-
-  const refresh = async () => {
-    if (tab !== 'ai-usage' && tab !== 'ai-models') {
-      queryClient.invalidateQueries({ queryKey: [PLUGIN_ID] })
-      return
-    }
-    setAiManualRefreshing(true)
-    setAiRefreshError('')
-    const refreshErrors = []
-    if (tab === 'ai-models') {
-      try {
-        const data = await ctx.rest(apiPath('/ai-models', { ...period, fresh: true }))
-        queryClient.setQueryData(
-          [PLUGIN_ID, 'ai-models', period.days, period.start_at, period.end_at],
-          data
-        )
-      } catch (error) {
-        refreshErrors.push(`Model analytics: ${error?.message || String(error || 'refresh failed')}`)
-      }
-    }
-    try {
-      const data = await ctx.rest('/ai-usage?fresh=true')
-      queryClient.setQueryData([PLUGIN_ID, 'ai-usage'], data)
-    } catch (error) {
-      refreshErrors.push(`OAuth quotas: ${error?.message || String(error || 'the backend did not return data')}`)
-    } finally {
-      if (refreshErrors.length) setAiRefreshError(refreshErrors.join(' · '))
-      setAiManualRefreshing(false)
-    }
-  }
-  const updateCustomStart = value => {
-    if (!value) return
-    setCustomStart(value)
-    if (value > customEnd) setCustomEnd(value)
-  }
-  const updateCustomEnd = value => {
-    if (!value) return
-    setCustomEnd(value)
-    if (value < customStart) setCustomStart(value)
-  }
-  let content = jsx(SessionsView, { ctx, period, narrow: Boolean(viewport?.narrow) })
-  if (tab === 'overview') content = jsx(OverviewView, { query: overviewQuery })
-  if (tab === 'operations') content = jsx(OperationsView, { ctx, period })
-  if (tab === 'tools') content = jsx(ToolsView, { ctx, period })
-  if (tab === 'skills') content = jsx(SkillsViewPanel, { ctx, period })
-  if (tab === 'system') content = jsx(SystemView, { ctx })
-  if (tab === 'ai-usage') content = jsx(AIUsageView, {
-    query: aiUsageQuery,
-    narrow: Boolean(viewport?.narrow),
-    refreshError: aiRefreshError
-  })
-  if (tab === 'ai-models') content = jsx(AIModelsView, {
-    query: aiModelsQuery,
-    quotaQuery: aiUsageQuery,
-    narrow: Boolean(viewport?.narrow),
-    refreshError: aiRefreshError
-  })
-
-  return jsxs('div', {
-    style: { color: color.primary, display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0, minWidth: 0 },
-    children: [
-      jsxs('header', {
-        style: { alignItems: 'center', display: 'flex', flexWrap: 'wrap', gap: '0.75rem 1rem', justifyContent: 'space-between', padding: '0.75rem 1rem' },
-        children: [
-          jsxs('div', {
-            style: { minWidth: 0 },
-            children: [
-              jsx('h1', {
-                style: { fontSize: '1.0625rem', fontWeight: 680, letterSpacing: '-0.015em', lineHeight: 1.3, margin: 0 },
-                children: 'Session Lens'
-              }),
-              jsx('p', {
-                style: { color: color.tertiary, fontSize: '0.6875rem', lineHeight: 1.4, margin: '0.12rem 0 0' },
-                children: 'Session evidence, account usage, runtime health, and work orchestration—grounded in Hermes records.'
-              })
-            ]
-          }),
-          jsxs('div', {
-            style: { alignItems: 'center', display: 'flex', flex: '1 1 auto', flexWrap: 'wrap', gap: '0.5rem', justifyContent: 'flex-end' },
-            children: [
-              tab === 'ai-usage'
-                ? jsx(Pill, {
-                    tone: 'accent',
-                    children: jsxs(Fragment, { children: [jsx(Codicon, { name: 'pulse', size: '0.65rem' }), 'Live account quotas'] })
-                  })
-                : jsx(SegmentedControl, { options: timeOptions, value: daysText, onChange: setDaysText }),
-              tab !== 'ai-usage' && daysText === 'custom'
-                ? jsxs('div', {
-                    'aria-label': 'Custom date range',
-                    style: { alignItems: 'center', display: 'flex', flexWrap: 'wrap', gap: '0.45rem' },
-                    children: [
-                      jsx(DateField, { label: 'Start', value: customStart, max: customEnd, onChange: updateCustomStart }),
-                      jsx(DateField, { label: 'End', value: customEnd, min: customStart, onChange: updateCustomEnd })
-                    ]
-                  })
-                : null,
-              jsx(Button, {
-                variant: 'outline',
-                size: 'icon-xs',
-                onClick: refresh,
-                'aria-label': 'Refresh Session Lens',
-                title: 'Refresh Session Lens',
-                disabled: aiManualRefreshing,
-                children: jsx(Codicon, {
-                  name: (tab === 'ai-usage' || tab === 'ai-models'
-                    ? aiManualRefreshing || aiUsageQuery.isFetching || (tab === 'ai-models' && aiModelsQuery.isFetching)
-                    : overviewQuery.isFetching) ? 'sync~spin' : 'refresh'
-                })
-              })
-            ]
-          })
-        ]
-      }),
-      tab === 'ai-usage'
-        ? jsx(AIUsageStatStrip, { data: aiUsageQuery.data })
-        : tab === 'ai-models'
-          ? jsx(AIModelsStatStrip, { data: aiModelsQuery.data })
-          : jsx(StatStrip, { overview: overviewQuery.data }),
-      jsx('nav', {
-        'aria-label': 'Session Lens views',
-        style: { borderBottom: border, display: 'flex', overflowX: 'auto', padding: '0 0.65rem' },
-        children: pageTabs.map(item =>
-          jsx('button', {
-            type: 'button',
-            onClick: () => setTab(item.id),
-            'aria-current': tab === item.id ? 'page' : undefined,
-            style: {
-              alignItems: 'center',
-              background: 'transparent',
-              border: 'none',
-              borderBottom: tab === item.id ? `2px solid ${color.accent}` : '2px solid transparent',
-              color: tab === item.id ? color.primary : color.tertiary,
-              cursor: 'pointer',
-              display: 'inline-flex',
-              fontSize: '0.75rem',
-              fontWeight: tab === item.id ? 650 : 500,
-              gap: '0.35rem',
-              padding: '0.62rem 0.7rem',
-              whiteSpace: 'nowrap'
-            },
-            children: jsxs(Fragment, { children: [jsx(Codicon, { name: item.codicon, size: '0.75rem' }), item.label] })
-          }, item.id)
-        )
-      }),
-      jsx('div', { style: { display: 'flex', flex: 1, minHeight: 0, overflow: 'hidden' }, children: content })
-    ]
   })
 }
 
