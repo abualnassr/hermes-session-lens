@@ -202,10 +202,18 @@ _FILE_REFERENCE_RE = re.compile(
     r"vue|xls|xlsx|xml|yaml|yml))\b"
 )
 _PATCH_FILE_RE = re.compile(r"(?im)^\*\*\* (?:add|delete|update) file:\s*(?P<path>.+?)\s*$")
-_CODE_COMMAND_RE = re.compile(
-    r"(?i)(?:^|[;&|]\s*|\s)(?:git|gh|pytest|npm|npx|pnpm|yarn|pip|pipx|uv|cargo|"
-    r"go\s+(?:build|test|install|run)|gradle|gradlew|mvn|mvnw|make|cmake|ninja|"
-    r"ruff|eslint|prettier|biome|tsc|jest|vitest|mocha|tox|nox|gdb|lldb)\b"
+_CODE_RUNNER_RE = re.compile(
+    r"(?ix)(?:^|\s)(?:"
+    r"pytest(?:\.exe)?|(?:python\s+-m\s+)?pytest|"
+    r"npm\s+(?:run|test|build|install|ci)|"
+    r"(?:pnpm|yarn)\s+(?:run|test|build|install)|"
+    r"npx\s+(?:tsc|jest|vitest|mocha|eslint|ruff|prettier|biome)|"
+    r"cargo\s+(?:build|test|run|install)|go\s+(?:build|test|install|run)|"
+    r"(?:gradle|gradlew|mvn|mvnw|make|cmake|ninja|tsc|jest|vitest|mocha|tox|nox)\b|"
+    r"(?:pip|pipx|uv)\s+(?:install|sync|run)|"
+    r"(?:ruff|eslint)\b[^\r\n;&|]*--fix\b|"
+    r"(?:prettier|biome)\b[^\r\n;&|]*(?:--write|--fix)\b"
+    r")"
 )
 _WORKER_COMMAND_RE = re.compile(
     r"(?i)(?:^|[;&|]\s*)(?:(?:npx\s+)?(?:claude(?:\s+code)?|codex(?:\.exe)?|openhands))\b"
@@ -1854,6 +1862,54 @@ def _is_orchestration_call(call: Mapping[str, Any]) -> bool:
     return bool(command and _WORKER_COMMAND_RE.search(command))
 
 
+def _is_mutating_git_command(segment: str) -> bool:
+    match = re.search(r"(?i)\b(?P<tool>git|gh)(?:\.exe)?\b\s+(?P<args>.+)", segment)
+    if not match:
+        return False
+    tool = match.group("tool").lower()
+    tokens = re.findall(r'''"[^"]*"|'[^']*'|[^\s]+''', match.group("args"))
+    tokens = [token.strip("\"'").lower() for token in tokens]
+    while tokens and tokens[0].startswith("-"):
+        option = tokens.pop(0)
+        if option in {"-c", "--git-dir", "--work-tree", "--namespace"} and tokens:
+            tokens.pop(0)
+    if not tokens:
+        return False
+    if tool == "gh" and tokens[0] in {"pr", "repo", "release"}:
+        tokens.pop(0)
+    if not tokens:
+        return False
+    subcommand = tokens[0]
+    if subcommand in {
+        "apply",
+        "cherry-pick",
+        "commit",
+        "merge",
+        "push",
+        "rebase",
+        "revert",
+    }:
+        return True
+    if subcommand == "stash":
+        return len(tokens) > 1 and tokens[1] in {"apply", "pop"}
+    if subcommand == "tag":
+        arguments = tokens[1:]
+        if not arguments or any(item in {"-l", "--list", "-n"} for item in arguments):
+            return False
+        return any(not item.startswith("-") for item in arguments) or any(
+            item in {"-a", "-d", "-f", "-s"} for item in arguments
+        )
+    return False
+
+
+def _is_code_mutating_command(command: Any) -> bool:
+    text = str(command or "")
+    for segment in re.split(r"(?:&&|\|\||[;&|])", text):
+        if _is_mutating_git_command(segment) or _CODE_RUNNER_RE.search(segment):
+            return True
+    return False
+
+
 def _is_coding_call(call: Mapping[str, Any]) -> bool:
     name = str(call.get("name") or "").lower()
     extra_text = call.get("result_content") if _is_git_commit_call(call) else None
@@ -1870,12 +1926,14 @@ def _is_coding_call(call: Mapping[str, Any]) -> bool:
         for marker in ("commit", "create", "delete", "edit", "merge", "mutate", "patch", "push", "update")
     ):
         return True
-    if any(marker in name for marker in ("exec_command", "execute_code", "terminal", "shell")):
+    if "execute_code" in name:
+        return True
+    if any(marker in name for marker in ("exec_command", "terminal", "shell")):
         arguments = call.get("arguments") if isinstance(call.get("arguments"), Mapping) else {}
         command = str(arguments.get("command") or arguments.get("code") or "")
         if _is_git_commit_call(call) and path_kinds and path_kinds <= {"Writing", None}:
             return False
-        return bool(_CODE_COMMAND_RE.search(command))
+        return _is_code_mutating_command(command)
     return False
 
 
@@ -2901,7 +2959,7 @@ def _ai_models_payload_sync(
                 len(accepted_task_sessions) / len(eligible_sessions) if eligible_sessions else None
             )
             if task["task_type"] == "Coding":
-                task["acceptance_basis"] = "resolved session with a recorded successful code-shaped save or commit"
+                task["acceptance_basis"] = "resolved session with a recorded successful code artifact save or commit"
             elif task["task_type"] == "Writing":
                 task["acceptance_basis"] = "resolved session with a recorded successful non-code artifact write"
             elif task["task_type"] in {"General", "Analysis"}:
@@ -3059,11 +3117,11 @@ def _ai_models_payload_sync(
             "model_source": "all-time distinct model IDs from Hermes session_model_usage with session-row fallback; metrics honor the selected period",
             "task_types": (
                 "Session Lens classifies each session once as Orchestration, Coding, Writing, Analysis, or General, in that order, "
-                "from recorded tool calls, arguments, code-shaped commands, and artifact paths; sources are not task types and auxiliary jobs are separate"
+                "from recorded tool calls, arguments, code-mutating commands, and artifact paths; sources are not task types and auxiliary jobs are separate"
             ),
             "first_attempt_acceptance": (
                 "General and Analysis use the eligible-closed-session proxy; Coding requires a resolved session plus a recorded successful "
-                "code-shaped save or commit; Writing requires a resolved session plus a recorded successful non-code artifact write; "
+                "code artifact save or commit; Writing requires a resolved session plus a recorded successful non-code artifact write; "
                 "Orchestration and auxiliary jobs are unavailable"
             ),
             "retry_switch": (

@@ -782,6 +782,40 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertEqual(api._session_task_type(tool_rows("terminal", {"command": "date"})), "General")
         self.assertEqual(api._session_task_type([]), "General")
 
+    def test_read_only_git_commands_are_not_coding_but_mutations_and_runners_are(self):
+        read_only = (
+            "git status",
+            "git log --oneline -5",
+            "git diff --stat",
+            "git show HEAD:app.py",
+            "git blame app.py",
+            "git branch --list",
+            "gh pr view 42",
+        )
+        for command in read_only:
+            with self.subTest(command=command):
+                self.assertEqual(
+                    api._session_task_type(tool_rows("exec_command", {"command": command})),
+                    "General",
+                )
+
+        mutating = (
+            "git commit -am fix",
+            "git push origin main",
+            "git stash pop",
+            "gh pr merge 42",
+            "pytest -q",
+            "npm run build",
+            "cargo test",
+            "ruff check --fix .",
+        )
+        for command in mutating:
+            with self.subTest(command=command):
+                self.assertEqual(
+                    api._session_task_type(tool_rows("exec_command", {"command": command})),
+                    "Coding",
+                )
+
     def test_session_task_type_classifies_mixed_research_by_saved_artifact(self):
         research = tool_rows("web_search", {"query": "provider release"})
         writing = tool_rows("write_file", {"path": "brief.md"})
