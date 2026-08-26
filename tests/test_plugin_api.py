@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sqlite3
 import tempfile
 import time
@@ -505,6 +506,16 @@ class SessionLensApiTests(unittest.TestCase):
         scoped_ids = {item["id"] for item in scoped["sessions"]}
         self.assertIn("session-open", scoped_ids)
         self.assertNotIn("session-reaped", scoped_ids)
+
+    def test_desktop_components_referenced_are_defined_or_imported(self):
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        referenced = set(re.findall(r"jsxs?\(([A-Z]\w*)", source))
+        defined = set(re.findall(r"(?m)^function ([A-Z]\w*)", source))
+        imported = set()
+        for block in re.findall(r"import \{([^}]*)\} from", source):
+            imported.update(name.strip() for name in block.split(",") if name.strip())
+        missing = referenced - defined - imported
+        self.assertEqual(missing, set(), f"components used but never defined or imported: {sorted(missing)}")
 
     def test_benign_json_error_fields_are_not_failures(self):
         benign = (

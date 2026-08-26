@@ -863,6 +863,122 @@ function FilesView({ files, truncated }) {
   })
 }
 
+function TraceView({ ctx, sessionId, period }) {
+  const [limit, setLimit] = useState(100)
+  useEffect(() => setLimit(100), [sessionId])
+  const traceQuery = useQuery({
+    queryKey: [PLUGIN_ID, 'trace', sessionId, limit],
+    queryFn: () => ctx.rest(apiPath(`/sessions/${encodeURIComponent(sessionId)}/trace`, { limit })),
+    enabled: Boolean(sessionId),
+    placeholderData: previous => previous
+  })
+  const telemetryQuery = useQuery({
+    queryKey: [PLUGIN_ID, 'session-telemetry', sessionId, period.days, period.start_at, period.end_at],
+    queryFn: () => ctx.rest(apiPath('/telemetry', { ...period, session_id: sessionId })),
+    enabled: Boolean(sessionId),
+    refetchInterval: 60_000
+  })
+  if (traceQuery.isLoading) return jsx(LoadingBlock, { rows: 9 })
+  if (traceQuery.isError) return jsx(ErrorBlock, { error: traceQuery.error, onRetry: traceQuery.refetch, title: 'Session trace unavailable' })
+  const data = traceQuery.data
+  const runtime = telemetryQuery.data?.summary
+  const kindMeta = {
+    user: ['account', 'User'],
+    assistant: ['hubot', 'Assistant'],
+    reasoning: ['lightbulb', 'Reasoning'],
+    tool_call: ['tools', 'Tool call'],
+    tool_result: ['terminal', 'Tool result']
+  }
+  return jsxs('div', {
+    style: { display: 'grid' },
+    children: [
+      runtime
+        ? jsx('div', {
+            style: { borderBottom: border, display: 'grid', gridTemplateColumns: 'repeat(4, minmax(7rem, 1fr))', overflowX: 'auto' },
+            children: [
+              jsx(Metric, { label: 'API calls in logs', value: formatCount(runtime.api_calls), detail: 'Session-attributed' }, 'calls'),
+              jsx(Metric, { label: 'Median latency', value: formatSeconds(runtime.latency_p50_seconds), detail: `p95 ${formatSeconds(runtime.latency_p95_seconds)}` }, 'latency'),
+              jsx(Metric, { label: 'Cache hit ratio', value: formatPercent(runtime.cache_hit_ratio), detail: `${formatCount(runtime.cache_read_tokens)} cache read` }, 'cache'),
+              jsx(Metric, { label: 'Timed tool runs', value: formatCount(runtime.tool_runs), detail: 'From local agent logs' }, 'tools')
+            ]
+          })
+        : null,
+      jsx('div', {
+        style: { background: color.surface, borderBottom: border, color: color.tertiary, fontSize: '0.6875rem', lineHeight: 1.5, padding: '0.55rem 1rem' },
+        children: 'Chronological active-message trace. System and scheduled-job prompts are excluded; recorded content is secret-redacted and bounded to 6,000 characters per event.'
+      }),
+      data.events?.length
+        ? jsx('ol', {
+            style: { listStyle: 'none', margin: 0, padding: 0 },
+            children: data.events.map(event => {
+              const [icon, label] = kindMeta[event.kind] || ['circle-outline', event.kind]
+              const failed = event.status === 'failed'
+              return jsx('li', {
+                style: { borderBottom: border, display: 'grid', gap: '0.45rem', padding: '0.8rem 1rem' },
+                children: [
+                  jsxs('div', {
+                    style: { alignItems: 'center', display: 'flex', flexWrap: 'wrap', gap: '0.4rem', justifyContent: 'space-between' },
+                    children: [
+                      jsxs('div', {
+                        style: { alignItems: 'center', display: 'flex', gap: '0.4rem', minWidth: 0 },
+                        children: [
+                          jsx(Codicon, { name: failed ? 'error' : icon, size: '0.78rem' }),
+                          jsx('strong', { style: { fontSize: '0.75rem', fontWeight: 650 }, children: event.tool_name || label }),
+                          event.kind === 'tool_call' ? jsx(Pill, { children: label }) : null,
+                          failed ? jsx(Pill, { tone: 'danger', children: 'Failed' }) : null
+                        ]
+                      }),
+                      jsx('time', { style: { color: color.quaternary, fontSize: '0.625rem' }, children: formatShortDate(event.timestamp) })
+                    ]
+                  }),
+                  event.kind === 'reasoning'
+                    ? jsxs('details', {
+                        children: [
+                          jsx('summary', { style: { color: color.tertiary, cursor: 'pointer', fontSize: '0.6875rem' }, children: 'Show recorded reasoning' }),
+                          jsx('pre', {
+                            style: { background: color.surface, borderRadius: '5px', color: color.secondary, fontFamily: 'var(--font-mono)', fontSize: '0.6875rem', lineHeight: 1.55, margin: '0.45rem 0 0', maxHeight: '24rem', overflow: 'auto', padding: '0.65rem', whiteSpace: 'pre-wrap' },
+                            children: event.content
+                          })
+                        ]
+                      })
+                    : jsx(event.kind === 'tool_result' ? 'pre' : 'div', {
+                        style: {
+                          background: event.kind === 'tool_result' ? color.surface : 'transparent',
+                          borderRadius: event.kind === 'tool_result' ? '5px' : 0,
+                          color: failed ? color.danger : color.secondary,
+                          fontFamily: event.kind === 'tool_result' ? 'var(--font-mono)' : 'inherit',
+                          fontSize: '0.71875rem',
+                          lineHeight: 1.55,
+                          margin: 0,
+                          maxHeight: event.kind === 'tool_result' ? '24rem' : 'none',
+                          overflow: event.kind === 'tool_result' ? 'auto' : 'visible',
+                          overflowWrap: 'anywhere',
+                          padding: event.kind === 'tool_result' ? '0.65rem' : 0,
+                          whiteSpace: 'pre-wrap'
+                        },
+                        children: event.content || 'No display content recorded.'
+                      })
+                ]
+              }, event.id)
+            })
+          })
+        : jsx(EmptyState, { title: 'No trace events', description: 'No active user, assistant, reasoning, or tool rows were recorded.' }),
+      data.pagination?.has_more
+        ? jsx('div', {
+            style: { padding: '0.75rem 1rem' },
+            children: jsx(Button, {
+              variant: 'outline',
+              size: 'sm',
+              disabled: traceQuery.isFetching || limit >= 200,
+              onClick: () => setLimit(value => Math.min(200, value + 100)),
+              children: limit >= 200 ? '200-message safety limit reached' : 'Load 100 more messages'
+            })
+          })
+        : null
+    ]
+  })
+}
+
 function SessionDetail({ query, detailTab, setDetailTab, ctx, period, onBack }) {
   if (!query) {
     return jsx(EmptyState, { title: 'Choose a session', description: 'Select a session to inspect its recorded evidence.' })
