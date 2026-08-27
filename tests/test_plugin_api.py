@@ -386,32 +386,6 @@ class SessionLensApiTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        kanban = sqlite3.connect(self.home / "kanban.db")
-        kanban.executescript(
-            """
-            CREATE TABLE tasks (
-                id TEXT, title TEXT, assignee TEXT, status TEXT, priority INTEGER,
-                created_at REAL, started_at REAL, completed_at REAL,
-                consecutive_failures INTEGER, last_failure_error TEXT,
-                current_run_id TEXT, session_id TEXT
-            );
-            CREATE TABLE task_runs (
-                id TEXT, task_id TEXT, profile TEXT, status TEXT, started_at REAL,
-                ended_at REAL, outcome TEXT, summary TEXT, error TEXT
-            );
-            INSERT INTO tasks VALUES (
-                'task-1','Inspect plugin','agent','done',1,1800000000,1800000001,
-                1800000050,0,NULL,'run-1','session-1'
-            );
-            INSERT INTO task_runs VALUES (
-                'run-1','task-1','default','completed',1800000001,1800000050,
-                'completed','Finished',NULL
-            );
-            """
-        )
-        kanban.commit()
-        kanban.close()
-
         FakeSessionDB.path = self.db_path
         self.original_session_db = hermes_compat.SessionDB
         hermes_compat.SessionDB = FakeSessionDB

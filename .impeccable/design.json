@@ -78,7 +78,7 @@
   ],
   "narrative": {
     "northStar": "The Native Observatory",
-    "overview": "Hermes Session Lens is an Operate surface inside Hermes Desktop: one native observatory connecting session evidence to accounting and operational health. It inherits Hermes typography, controls, codicons, focus behavior, and light/dark theme roles; it does not establish a separate brand skin. The interface is compact, quiet, and evidence-first. A user finds a session, verifies trace and accounting, then inspects runtime, profile, schedule, or Kanban state without leaving Hermes. Progressive disclosure carries the density, while explicit provenance, bounded excerpts, and read-only language make the trust boundary visible.",
+    "overview": "Hermes Session Lens is an Operate surface inside Hermes Desktop: one native observatory connecting session evidence to accounting and operational health. It inherits Hermes typography, controls, codicons, focus behavior, and light/dark theme roles; it does not establish a separate brand skin. The interface is compact, quiet, and evidence-first. A user finds a session, verifies trace and accounting, then inspects runtime, profile, or schedule state without leaving Hermes. Progressive disclosure carries the density, while explicit provenance, bounded excerpts, and read-only language make the trust boundary visible.",
     "keyCharacteristics": [
       "Native Hermes controls, theme roles, and codicons.",
       "Compact borders, tabular data, and independent scrolling regions.",

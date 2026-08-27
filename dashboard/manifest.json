@@ -3,7 +3,7 @@
   "label": "Hermes Session Lens",
   "description": "Session telemetry and provider-usage backend for the native Hermes Desktop plugin",
   "icon": "ChartNoAxesCombined",
-  "version": "0.13.1",
+  "version": "0.13.2",
   "tab": {
     "path": "/session-lens-dashboard",
     "hidden": true

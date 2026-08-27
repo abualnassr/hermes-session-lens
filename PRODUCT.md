@@ -24,7 +24,7 @@ Session Lens combines broad token and cost telemetry with failure-first, session
 
 ## Operating Context
 
-The plugin appears in Hermes Desktop's left sidebar as **Session Lens** and opens a full native route. It reads local Hermes state, runtime logs, gateway status, schedule metadata, and Kanban stores in read-only mode; it supports dark and light Hermes themes and must remain usable across routine Hermes application updates.
+The plugin appears in Hermes Desktop's left sidebar as **Session Lens** and opens a full native route. It reads local Hermes state, runtime logs, gateway status, and schedule metadata in read-only mode; it supports dark and light Hermes themes and must remain usable across routine Hermes application updates.
 
 ## Capabilities and Constraints
 
@@ -36,7 +36,7 @@ The plugin appears in Hermes Desktop's left sidebar as **Session Lens** and open
 - Chronological, paginated session trace for active user, assistant, reasoning, tool-call, and tool-result rows; system prompts excluded.
 - Conservative session outcomes that preserve Hermes' recorded end reason.
 - Cached local-log telemetry for latency, cache efficiency, request-failure observations, and tool duration; time-to-first-token remains explicitly unavailable because Hermes does not record it.
-- Cross-profile accounting, gateway/platform health, prompt-safe schedules, and shared Kanban execution status.
+- Cross-profile accounting, gateway/platform health, and prompt-safe schedules.
 - Failure-first sorting, a dedicated failed-call inspector, Hermes FTS search with snippets, and cursor-style pagination up to 500 rows.
 - An Ask Lens workflow that produces a privacy-conscious, session-grounded prompt for analysis in Hermes.
 - Read-only database access. The plugin must not mutate, archive, delete, or rewrite sessions.
@@ -52,7 +52,7 @@ The plugin appears in Hermes Desktop's left sidebar as **Session Lens** and open
 - Sidebar label: **Session Lens**.
 - Repository name: `hermes-session-lens`.
 - Plugin id: `session-lens`.
-- Current documented release: `0.13.1`.
+- Current documented release: `0.13.2`.
 - The interface inherits Hermes Desktop's native components, typography, spacing, and theme variables.
 - Upstream inspiration is credited transparently; no upstream logo or endorsement is implied.
 
