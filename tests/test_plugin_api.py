@@ -1038,6 +1038,45 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertEqual(codex["status"], "unavailable")
         self.assertNotIn("must-not-leak", json.dumps(codex))
 
+    def test_ai_usage_probe_skips_collectors_for_unconfigured_providers(self):
+        def ok(provider):
+            return api._provider_payload(
+                provider,
+                status="ok",
+                windows=[api._usage_window("Weekly", used_percent=25)],
+            )
+
+        collectors = {
+            f"_collect_{provider}_usage": Mock(return_value=ok(provider))
+            for provider in api._AI_USAGE_PROVIDER_ORDER
+        }
+        with patch.object(api, "_probe_usage_provider", side_effect=lambda p: p in {"codex", "openrouter"}):
+            with patch.multiple(api, **collectors):
+                payload = api._ai_usage_sync(True)
+        collectors["_collect_codex_usage"].assert_called_once()
+        collectors["_collect_openrouter_usage"].assert_called_once()
+        for provider in ("anthropic", "nous", "deepseek", "grok", "kimi", "zai"):
+            collectors[f"_collect_{provider}_usage"].assert_not_called()
+        deepseek = next(item for item in payload["providers"] if item["provider"] == "deepseek")
+        self.assertEqual(deepseek["status"], "not_configured")
+        self.assertEqual(deepseek["message"], "No Hermes DeepSeek API key was found.")
+        self.assertEqual(payload["summary"]["configured"], 2)
+        self.assertEqual(payload["summary"]["connected"], 2)
+        self.assertEqual(payload["summary"]["not_configured"], 6)
+
+    def test_ai_usage_probe_is_conservative_outside_hermes(self):
+        # Without Hermes modules the probes cannot prove absence, so every
+        # provider stays eligible and its collector reports the real status.
+        for provider in api._AI_USAGE_PROVIDER_ORDER:
+            self.assertTrue(api._probe_usage_provider(provider), provider)
+
+    def test_ai_usage_ui_hides_unconfigured_providers_behind_summary_line(self):
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("provider.status !== 'not_configured'", source)
+        self.assertIn("Also supported: ", source)
+        self.assertIn("No AI providers are connected", source)
+        self.assertIn("more supported", source)
+
     def test_trace_is_paginated_redacted_and_excludes_system_prompts(self):
         trace = api._trace_sync("session-1", 100, 0)
         kinds = {event["kind"] for event in trace["events"]}

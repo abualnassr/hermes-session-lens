@@ -2154,8 +2154,8 @@ function AIUsageStatStrip({ data }) {
     children: [
       jsx(Metric, {
         label: 'Connected providers',
-        value: data ? `${formatCount(summary.connected)} / ${formatCount(summary.providers)}` : '—',
-        detail: data ? `${formatCount(summary.not_configured)} not configured` : null
+        value: data ? `${formatCount(summary.connected)} / ${formatCount(summary.configured ?? summary.providers)}` : '—',
+        detail: data ? `${formatCount(summary.not_configured)} more supported` : null
       }, 'connected'),
       jsx(Metric, {
         label: 'Needs attention',
@@ -2182,9 +2182,11 @@ function AIUsageView({ query, narrow, refreshError }) {
   if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'AI usage is unavailable' })
   const data = query.data
   const providers = data?.providers || []
+  const configured = providers.filter(provider => provider.status !== 'not_configured')
+  const unconfigured = providers.filter(provider => provider.status === 'not_configured')
   const orderedProviders = [
-    ...providers.filter(provider => provider.status === 'ok'),
-    ...providers.filter(provider => provider.status !== 'ok')
+    ...configured.filter(provider => provider.status === 'ok'),
+    ...configured.filter(provider => provider.status !== 'ok')
   ]
   return jsx('div', {
     style: { flex: 1, minHeight: 0, overflow: 'auto', padding: '1rem' },
@@ -2202,13 +2204,34 @@ function AIUsageView({ query, narrow, refreshError }) {
               children: `Manual refresh failed: ${refreshError}`
             })
           : null,
-        jsx(UsageProviderGroup, {
-          id: 'supported-ai-usage',
-          title: 'Supported providers',
-          description: 'Provider-supported account limits and balances resolved through Hermes credentials.',
-          providers: orderedProviders,
-          narrow
-        }),
+        configured.length
+          ? jsx(UsageProviderGroup, {
+              id: 'supported-ai-usage',
+              title: 'Your providers',
+              description: 'Account limits and balances for the providers Hermes holds credentials for.',
+              providers: orderedProviders,
+              narrow
+            })
+          : jsx(EmptyState, {
+              title: 'No AI providers are connected',
+              description: unconfigured.length
+                ? `Session Lens can monitor account allowances for ${unconfigured.map(provider => provider.label).join(', ')}. Sign in or add the API key in Hermes and the provider appears here automatically.`
+                : 'No provider credentials were found in Hermes.'
+            }),
+        configured.length && unconfigured.length
+          ? jsxs('div', {
+              style: { alignItems: 'flex-start', borderTop: border, color: color.quaternary, display: 'flex', fontSize: '0.6875rem', gap: '0.5rem', lineHeight: 1.5, paddingTop: '0.75rem' },
+              children: [
+                jsx(Codicon, { name: 'plug', size: '0.75rem', style: { marginTop: '0.15rem' } }),
+                jsxs('span', {
+                  children: [
+                    jsx('span', { style: { color: color.tertiary, fontWeight: 600 }, children: 'Also supported: ' }),
+                    `${unconfigured.map(provider => provider.label).join(' · ')} — sign in or add the key in Hermes and they appear here.`
+                  ]
+                })
+              ]
+            })
+          : null,
         jsxs('div', {
           style: { alignItems: 'flex-start', borderTop: border, color: color.tertiary, display: 'flex', fontSize: '0.6875rem', gap: '0.5rem', lineHeight: 1.5, paddingTop: '0.75rem' },
           children: [

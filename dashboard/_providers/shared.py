@@ -21,6 +21,67 @@ _AI_USAGE_PROVIDER_META = {
 }
 _AI_USAGE_PROVIDER_ORDER = tuple(_AI_USAGE_PROVIDER_META)
 
+_AI_USAGE_NOT_CONFIGURED_MESSAGES = {
+    "codex": "No Hermes OpenAI Codex OAuth login was found.",
+    "anthropic": "No Hermes Anthropic OAuth login was found.",
+    "nous": "No Nous Portal login was found.",
+    "openrouter": "No Hermes OpenRouter API key was found.",
+    "deepseek": "No Hermes DeepSeek API key was found.",
+    "grok": "No Hermes xAI OAuth login was found.",
+    "kimi": "No Hermes Kimi Code Plan API key was found.",
+    "zai": "No Hermes Z.AI API key was found.",
+}
+
+
+def _probe_usage_provider(provider: str) -> bool:
+    """Local-only check whether Hermes holds credentials for a provider.
+
+    Gate for the network collectors: False means the local credential store
+    positively shows nothing is configured, so the collector (and its outbound
+    request) is skipped. Conservative by design — any uncertainty (missing
+    Hermes modules, probe errors) returns True so the collector still runs and
+    reports its own status; a probe must never hide a configured provider.
+    """
+    try:
+        if provider == "codex":
+            try:
+                from hermes_cli.auth import AuthError, _read_codex_tokens
+            except ImportError:
+                return True
+            try:
+                data = _read_codex_tokens()
+            except AuthError:
+                return False
+            tokens = (data or {}).get("tokens") or {}
+            return bool(tokens.get("access_token") or tokens.get("refresh_token"))
+        if provider == "anthropic":
+            try:
+                from agent import anthropic_adapter
+            except ImportError:
+                return True
+            return bool(str(anthropic_adapter.resolve_anthropic_token() or "").strip())
+        if provider == "nous":
+            try:
+                from hermes_cli.nous_account import get_nous_portal_account_info
+            except ImportError:
+                return True
+            account = get_nous_portal_account_info(force_fresh=False)
+            return bool(getattr(account, "logged_in", False))
+        if provider == "grok":
+            try:
+                from hermes_cli.auth import AuthError, resolve_xai_oauth_runtime_credentials
+            except ImportError:
+                return True
+            try:
+                credentials = resolve_xai_oauth_runtime_credentials(refresh_if_expiring=False) or {}
+            except AuthError:
+                return False
+            return bool(str(credentials.get("api_key") or "").strip())
+        token, _base_url = _resolve_hermes_api_key(provider)
+        return bool(token)
+    except Exception:
+        return True
+
 
 def _usage_number(value: Any) -> Optional[float]:
     if isinstance(value, bool) or value in (None, ""):
@@ -230,10 +291,12 @@ def _ai_usage_summary(providers: List[Dict[str, Any]]) -> Dict[str, Any]:
         for window in provider.get("windows", [])
         if (epoch := _usage_reset_epoch(window.get("reset_at"))) is not None and epoch > time.time()
     ]
+    not_configured = sum(1 for item in providers if item.get("status") == "not_configured")
     return {
         "providers": len(providers),
+        "configured": len(providers) - not_configured,
         "connected": sum(1 for item in providers if item.get("status") == "ok"),
-        "not_configured": sum(1 for item in providers if item.get("status") == "not_configured"),
+        "not_configured": not_configured,
         "needs_attention": sum(
             1 for item in providers if item.get("status") in {"expired", "forbidden", "unavailable", "stale"}
         ),

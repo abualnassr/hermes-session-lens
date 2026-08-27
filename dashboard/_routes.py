@@ -3021,16 +3021,29 @@ def _ai_usage_sync(fresh: bool = False) -> Dict[str, Any]:
         "kimi": _collect_kimi_usage,
         "zai": _collect_zai_usage,
     }
+    # Stage 1: local-only credential probes decide which collectors run at
+    # all, so providers with nothing configured never trigger a network call.
     results: Dict[str, Dict[str, Any]] = {}
-    with ThreadPoolExecutor(max_workers=len(collectors), thread_name_prefix="session-lens-usage") as pool:
-        futures = {pool.submit(collector): provider for provider, collector in collectors.items()}
-        for future in as_completed(futures):
-            provider = futures[future]
-            try:
-                result = future.result()
-            except Exception as error:
-                result = _provider_payload(provider, status="unavailable", message=_provider_message(error))
-            results[provider] = result
+    active: Dict[str, Any] = {}
+    for provider, collector in collectors.items():
+        if _probe_usage_provider(provider):
+            active[provider] = collector
+        else:
+            results[provider] = _provider_payload(
+                provider,
+                status="not_configured",
+                message=_AI_USAGE_NOT_CONFIGURED_MESSAGES.get(provider),
+            )
+    if active:
+        with ThreadPoolExecutor(max_workers=len(active), thread_name_prefix="session-lens-usage") as pool:
+            futures = {pool.submit(collector): provider for provider, collector in active.items()}
+            for future in as_completed(futures):
+                provider = futures[future]
+                try:
+                    result = future.result()
+                except Exception as error:
+                    result = _provider_payload(provider, status="unavailable", message=_provider_message(error))
+                results[provider] = result
 
     with _ai_usage_cache_lock:
         for provider in _AI_USAGE_PROVIDER_ORDER:
