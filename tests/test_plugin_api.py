@@ -11,7 +11,18 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from datetime import datetime
 from unittest.mock import Mock, patch
+
+
+def _stamp(epoch: int) -> str:
+    """Render an epoch as the local-time log stamp `_timestamp_from_log` parses.
+
+    Fixture DB rows store raw epochs while Hermes log lines carry local-time
+    strings; deriving the strings from the same epochs keeps the two aligned in
+    every timezone (a literal stamp only lines up on a UTC runner).
+    """
+    return datetime.fromtimestamp(epoch).strftime("%Y-%m-%d %H:%M:%S,000")
 
 
 MODULE_PATH = Path(__file__).resolve().parents[1] / "dashboard" / "_routes.py"
@@ -344,12 +355,12 @@ class SessionLensApiTests(unittest.TestCase):
         logs = self.home / "logs"
         logs.mkdir()
         (logs / "agent.log").write_text(
-            "2027-01-15 08:00:00,000 INFO [session-1] agent.conversation_loop: "
+            f"{_stamp(1_800_000_000)} INFO [session-1] agent.conversation_loop: "
             "API call #1: model=provider/model-a provider=provider in=1000 out=250 total=1250 "
             "latency=2.5s cache=500/1000 (50%)\n"
-            "2027-01-15 08:00:03,000 INFO [session-1] agent.tool_executor: "
+            f"{_stamp(1_800_000_003)} INFO [session-1] agent.tool_executor: "
             "tool write_file failed (1.25s)\n"
-            "2027-01-15 08:00:04,000 ERROR [session-1] agent.conversation_loop: "
+            f"{_stamp(1_800_000_004)} ERROR [session-1] agent.conversation_loop: "
             "Error during OpenAI-compatible API call #2: HTTP 429 rate limit\n",
             encoding="utf-8",
         )
@@ -1052,15 +1063,15 @@ class SessionLensApiTests(unittest.TestCase):
         log_path = self.home / "logs" / "agent.log"
         original = log_path.read_text(encoding="utf-8")
         log_path.write_text(
-            "2027-01-15 07:59:00,000 INFO [session-1] agent.lifecycle: startup complete\n"
+            f"{_stamp(1_799_999_940)} INFO [session-1] agent.lifecycle: startup complete\n"
             + original
-            + "2027-01-15 08:01:00,000 INFO [session-1] agent.lifecycle: shutdown complete\n",
+            + f"{_stamp(1_800_000_060)} INFO [session-1] agent.lifecycle: shutdown complete\n",
             encoding="utf-8",
         )
         api._log_file_cache.clear()
         payload = api._ai_models_sync(0, fresh=True)
-        self.assertEqual(payload["coverage"]["log_start_at"], api._timestamp_from_log("2027-01-15 07:59:00,000"))
-        self.assertEqual(payload["coverage"]["log_end_at"], api._timestamp_from_log("2027-01-15 08:01:00,000"))
+        self.assertEqual(payload["coverage"]["log_start_at"], 1_799_999_940.0)
+        self.assertEqual(payload["coverage"]["log_end_at"], 1_800_000_060.0)
 
         for index in range(11):
             rotated = self.home / "logs" / f"rotated-{index}.log"
@@ -1390,7 +1401,7 @@ class SessionLensApiTests(unittest.TestCase):
         log_path = self.home / "logs" / "agent.log"
         log_path.write_text(
             log_path.read_text(encoding="utf-8")
-            + "2027-01-15 08:00:05,000 WARNING [session-1] agent.conversation_loop: "
+            + f"{_stamp(1_800_000_005)} WARNING [session-1] agent.conversation_loop: "
             + "API call failed (attempt 1/1) error_type=APITimeout provider=provider "
             + "base_url=https://example.test model=provider/model-a summary=timeout\n",
             encoding="utf-8",
@@ -1468,7 +1479,7 @@ class SessionLensApiTests(unittest.TestCase):
                 )
                 if session_id == "switched-task":
                     usage = [
-                        ("provider/model-a", started_at + 2, started_at + 20),
+                        ("provider/model-x", started_at + 2, started_at + 20),
                         ("provider/model-b", started_at + 25, started_at + 50),
                     ]
                 else:
@@ -1495,7 +1506,7 @@ class SessionLensApiTests(unittest.TestCase):
                 "2027-01-15 09:10:10,000 INFO [unrecovered-task] agent.conversation_loop: API call #1: model=provider/model-u provider=provider in=100 out=20 total=120 latency=1.0s\n",
                 "2027-01-15 09:10:20,000 WARNING [unrecovered-task] agent.conversation_loop: API call failed (attempt 1/1) error_type=APITimeout provider=provider base_url=https://example.test model=provider/model-u summary=timeout\n",
                 "2027-01-15 09:20:10,000 INFO [clean-task] agent.conversation_loop: API call #1: model=provider/model-c provider=provider in=100 out=20 total=120 latency=1.0s\n",
-                "2027-01-15 09:30:10,000 INFO [switched-task] agent.conversation_loop: API call #1: model=provider/model-a provider=provider in=100 out=20 total=120 latency=1.0s\n",
+                "2027-01-15 09:30:10,000 INFO [switched-task] agent.conversation_loop: API call #1: model=provider/model-x provider=provider in=100 out=20 total=120 latency=1.0s\n",
                 "2027-01-15 09:30:40,000 INFO [switched-task] agent.conversation_loop: API call #2: model=provider/model-b provider=provider in=100 out=20 total=120 latency=1.0s\n",
                 "2027-01-15 09:40:10,000 INFO [tool-only-task] agent.conversation_loop: API call #1: model=provider/model-t provider=provider in=100 out=20 total=120 latency=1.0s\n",
             ]
@@ -1525,7 +1536,7 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertEqual(clean["completion_rate"], 1)
         self.assertEqual(clean["by_route"][0]["label"], "Provider API")
 
-        switched_from = models["provider/model-a"]["work_reliability"]
+        switched_from = models["provider/model-x"]["work_reliability"]
         switched_to = models["provider/model-b"]["work_reliability"]
         self.assertEqual(switched_from["switched_away_tasks"], 1)
         self.assertEqual(switched_from["eligible_tasks"], 0)
@@ -1628,7 +1639,7 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertEqual(api._profiles_sync(0, outside_start, outside_end)["totals"]["sessions"], 0)
 
     def test_custom_period_filters_runtime_logs_and_rejects_reverse_ranges(self):
-        log_time = api._timestamp_from_log("2027-01-15 08:00:00,000")
+        log_time = 1_800_000_000.0
         included = api._telemetry_sync(0, "session-1", log_time, log_time + 4)
         excluded = api._telemetry_sync(0, "session-1", log_time + 4, log_time + 8)
         self.assertEqual(included["summary"]["api_calls"], 1)
