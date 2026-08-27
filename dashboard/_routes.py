@@ -3061,7 +3061,7 @@ async def schedules() -> Dict[str, Any]:
     return await asyncio.to_thread(_schedules_sync)
 
 
-def _ai_usage_sync(fresh: bool = False) -> Dict[str, Any]:
+def _ai_usage_sync(fresh: bool = False, only_provider: Optional[str] = None) -> Dict[str, Any]:
     global _ai_usage_cache
     now = time.time()
     with _ai_usage_cache_lock:
@@ -3080,6 +3080,14 @@ def _ai_usage_sync(fresh: bool = False) -> Dict[str, Any]:
         "kimi": _collect_kimi_usage,
         "zai": _collect_zai_usage,
     }
+    if fresh and only_provider:
+        collector = collectors.get(only_provider)
+        if collector is not None:
+            merged = _ai_usage_refresh_provider(only_provider, collector)
+            if merged is not None:
+                return merged
+        # Unknown provider name or no cached payload to merge into — a full
+        # pass answers correctly either way.
     # Stage 1: local-only credential probes decide which collectors run at
     # all, so providers with nothing configured never trigger a network call.
     results: Dict[str, Dict[str, Any]] = {}
@@ -3104,6 +3112,7 @@ def _ai_usage_sync(fresh: bool = False) -> Dict[str, Any]:
                     result = _provider_payload(provider, status="unavailable", message=_provider_message(error))
                 results[provider] = result
 
+    recorded = _usage_recorded_7d()
     with _ai_usage_cache_lock:
         for provider in _AI_USAGE_PROVIDER_ORDER:
             result = results.get(provider) or _provider_payload(
@@ -3111,22 +3120,8 @@ def _ai_usage_sync(fresh: bool = False) -> Dict[str, Any]:
                 status="unavailable",
                 message="Provider collector returned no result.",
             )
-            if result.get("status") == "ok":
-                _ai_usage_last_success[provider] = copy.deepcopy(result)
-            elif result.get("status") in {"not_configured", "expired", "forbidden"}:
-                _ai_usage_last_success.pop(provider, None)
-            elif result.get("status") == "unavailable" and provider in _ai_usage_last_success:
-                current_status = result.get("status")
-                current_message = result.get("message")
-                result = copy.deepcopy(_ai_usage_last_success[provider])
-                result.update(
-                    {
-                        "status": "stale",
-                        "stale": True,
-                        "last_error_status": current_status,
-                        "message": current_message or "The latest refresh failed; showing the last successful reading.",
-                    }
-                )
+            result = _fold_usage_last_success(provider, result)
+            result["recorded_7d"] = recorded.get(provider)
             results[provider] = result
 
         providers = [results[provider] for provider in _AI_USAGE_PROVIDER_ORDER]
@@ -3146,9 +3141,122 @@ def _ai_usage_sync(fresh: bool = False) -> Dict[str, Any]:
         return payload
 
 
+def _fold_usage_last_success(provider: str, result: Dict[str, Any]) -> Dict[str, Any]:
+    """Track last-good readings; call with _ai_usage_cache_lock held.
+
+    A transient failure re-serves the last good reading marked stale; a
+    definitive credential failure (expired/forbidden/not configured) clears
+    the memory so dead credentials never show comforting numbers.
+    """
+    if result.get("status") == "ok":
+        _ai_usage_last_success[provider] = copy.deepcopy(result)
+    elif result.get("status") in {"not_configured", "expired", "forbidden"}:
+        _ai_usage_last_success.pop(provider, None)
+    elif result.get("status") == "unavailable" and provider in _ai_usage_last_success:
+        current_status = result.get("status")
+        current_message = result.get("message")
+        result = copy.deepcopy(_ai_usage_last_success[provider])
+        result.update(
+            {
+                "status": "stale",
+                "stale": True,
+                "last_error_status": current_status,
+                "message": current_message or "The latest refresh failed; showing the last successful reading.",
+            }
+        )
+    return result
+
+
+_USAGE_BILLING_KEYS = {
+    "codex": ("openai-codex",),
+    "anthropic": ("anthropic-oauth", "anthropic"),
+    "nous": ("nous",),
+    "openrouter": ("openrouter",),
+    "deepseek": ("deepseek",),
+    "grok": ("xai-oauth",),
+    "kimi": ("kimi-coding", "kimi-coding-cn"),
+    "zai": ("zai", "zai-coding"),
+}
+
+
+def _usage_recorded_7d() -> Dict[str, Dict[str, Any]]:
+    """Trailing-7-day tokens/cost/sessions per quota provider from local records."""
+    start = time.time() - 7 * 86_400
+    try:
+        with _database() as db:
+            rows = _db_connection(db).execute(
+                """
+                SELECT LOWER(billing_provider),
+                       SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens),
+                       SUM(CASE WHEN actual_cost_usd > 0 THEN actual_cost_usd ELSE estimated_cost_usd END),
+                       COUNT(DISTINCT session_id)
+                FROM session_model_usage
+                WHERE COALESCE(last_seen, first_seen, 0) >= ?
+                GROUP BY LOWER(billing_provider)
+                """,
+                (start,),
+            ).fetchall()
+    except Exception:
+        return {}
+    by_billing = {str(row[0] or ""): row for row in rows}
+    recorded: Dict[str, Dict[str, Any]] = {}
+    for provider, billing_keys in _USAGE_BILLING_KEYS.items():
+        matched = [by_billing[key] for key in billing_keys if key in by_billing]
+        if not matched:
+            continue
+        recorded[provider] = {
+            "tokens": sum(_integer(row[1]) for row in matched),
+            "cost_usd": round(sum(_number(row[2]) for row in matched), 4),
+            "sessions": sum(_integer(row[3]) for row in matched),
+        }
+    return recorded
+
+
+def _ai_usage_refresh_provider(provider: str, collector: Any) -> Optional[Dict[str, Any]]:
+    """Refresh ONE provider into the cached payload; None when no cache exists.
+
+    The cache timestamp is deliberately left untouched — refreshing one card
+    must not extend the whole payload's lifetime.
+    """
+    global _ai_usage_cache
+    with _ai_usage_cache_lock:
+        if not _ai_usage_cache:
+            return None
+        cached_at, base = _ai_usage_cache
+        base = copy.deepcopy(base)
+    if _probe_usage_provider(provider):
+        try:
+            result = collector()
+        except Exception as error:
+            result = _provider_payload(provider, status="unavailable", message=_provider_message(error))
+    else:
+        result = _provider_payload(
+            provider,
+            status="not_configured",
+            message=_AI_USAGE_NOT_CONFIGURED_MESSAGES.get(provider),
+        )
+    recorded = _usage_recorded_7d()
+    with _ai_usage_cache_lock:
+        result = _fold_usage_last_success(provider, result)
+        result["recorded_7d"] = recorded.get(provider)
+        providers = [
+            result if item.get("provider") == provider else item
+            for item in base.get("providers", [])
+        ]
+        payload = {
+            **base,
+            "providers": providers,
+            "summary": _ai_usage_summary(providers),
+            "generated_at": time.time(),
+            "cached": False,
+        }
+        _ai_usage_cache = (cached_at, copy.deepcopy(payload))
+        return payload
+
+
 @router.get("/ai-usage")
-async def ai_usage(fresh: bool = False) -> Dict[str, Any]:
-    return await asyncio.to_thread(_ai_usage_sync, fresh)
+async def ai_usage(fresh: bool = False, provider: Optional[str] = None) -> Dict[str, Any]:
+    return await asyncio.to_thread(_ai_usage_sync, fresh, provider)
 
 
 def _system_sync() -> Dict[str, Any]:

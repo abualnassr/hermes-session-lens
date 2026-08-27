@@ -1077,6 +1077,84 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertIn("No AI providers are connected", source)
         self.assertIn("more supported", source)
 
+    def test_ai_usage_single_provider_refresh_merges_into_cached_payload(self):
+        def ok(provider, used):
+            return api._provider_payload(
+                provider,
+                status="ok",
+                windows=[api._usage_window("Weekly", used_percent=used)],
+            )
+
+        first = {
+            f"_collect_{provider}_usage": Mock(return_value=ok(provider, 25))
+            for provider in api._AI_USAGE_PROVIDER_ORDER
+        }
+        with patch.multiple(api, **first):
+            api._ai_usage_sync(True)
+        cached_at = api._ai_usage_cache[0]
+
+        second = {
+            f"_collect_{provider}_usage": Mock(return_value=ok(provider, 60))
+            for provider in api._AI_USAGE_PROVIDER_ORDER
+        }
+        with patch.multiple(api, **second):
+            payload = api._ai_usage_sync(True, "grok")
+        second["_collect_grok_usage"].assert_called_once()
+        for provider in api._AI_USAGE_PROVIDER_ORDER:
+            if provider != "grok":
+                second[f"_collect_{provider}_usage"].assert_not_called()
+        by_provider = {item["provider"]: item for item in payload["providers"]}
+        self.assertEqual(by_provider["grok"]["windows"][0]["percentage_used"], 60.0)
+        self.assertEqual(by_provider["codex"]["windows"][0]["percentage_used"], 25.0)
+        self.assertFalse(payload["cached"])
+        # Refreshing one card must not extend the whole payload's lifetime.
+        self.assertEqual(api._ai_usage_cache[0], cached_at)
+
+    def test_ai_usage_attaches_local_seven_day_usage_per_provider(self):
+        connection = sqlite3.connect(self.db_path)
+        try:
+            connection.execute(
+                SESSION_MODEL_USAGE_INSERT_SQL,
+                ("session-kimi", "kimi/k2", "kimi-coding", "metered", "", 2, 1000, 200, 0, 0, 0, 0.05, 0,
+                 "estimated", "test", 1_800_000_000, 1_800_000_100),
+            )
+            connection.execute(
+                SESSION_MODEL_USAGE_INSERT_SQL,
+                ("session-kimi-cn", "kimi/k2", "kimi-coding-cn", "metered", "", 1, 500, 100, 0, 0, 0, 0.02, 0,
+                 "estimated", "test", 1_800_000_000, 1_800_000_100),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        recorded = api._usage_recorded_7d()
+        self.assertEqual(recorded["kimi"]["tokens"], 1800)
+        self.assertEqual(recorded["kimi"]["sessions"], 2)
+        self.assertAlmostEqual(recorded["kimi"]["cost_usd"], 0.07)
+        self.assertNotIn("codex", recorded)
+
+        collectors = {
+            f"_collect_{provider}_usage": Mock(
+                return_value=api._provider_payload(provider, status="ok",
+                                                  windows=[api._usage_window("Weekly", used_percent=10)])
+            )
+            for provider in api._AI_USAGE_PROVIDER_ORDER
+        }
+        with patch.multiple(api, **collectors):
+            payload = api._ai_usage_sync(True)
+        kimi = next(item for item in payload["providers"] if item["provider"] == "kimi")
+        self.assertEqual(kimi["recorded_7d"]["tokens"], 1800)
+        codex = next(item for item in payload["providers"] if item["provider"] == "codex")
+        self.assertIsNone(codex["recorded_7d"])
+
+    def test_ai_usage_ui_orders_by_urgency_with_countdowns_and_local_line(self):
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("function usageUrgency", source)
+        self.assertIn("usageUrgency(b) - usageUrgency(a)", source)
+        self.assertIn("function formatCountdown", source)
+        self.assertIn("Recorded locally: ", source)
+        self.assertIn("Refresh only ${provider.label}", source)
+        self.assertIn("provider=${encodeURIComponent(provider)}", source)
+
     def test_attention_quota_notes_come_from_cached_usage_only(self):
         api._ai_usage_cache = None
         self.assertEqual(api._attention_sync(0)["quotas"], [])

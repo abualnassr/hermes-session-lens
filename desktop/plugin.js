@@ -1948,6 +1948,32 @@ const usageProviderIcons = {
 // AI USAGE
 // ============================================================================
 
+function formatCountdown(value) {
+  const date = timestampDate(value)
+  if (!date) return null
+  const seconds = Math.round((date.getTime() - Date.now()) / 1000)
+  if (seconds <= 0) return null
+  const days = Math.floor(seconds / 86_400)
+  const hours = Math.floor((seconds % 86_400) / 3_600)
+  const minutes = Math.floor((seconds % 3_600) / 60)
+  if (days) return `in ${days}d ${hours}h`
+  if (hours) return `in ${hours}h ${minutes}m`
+  return `in ${Math.max(1, minutes)}m`
+}
+
+// Sort key for provider cards: broken credentials first (monitoring is blind
+// there), then transient failures, then working providers by their hottest
+// quota window — the card most likely to need action floats to the top.
+function usageUrgency(provider) {
+  if (provider.status === 'expired' || provider.status === 'forbidden') return 1000
+  if (provider.status === 'unavailable') return 900
+  const quotas = (provider.windows || []).filter(window =>
+    window.kind === 'quota' && Number.isFinite(Number(window.percentage_used))
+  )
+  const maxUsed = quotas.length ? Math.max(...quotas.map(window => Number(window.percentage_used))) : 0
+  return maxUsed + (provider.status === 'stale' ? 40 : 0)
+}
+
 function usageStatus(provider) {
   const status = provider?.status || 'unavailable'
   if (status === 'ok') return { label: 'Connected', tone: 'accent', icon: 'pass' }
@@ -2062,7 +2088,10 @@ function UsageWindow({ window, series }) {
   const detailParts = []
   if (usedAmount && limitAmount) detailParts.push(`${usedAmount} used of ${limitAmount}`)
   if (window.detail) detailParts.push(window.detail)
-  if (window.reset_at) detailParts.push(`Resets ${formatDate(window.reset_at)}`)
+  if (window.reset_at) {
+    const countdown = formatCountdown(window.reset_at)
+    detailParts.push(`Resets ${formatDate(window.reset_at)}${countdown ? ` · ${countdown}` : ''}`)
+  }
   return jsxs('div', {
     style: { borderTop: border, display: 'grid', gap: '0.45rem', padding: '0.72rem 0' },
     children: [
@@ -2114,9 +2143,19 @@ function UsageWindow({ window, series }) {
   })
 }
 
-function UsageProvider({ provider, history }) {
+function UsageProvider({ provider, history, onRefresh }) {
   const status = usageStatus(provider)
   const messageDanger = ['expired', 'forbidden', 'unavailable'].includes(provider.status)
+  const [busy, setBusy] = useState(false)
+  const refreshOne = async () => {
+    if (busy || !onRefresh) return
+    setBusy(true)
+    try {
+      await onRefresh(provider.provider)
+    } finally {
+      setBusy(false)
+    }
+  }
   return jsxs('section', {
     style: { border, borderRadius: '6px', minWidth: 0, padding: '0.85rem 1rem' },
     children: [
@@ -2142,9 +2181,25 @@ function UsageProvider({ provider, history }) {
               })
             ]
           }),
-          jsx(Pill, {
-            tone: status.tone,
-            children: jsxs(Fragment, { children: [jsx(Codicon, { name: status.icon, size: '0.65rem' }), status.label] })
+          jsxs('div', {
+            style: { alignItems: 'center', display: 'flex', flexShrink: 0, gap: '0.35rem' },
+            children: [
+              jsx(Pill, {
+                tone: status.tone,
+                children: jsxs(Fragment, { children: [jsx(Codicon, { name: status.icon, size: '0.65rem' }), status.label] })
+              }),
+              onRefresh
+                ? jsx('button', {
+                    type: 'button',
+                    onClick: refreshOne,
+                    disabled: busy,
+                    'aria-label': `Refresh ${provider.label} usage`,
+                    title: `Refresh only ${provider.label}. The other cards keep their current readings.`,
+                    style: { alignItems: 'center', background: 'transparent', border: 'none', color: color.quaternary, cursor: busy ? 'default' : 'pointer', display: 'flex', outlineColor: color.accent, padding: '0.1rem' },
+                    children: jsx(Codicon, { name: busy ? 'sync~spin' : 'refresh', size: '0.7rem' })
+                  })
+                : null
+            ]
           })
         ]
       }),
@@ -2179,6 +2234,13 @@ function UsageProvider({ provider, history }) {
             children: provider.details.map((detail, index) => jsx('li', { children: detail }, `${provider.provider}-detail-${index}`))
           })
         : null,
+      provider.recorded_7d && (provider.recorded_7d.tokens || provider.recorded_7d.sessions)
+        ? jsx('div', {
+            title: 'What your local Hermes sessions recorded against this provider in the last 7 days. The account quota above may also include usage from other machines or tools on the same account.',
+            style: { color: color.quaternary, fontSize: '0.625rem', marginTop: '0.65rem' },
+            children: `Recorded locally: ${formatCount(provider.recorded_7d.tokens)} tok · ${formatUsageAmount(provider.recorded_7d.cost_usd, 'USD')} across ${formatCount(provider.recorded_7d.sessions)} session${Number(provider.recorded_7d.sessions) === 1 ? '' : 's'} (7d)`
+          })
+        : null,
       provider.fetched_at
         ? jsx('div', {
             style: { color: color.quaternary, fontSize: '0.625rem', marginTop: '0.65rem' },
@@ -2189,7 +2251,7 @@ function UsageProvider({ provider, history }) {
   })
 }
 
-function UsageProviderGroup({ title, description, providers, narrow, id, history }) {
+function UsageProviderGroup({ title, description, providers, narrow, id, history, onRefresh }) {
   if (!providers.length) return null
   return jsxs('section', {
     'aria-labelledby': id,
@@ -2210,7 +2272,7 @@ function UsageProviderGroup({ title, description, providers, narrow, id, history
       }),
       jsx('div', {
         style: { display: 'grid', gap: '0.85rem', gridTemplateColumns: narrow ? 'minmax(0, 1fr)' : 'repeat(2, minmax(0, 1fr))' },
-        children: providers.map(provider => jsx(UsageProvider, { provider, history }, provider.provider))
+        children: providers.map(provider => jsx(UsageProvider, { provider, history, onRefresh }, provider.provider))
       })
     ]
   })
@@ -2240,7 +2302,9 @@ function AIUsageStatStrip({ data }) {
       }, 'attention'),
       jsx(Metric, {
         label: 'Next reset',
-        value: summary.next_reset_at ? formatShortDate(summary.next_reset_at) : '—',
+        value: summary.next_reset_at
+          ? (formatCountdown(summary.next_reset_at) || formatShortDate(summary.next_reset_at))
+          : '—',
         detail: summary.next_reset_at ? formatDate(summary.next_reset_at) : 'No timed window reported'
       }, 'reset'),
       jsx(Metric, {
@@ -2313,17 +2377,14 @@ function QuotaAlertStrip({ notes, dismissedIds, onDismiss, onOpen }) {
   })
 }
 
-function AIUsageView({ query, narrow, refreshError, history }) {
+function AIUsageView({ query, narrow, refreshError, history, onRefreshProvider }) {
   if (query.isLoading) return jsx(LoadingBlock, { rows: 8 })
   if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'AI usage is unavailable' })
   const data = query.data
   const providers = data?.providers || []
   const configured = providers.filter(provider => provider.status !== 'not_configured')
   const unconfigured = providers.filter(provider => provider.status === 'not_configured')
-  const orderedProviders = [
-    ...configured.filter(provider => provider.status === 'ok'),
-    ...configured.filter(provider => provider.status !== 'ok')
-  ]
+  const orderedProviders = [...configured].sort((a, b) => usageUrgency(b) - usageUrgency(a))
   return jsx('div', {
     style: { flex: 1, minHeight: 0, overflow: 'auto', padding: '1rem' },
     children: jsxs('div', {
@@ -2347,7 +2408,8 @@ function AIUsageView({ query, narrow, refreshError, history }) {
               description: 'Account limits and balances for the providers Hermes holds credentials for.',
               providers: orderedProviders,
               narrow,
-              history
+              history,
+              onRefresh: onRefreshProvider
             })
           : jsx(EmptyState, {
               title: 'No AI providers are connected',
@@ -2516,12 +2578,16 @@ function SessionLensPage({ ctx }) {
   useEffect(() => {
     const data = aiUsageQuery.data
     if (!data || data.cached) return
-    const t = Math.round(Number(data.generated_at) * 1000) || Date.now()
     setUsageHistory(current => {
       const next = { ...current }
       let changed = false
       for (const provider of data.providers || []) {
         if (provider.status !== 'ok') continue
+        // Per-provider fetch time: a single-card refresh re-serves the other
+        // cards' old readings, and re-stamping those would flatten their slopes.
+        const t = Math.round(Number(provider.fetched_at) * 1000)
+          || Math.round(Number(data.generated_at) * 1000)
+          || Date.now()
         for (const window of provider.windows || []) {
           const pct = Number(window.percentage_used)
           if (!Number.isFinite(pct)) continue
@@ -2630,11 +2696,20 @@ function SessionLensPage({ ctx }) {
   if (tab === 'operations') content = jsx(OperationsView, { ctx, period, onDrill: drillToSessions })
   if (tab === 'tools') content = jsx(ToolsView, { ctx, period })
   if (tab === 'system') content = jsx(SystemView, { ctx })
+  const refreshProvider = async provider => {
+    try {
+      const data = await ctx.rest(`/ai-usage?fresh=true&provider=${encodeURIComponent(provider)}`)
+      queryClient.setQueryData([PLUGIN_ID, 'ai-usage'], data)
+    } catch (error) {
+      setAiRefreshError(`${provider}: ${error?.message || String(error || 'refresh failed')}`)
+    }
+  }
   if (tab === 'ai-usage') content = jsx(AIUsageView, {
     query: aiUsageQuery,
     narrow: Boolean(viewport?.narrow),
     refreshError: aiRefreshError,
-    history: usageHistory
+    history: usageHistory,
+    onRefreshProvider: refreshProvider
   })
   if (tab === 'ai-models') content = jsx(AIModelsView, {
     onDrill: drillToSessions,
