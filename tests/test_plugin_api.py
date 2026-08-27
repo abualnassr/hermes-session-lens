@@ -1077,6 +1077,49 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertIn("No AI providers are connected", source)
         self.assertIn("more supported", source)
 
+    def test_attention_quota_notes_come_from_cached_usage_only(self):
+        api._ai_usage_cache = None
+        self.assertEqual(api._attention_sync(0)["quotas"], [])
+
+        now = time.time()
+
+        def window(label, used, reset_offset, kind="quota"):
+            return api._usage_window(label, kind=kind, used_percent=used, reset_at=now + reset_offset)
+
+        payload = {
+            "providers": [
+                api._provider_payload("codex", status="ok", windows=[window("Weekly quota", 95, 86_400)]),
+                api._provider_payload("grok", status="ok", windows=[window("Weekly quota", 50, 86_400)]),
+                api._provider_payload("kimi", status="ok", windows=[window("Weekly quota", 40, 6 * 86_400)]),
+                api._provider_payload("zai", status="expired", windows=[window("Weekly quota", 99, 86_400)]),
+                api._provider_payload(
+                    "openrouter", status="ok", windows=[window("Account credits", 99, 86_400, kind="balance")]
+                ),
+            ],
+            "generated_at": now,
+        }
+        api._ai_usage_cache = (now, payload)
+        quotas = api._attention_sync(0)["quotas"]
+        self.assertEqual([note["provider"] for note in quotas], ["codex", "kimi"])
+        self.assertEqual(quotas[0]["severity"], "danger")
+        self.assertEqual(quotas[0]["percent_used"], 95)
+        self.assertEqual(quotas[1]["severity"], "warning")
+        self.assertIsNotNone(quotas[1]["exhaust_at"])
+        self.assertTrue(quotas[0]["id"].startswith("quota:codex:"))
+
+        # An aged-out cache stops producing notes rather than lying quietly.
+        api._ai_usage_cache = (now - api.QUOTA_ATTENTION_MAX_CACHE_AGE_SECONDS - 1, payload)
+        self.assertEqual(api._attention_sync(0)["quotas"], [])
+
+    def test_quota_alert_strip_ui_shows_on_other_tabs_and_dismisses_per_window(self):
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("function QuotaAlertStrip", source)
+        self.assertIn("ctx.storage.get('quotaAlertsDismissed')", source)
+        # The strip is redundant on the AI Usage tab itself.
+        self.assertIn("tab !== 'ai-usage'\n        ? jsx(QuotaAlertStrip", source)
+        self.assertIn("Open AI Usage.", source)
+        self.assertIn("It returns after the reset if the condition persists.", source)
+
     def test_ai_usage_ui_records_burn_history_and_forecasts_from_slope(self):
         source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
         self.assertIn("ctx.storage.get('usageHistory')", source)

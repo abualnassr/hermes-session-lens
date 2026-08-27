@@ -1090,6 +1090,64 @@ ATTENTION_OPEN_HOURS = 24
 ATTENTION_MIN_TOKENS = 5_000_000
 _ATTENTION_REAPED_END_REASONS = {"startup_orphan_reap", "max_runtime", "timeout"}
 _ATTENTION_MAX_SESSIONS = 20
+QUOTA_ATTENTION_PERCENT = 90
+QUOTA_ATTENTION_MAX_CACHE_AGE_SECONDS = 3600
+
+
+def _ai_usage_cached_payload(max_age_seconds: float = QUOTA_ATTENTION_MAX_CACHE_AGE_SECONDS) -> Optional[Dict[str, Any]]:
+    """Return a recent cached /ai-usage payload WITHOUT triggering collection.
+
+    Quota attention notes must never cause outbound provider requests on
+    their own — the plugin only phones providers when the user opens the AI
+    pages. No cache (or one too old) simply means no quota notes.
+    """
+    with _ai_usage_cache_lock:
+        if _ai_usage_cache and time.time() - _ai_usage_cache[0] < max_age_seconds:
+            return copy.deepcopy(_ai_usage_cache[1])
+    return None
+
+
+def _quota_attention_notes() -> List[Dict[str, Any]]:
+    """Account-quota warnings derived from the cached provider readings."""
+    payload = _ai_usage_cached_payload()
+    if not payload:
+        return []
+    notes: List[Dict[str, Any]] = []
+    for provider in payload.get("providers", []):
+        if provider.get("status") not in {"ok", "stale"}:
+            continue
+        for window in provider.get("windows", []):
+            if window.get("kind") != "quota":
+                continue
+            used = _number(window.get("percentage_used"), None)
+            if used is None:
+                continue
+            exhaust_at = _quota_exhaust_at(window.get("label"), window.get("reset_at"), used)
+            if used >= QUOTA_ATTENTION_PERCENT:
+                severity = "danger"
+                reason = f"{round(used)}% of the window is used"
+            elif exhaust_at:
+                severity = "warning"
+                reason = "on pace to run out before the reset"
+            else:
+                continue
+            notes.append(
+                {
+                    "id": f"quota:{provider.get('provider')}:{window.get('id')}:{window.get('reset_at') or ''}",
+                    "provider": provider.get("provider"),
+                    "provider_label": provider.get("label"),
+                    "window_label": window.get("label"),
+                    "severity": severity,
+                    "percent_used": round(used, 1),
+                    "exhaust_at": exhaust_at,
+                    "reset_at": window.get("reset_at"),
+                    "reason": reason,
+                    "as_of": payload.get("generated_at"),
+                    "stale": bool(provider.get("stale")),
+                }
+            )
+    notes.sort(key=lambda item: (0 if item["severity"] == "danger" else 1, -item["percent_used"]))
+    return notes
 
 
 def _attention_sync(
@@ -1199,6 +1257,7 @@ def _attention_sync(
     truncated = len(flagged) > _ATTENTION_MAX_SESSIONS
     return {
         "sessions": flagged[:_ATTENTION_MAX_SESSIONS],
+        "quotas": _quota_attention_notes(),
         "totals": {
             "flagged": len(flagged),
             "open_sessions": open_flagged,

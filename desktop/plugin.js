@@ -2252,6 +2252,67 @@ function AIUsageStatStrip({ data }) {
   })
 }
 
+function QuotaAlertStrip({ notes, dismissedIds, onDismiss, onOpen }) {
+  const dismissed = new Set(dismissedIds || [])
+  const visible = (notes || []).filter(note => !dismissed.has(note.id))
+  if (!visible.length) return null
+  return jsx('div', {
+    role: 'status',
+    style: { background: color.warningSoft, borderBottom: border, display: 'grid', gap: '0.2rem', padding: '0.4rem 0.8rem' },
+    children: visible.slice(0, 3).map(note => jsxs('div', {
+      style: { alignItems: 'center', display: 'flex', gap: '0.45rem' },
+      children: [
+        jsx(Codicon, {
+          name: note.severity === 'danger' ? 'flame' : 'warning',
+          size: '0.7rem',
+          style: { color: note.severity === 'danger' ? color.danger : color.warning, flexShrink: 0 }
+        }),
+        jsxs('button', {
+          type: 'button',
+          onClick: onOpen,
+          title: `Open AI Usage. Reading from ${formatDate(note.as_of)}${note.stale ? ' (last known; the latest refresh failed)' : ''}.`,
+          style: {
+            alignItems: 'baseline',
+            background: 'transparent',
+            border: 'none',
+            color: color.secondary,
+            cursor: 'pointer',
+            display: 'flex',
+            flex: 1,
+            font: 'inherit',
+            fontSize: '0.6875rem',
+            gap: '0.45rem',
+            minWidth: 0,
+            outlineColor: color.accent,
+            overflow: 'hidden',
+            padding: '0.1rem 0',
+            textAlign: 'left',
+            whiteSpace: 'nowrap'
+          },
+          children: [
+            jsx('span', {
+              style: { color: note.severity === 'danger' ? color.danger : color.primary, fontWeight: 650 },
+              children: `${note.provider_label} · ${note.window_label}`
+            }),
+            jsx('span', {
+              style: { color: color.tertiary, overflow: 'hidden', textOverflow: 'ellipsis' },
+              children: `${note.reason}${note.exhaust_at ? ` — empty ~${formatShortDate(note.exhaust_at)}` : ''}`
+            })
+          ]
+        }),
+        jsx('button', {
+          type: 'button',
+          onClick: () => onDismiss(note.id),
+          'aria-label': `Dismiss the quota note for ${note.provider_label} ${note.window_label}`,
+          title: 'Dismiss this note for the current window. It returns after the reset if the condition persists.',
+          style: { alignItems: 'center', background: 'transparent', border: 'none', color: color.quaternary, cursor: 'pointer', display: 'flex', flexShrink: 0, outlineColor: color.accent, padding: '0.05rem' },
+          children: jsx(Codicon, { name: 'close', size: '0.7rem' })
+        })
+      ]
+    }, note.id))
+  })
+}
+
 function AIUsageView({ query, narrow, refreshError, history }) {
   if (query.isLoading) return jsx(LoadingBlock, { rows: 8 })
   if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'AI usage is unavailable' })
@@ -2546,6 +2607,20 @@ function SessionLensPage({ ctx }) {
     refetchInterval: 120_000
   })
   const servingProfile = healthQuery.data?.profile_name
+  // Same query key as SessionsView's attention banner, so the two share one
+  // request; this page-level copy keeps quota notes visible on every tab.
+  const pageAttentionQuery = useQuery({
+    queryKey: [PLUGIN_ID, 'attention', period.days, period.start_at, period.end_at],
+    queryFn: () => ctx.rest(apiPath('/attention', period)),
+    refetchInterval: 120_000
+  })
+  const [quotaDismissed, setQuotaDismissed] = useState(() => {
+    const stored = ctx.storage.get('quotaAlertsDismissed')
+    return Array.isArray(stored) ? stored.filter(item => typeof item === 'string').slice(0, 40) : []
+  })
+  useEffect(() => {
+    ctx.storage.set('quotaAlertsDismissed', quotaDismissed)
+  }, [ctx, quotaDismissed])
   const drillToSessions = filters => {
     setDrill({ ...filters, key: Date.now() })
     setTab('sessions')
@@ -2662,6 +2737,14 @@ function SessionLensPage({ ctx }) {
           }, item.id)
         )
       }),
+      tab !== 'ai-usage'
+        ? jsx(QuotaAlertStrip, {
+            notes: pageAttentionQuery.data?.quotas,
+            dismissedIds: quotaDismissed,
+            onDismiss: id => setQuotaDismissed(current => [...new Set([...current, id])].slice(-40)),
+            onOpen: () => setTab('ai-usage')
+          })
+        : null,
       jsx('div', { style: { display: 'flex', flex: 1, minHeight: 0, overflow: 'hidden' }, children: content })
     ]
   })
