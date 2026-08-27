@@ -1052,13 +1052,32 @@ function SessionDetail({ query, detailTab, setDetailTab, ctx, period, onBack }) 
   })
 }
 
-function AttentionBanner({ data, onSelect }) {
-  const sessions = data?.sessions || []
-  if (!sessions.length) return null
-  const totals = data.totals || {}
+function AttentionBanner({ data, onSelect, dismissedIds, onDismiss, onRestore }) {
+  const dismissed = new Set(dismissedIds || [])
+  const allSessions = data?.sessions || []
+  const sessions = allSessions.filter(session => !dismissed.has(session.id))
+  const dismissedCount = allSessions.length - sessions.length
+  if (!allSessions.length) return null
+  if (!sessions.length) {
+    return jsxs('div', {
+      style: { alignItems: 'center', borderBottom: border, color: color.quaternary, display: 'flex', fontSize: '0.625rem', gap: '0.4rem', padding: '0.3rem 0.8rem' },
+      children: [
+        jsx('span', { children: `${formatCount(dismissedCount)} attention note${dismissedCount === 1 ? '' : 's'} dismissed.` }),
+        jsx('button', {
+          type: 'button',
+          onClick: onRestore,
+          style: { background: 'transparent', border: 'none', color: color.accent, cursor: 'pointer', font: 'inherit', fontSize: '0.625rem', outlineColor: color.accent, padding: 0, textDecoration: 'underline', textUnderlineOffset: '2px' },
+          children: 'Restore'
+        })
+      ]
+    })
+  }
+  const openCount = sessions.filter(session => session.ended_at === null || session.ended_at === undefined).length
+  const reapedCount = sessions.length - openCount
+  const hiddenFlagged = Math.max(0, (Number(data.totals?.flagged) || allSessions.length) - allSessions.length)
   const summaryParts = []
-  if (totals.open_sessions) summaryParts.push(`${formatCount(totals.open_sessions)} open past ${formatCount(data.thresholds?.open_hours || 24)}h`)
-  if (totals.reaped_sessions) summaryParts.push(`${formatCount(totals.reaped_sessions)} reaped with heavy spend`)
+  if (openCount) summaryParts.push(`${formatCount(openCount)} open past ${formatCount(data.thresholds?.open_hours || 24)}h`)
+  if (reapedCount) summaryParts.push(`${formatCount(reapedCount)} reaped with heavy spend`)
   return jsxs('div', {
     role: 'status',
     style: { background: color.warningSoft, borderBottom: border, display: 'grid', gap: '0.35rem', padding: '0.55rem 0.8rem' },
@@ -1067,48 +1086,77 @@ function AttentionBanner({ data, onSelect }) {
         style: { alignItems: 'center', color: color.warning, display: 'flex', fontSize: '0.6875rem', fontWeight: 650, gap: '0.4rem' },
         children: [
           jsx(Codicon, { name: 'warning', size: '0.75rem' }),
-          jsx('span', { children: `${formatCount(totals.flagged)} session${totals.flagged === 1 ? '' : 's'} need attention — ${summaryParts.join(' · ')}` })
+          jsx('span', { style: { flex: 1 }, children: `${formatCount(sessions.length)} session${sessions.length === 1 ? '' : 's'} need attention — ${summaryParts.join(' · ')}` }),
+          dismissedCount > 0
+            ? jsx('button', {
+                type: 'button',
+                onClick: onRestore,
+                style: { background: 'transparent', border: 'none', color: color.warning, cursor: 'pointer', font: 'inherit', fontSize: '0.625rem', fontWeight: 400, outlineColor: color.accent, padding: 0, textDecoration: 'underline', textUnderlineOffset: '2px' },
+                children: `restore ${formatCount(dismissedCount)} dismissed`
+              })
+            : null,
+          jsx('button', {
+            type: 'button',
+            onClick: () => onDismiss(sessions.map(session => session.id)),
+            title: 'Dismiss all current attention notes. Restore brings them back.',
+            style: { background: 'transparent', border: 'none', color: color.warning, cursor: 'pointer', font: 'inherit', fontSize: '0.625rem', fontWeight: 400, outlineColor: color.accent, padding: 0, textDecoration: 'underline', textUnderlineOffset: '2px' },
+            children: 'dismiss all'
+          })
         ]
       }),
       jsx('div', {
         style: { display: 'grid', gap: '0.15rem' },
-        children: sessions.slice(0, 5).map(session => jsxs('button', {
-          type: 'button',
-          onClick: () => onSelect(session.id),
-          title: 'Show this session in the list below',
-          style: {
-            alignItems: 'baseline',
-            background: 'transparent',
-            border: 'none',
-            color: color.secondary,
-            cursor: 'pointer',
-            display: 'flex',
-            font: 'inherit',
-            fontSize: '0.6875rem',
-            gap: '0.6rem',
-            justifyContent: 'space-between',
-            outlineColor: color.accent,
-            padding: '0.12rem 0',
-            textAlign: 'left',
-            width: '100%'
-          },
+        children: sessions.slice(0, 5).map(session => jsxs('div', {
+          style: { alignItems: 'baseline', display: 'flex', gap: '0.45rem' },
           children: [
-            jsxs('span', {
-              style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+            jsxs('button', {
+              type: 'button',
+              onClick: () => onSelect(session.id),
+              title: 'Show this session in the list below',
+              style: {
+                alignItems: 'baseline',
+                background: 'transparent',
+                border: 'none',
+                color: color.secondary,
+                cursor: 'pointer',
+                display: 'flex',
+                flex: 1,
+                font: 'inherit',
+                fontSize: '0.6875rem',
+                gap: '0.6rem',
+                justifyContent: 'space-between',
+                minWidth: 0,
+                outlineColor: color.accent,
+                padding: '0.12rem 0',
+                textAlign: 'left'
+              },
               children: [
-                jsx('span', { style: { color: session.severity === 'danger' ? color.danger : color.primary, fontWeight: 650 }, children: session.title || session.id }),
-                jsx('span', { style: { color: color.tertiary }, children: ` — ${session.reason}` })
+                jsxs('span', {
+                  style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+                  children: [
+                    jsx('span', { style: { color: session.severity === 'danger' ? color.danger : color.primary, fontWeight: 650 }, children: session.title || session.id }),
+                    jsx('span', { style: { color: color.tertiary }, children: ` — ${session.reason}` })
+                  ]
+                }),
+                jsx('span', {
+                  style: { ...tabular, color: color.tertiary, flexShrink: 0 },
+                  children: `${formatCount(session.total_tokens)} tok · ${formatCost(session.display_cost_usd, session.cost_kind)}`
+                })
               ]
             }),
-            jsx('span', {
-              style: { ...tabular, color: color.tertiary, flexShrink: 0 },
-              children: `${formatCount(session.total_tokens)} tok · ${formatCost(session.display_cost_usd, session.cost_kind)}`
+            jsx('button', {
+              type: 'button',
+              onClick: () => onDismiss([session.id]),
+              'aria-label': `Dismiss the attention note for ${session.title || session.id}`,
+              title: 'Dismiss this note',
+              style: { alignItems: 'center', background: 'transparent', border: 'none', color: color.quaternary, cursor: 'pointer', display: 'flex', flexShrink: 0, outlineColor: color.accent, padding: '0.05rem' },
+              children: jsx(Codicon, { name: 'close', size: '0.7rem' })
             })
           ]
         }, session.id))
       }),
-      sessions.length > 5 || data.totals?.truncated
-        ? jsx('span', { style: { color: color.tertiary, fontSize: '0.625rem' }, children: `${formatCount(Math.max(0, (totals.flagged || 0) - 5))} more flagged; search or sort by tokens to review the rest.` })
+      sessions.length > 5 || hiddenFlagged > 0
+        ? jsx('span', { style: { color: color.tertiary, fontSize: '0.625rem' }, children: `${formatCount(Math.max(0, sessions.length - 5) + hiddenFlagged)} more flagged; search or sort by tokens to review the rest.` })
         : null
     ]
   })
@@ -1136,6 +1184,13 @@ function SessionsView({ ctx, period, narrow, drill }) {
     setNarrowPane('list')
   }, [drill])
 
+  const [dismissedAttention, setDismissedAttention] = useState(() => {
+    const stored = ctx.storage.get('attentionDismissed')
+    return Array.isArray(stored) ? stored.filter(item => typeof item === 'string').slice(0, 100) : []
+  })
+  useEffect(() => {
+    ctx.storage.set('attentionDismissed', dismissedAttention)
+  }, [ctx, dismissedAttention])
   const attentionQuery = useQuery({
     queryKey: [PLUGIN_ID, 'attention', period.days, period.start_at, period.end_at],
     queryFn: () => ctx.rest(apiPath('/attention', period)),
@@ -1182,6 +1237,9 @@ function SessionsView({ ctx, period, narrow, drill }) {
         ? null
         : jsx(AttentionBanner, {
             data: attentionQuery.data,
+            dismissedIds: dismissedAttention,
+            onDismiss: ids => setDismissedAttention(current => [...new Set([...current, ...ids])].slice(-100)),
+            onRestore: () => setDismissedAttention([]),
             onSelect: id => {
               setSearch(id)
               setFailuresOnly(false)

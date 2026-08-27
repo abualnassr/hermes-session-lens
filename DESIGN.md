@@ -104,7 +104,7 @@ components:
 
 Hermes Session Lens is an **Operate** surface inside Hermes Desktop: one native observatory connecting provider capacity and session evidence to accounting and operational health. It inherits Hermes typography, controls, codicons, focus behavior, and light/dark theme roles; it does not establish a separate brand skin.
 
-This design document describes Hermes Session Lens `0.12.0`.
+This design document describes Hermes Session Lens `0.12.1`.
 
 The interface is compact, quiet, and evidence-first. A user finds a session, verifies trace and accounting, then inspects runtime, profile, or schedule state without leaving Hermes. Progressive disclosure carries the density, while explicit provenance, bounded excerpts, and read-only language make the trust boundary visible.
 
@@ -169,7 +169,7 @@ The palette is wholly theme-owned: Hermes accent and neutral roles carry structu
 
 The page fills its Hermes route and uses a compact header, a four-signal strip, seven stable view tabs, then a dense scroll-managed workspace. Session views establish recorded cost, tokens, sessions, and failures; AI Usage swaps those signals for connected providers, attention, next reset, and refresh freshness; AI Models shows distinct models, requests, total tokens, and known API cost.
 
-An attention banner precedes the Sessions toolbar when runaway work exists: a warning-wash strip listing up to five sessions that are open past the 24-hour threshold (still-active ones always; idle ones only with five-million-plus tokens) or were reaped with five-million-plus tokens, each row a button that reveals that session in the list. Severity distinguishes still-active runaways (destructive text) from idle never-closed sessions (primary text). The banner renders nothing when no session qualifies.
+An attention banner precedes the Sessions toolbar when runaway work exists: a warning-wash strip listing up to five sessions that are open past the 24-hour threshold (still-active ones always; idle ones only with five-million-plus tokens) or were reaped with five-million-plus tokens, each row a button that reveals that session in the list. Severity distinguishes still-active runaways (destructive text) from idle never-closed sessions (primary text). Each note carries a close control; dismissals persist in plugin storage (capped at one hundred ids) and a quiet restore link brings them back — dismissing all collapses the banner to a one-line dismissed count. The banner renders nothing when no session qualifies.
 
 Sessions uses a wide master/detail split with a minimum 20rem list and 28rem detail, weighted 0.82/1.38. List and detail scroll independently. The detail proceeds through its own header, four metrics, Summary/Trace/Tools/Failures/Files tabs, then a single content scroller.
 
