@@ -225,6 +225,18 @@ function LoadingBlock({ rows = 4 }) {
 
 function ErrorBlock({ error, onRetry, title = 'Session Lens could not load this view' }) {
   const message = error?.message || String(error || 'The backend did not return data.')
+  if (/plugin not found/i.test(message)) {
+    return jsx('div', {
+      style: { display: 'grid', minHeight: '15rem', placeItems: 'center', padding: '2rem' },
+      children: jsxs(EmptyState, {
+        title: 'Session Lens is not installed in the active profile',
+        description: 'Hermes plugins are per-profile, and this profile’s gateway does not serve session-lens. To use it here, run “hermes plugins install abualnassr/hermes-session-lens --enable” while this profile is active, then restart the gateway. Your other profiles are unaffected.',
+        children: [
+          jsx(Button, { variant: 'outline', size: 'sm', onClick: onRetry, children: 'Check again' })
+        ]
+      })
+    })
+  }
   return jsx('div', {
     style: { display: 'grid', minHeight: '15rem', placeItems: 'center', padding: '2rem' },
     children: jsxs(ErrorState, {
