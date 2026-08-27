@@ -1462,7 +1462,7 @@ function ProjectsSection({ ctx, period }) {
             label: 'Models',
             muted: true,
             sortValue: row => (row.models || []).map(item => item.model).join(', '),
-            render: row => (row.models || []).map(item => _modelBasename(item.model)).join(' · ') || '—'
+            render: row => distinctValues((row.models || []).map(item => _modelBasename(item.model))).join(' · ') || '—'
           },
           { key: 'last_activity_at', label: 'Last active', render: row => formatShortDate(row.last_activity_at), muted: true }
         ],
@@ -1848,7 +1848,7 @@ function AgentScoreboard({ ctx, period, onSelectJob }) {
               }),
               jsx('span', {
                 style: { ...tabular, color: color.quaternary, flexShrink: 0, fontSize: '0.625rem' },
-                children: `avg ${formatDurationShort(job.avg_duration_seconds)} · avg ${formatCost(job.avg_cost_usd, 'actual')} · last ${formatRelativeTime(job.last_run_at)}`
+                children: `avg ${formatDurationShort(job.avg_duration_seconds)} · avg ${formatCost(job.avg_cost_usd, 'actual')} · ${formatRelativeTime(job.last_run_at)}`
               })
             ]
           }, job.label)
