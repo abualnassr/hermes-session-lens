@@ -173,6 +173,20 @@ def _list_sessions_sync(
         }
 
 
+def _serving_profile_name() -> str:
+    """Name the Hermes profile this backend reads, derived from its home path."""
+    try:
+        home = _hermes_home().resolve()
+    except Exception:
+        return "unknown"
+    parts = [part.lower() for part in home.parts]
+    if "profiles" in parts:
+        index = parts.index("profiles")
+        if index + 1 < len(home.parts):
+            return home.parts[index + 1]
+    return "default"
+
+
 @router.get("/health")
 async def health() -> Dict[str, Any]:
     def read() -> Dict[str, Any]:
@@ -184,6 +198,7 @@ async def health() -> Dict[str, Any]:
                 "plugin_version": PLUGIN_VERSION,
                 "schema_version": _integer(version_row[0] if version_row else 0),
                 "read_only": bool(getattr(db, "read_only", False)),
+                "profile_name": _serving_profile_name(),
             }
 
     return await asyncio.to_thread(read)

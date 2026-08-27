@@ -2399,6 +2399,12 @@ function SessionLensPage({ ctx }) {
     setCustomEnd(value)
     if (value < customStart) setCustomStart(value)
   }
+  const healthQuery = useQuery({
+    queryKey: [PLUGIN_ID, 'health'],
+    queryFn: () => ctx.rest('/health'),
+    refetchInterval: 120_000
+  })
+  const servingProfile = healthQuery.data?.profile_name
   const drillToSessions = filters => {
     setDrill({ ...filters, key: Date.now() })
     setTab('sessions')
@@ -2443,6 +2449,13 @@ function SessionLensPage({ ctx }) {
           jsxs('div', {
             style: { alignItems: 'center', display: 'flex', flex: '1 1 auto', flexWrap: 'wrap', gap: '0.5rem', justifyContent: 'flex-end' },
             children: [
+              servingProfile
+                ? jsx('span', {
+                    title: `Every number on this page comes from the “${servingProfile}” profile’s Hermes records. If the desktop is on a different profile whose gateway is not running, requests fall back to this one — the label keeps the data source honest.`,
+                    style: { ...tabular, background: color.surfaceRaised, border, borderRadius: '999px', color: color.tertiary, flexShrink: 0, fontSize: '0.625rem', padding: '0.22rem 0.6rem', whiteSpace: 'nowrap' },
+                    children: `data: ${servingProfile} profile`
+                  })
+                : null,
               tab === 'ai-usage'
                 ? jsx(Pill, {
                     tone: 'accent',

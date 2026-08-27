@@ -582,6 +582,10 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertEqual(offender["fallback_streak"], 3)
         self.assertNotIn("abc123", offender["failure_error"])
 
+    def test_health_names_the_serving_profile(self):
+        # The fixture home is a temp dir with no "profiles" segment -> default.
+        self.assertEqual(api._serving_profile_name(), "default")
+
     def test_attention_flags_runaway_and_reaped_sessions(self):
         connection = sqlite3.connect(self.db_path)
         try:

@@ -4,13 +4,14 @@ Hermes Session Lens is a native observability page for Hermes Desktop. It appear
 
 It is a unified Hermes plugin—one install contains the native Desktop page and its namespaced Python API. There is no iframe, separate dashboard, Node server, or third-party telemetry service.
 
-This documentation describes Hermes Session Lens `0.13.0`.
+This documentation describes Hermes Session Lens `0.13.1`.
 
 ## What it includes
 
 - A project rollup on Overview ("Where the spend goes"): sessions grouped by git repository, then working directory, then source for sessions with no recorded directory — sessions, tokens, recorded cost with unpriced counts, confirmed failures, top models, last activity.
 - An agent run-health scoreboard on Operations → Schedules: cron sessions grouped per job by title, with a latest-runs strip (completed/failed/cancelled/running), failure counts, streaks, average duration and cost per run, and click-through to the job's sessions.
 - A context-compression distress readout on Operations → Health: sessions with recorded fallback streaks, ineffective passes, compression failures, or active cooldowns, with the top offenders listed; a single quiet line when nothing is distressed.
+- Profile provenance: `/health` names the profile whose records the backend serves, and the page header shows it as a "data: <profile> profile" chip. Hermes plugins and telemetry are per-profile, and the desktop can silently fall back to another profile's gateway when the active one is not running — the chip keeps the data source honest.
 - A machine-consumable digest at `GET /api/plugins/session-lens/digest?days=7`: period totals with prior-period deltas (sessions, tokens, recorded cost, failure events, tool failures), the attention list, top models by requests with work-reliability evidence, over-pace quota windows with exhaustion forecasts, and a ready-made `markdown` field — built for cron agents, notification pipelines, or any automation that reads the plugin API. Read-only like every other route.
 - Quota exhaustion forecasts: when a timed OAuth quota window is burning faster than its billing period elapses, both the AI Usage window card and the AI Models quota meter state when the window runs out at the current pace ("At this pace, empty ~Sat, Aug 29"). Forecasts are linear extrapolations, suppressed during the first 10% of a period, for on-pace windows, and for windows without a known duration.
 - An attention banner above the session list flags runaway work: sessions open past 24 hours that are either still active (destructive severity) or idle with five million tokens or more, and reaped or expired sessions (`startup_orphan_reap`, `max_runtime`, `timeout`) at the same token threshold. Each flagged row jumps to that session in the list and can be dismissed individually or all at once (persisted locally, restorable); quiet histories render no banner.
