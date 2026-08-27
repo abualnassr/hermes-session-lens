@@ -937,6 +937,15 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertEqual(payload["windows"][0]["unit"], "tokens")
         self.assertIn("2027", payload["windows"][0]["reset_at"])
 
+    def test_zai_no_coding_plan_is_nothing_to_monitor_not_a_fault(self):
+        payload = api._zai_payload({"code": 500, "msg": "当前用户不存在coding plan", "success": False})
+        self.assertEqual(payload["status"], "not_configured")
+        self.assertIn("no Coding Plan subscription", payload["message"])
+
+        generic = api._zai_payload({"code": 500, "msg": "internal error", "success": False})
+        self.assertEqual(generic["status"], "unavailable")
+        self.assertIn("internal error", generic["message"])
+
     def test_ai_usage_cache_preserves_last_success_as_stale(self):
         def ok(provider):
             return api._provider_payload(

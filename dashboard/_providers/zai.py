@@ -28,8 +28,23 @@ def _zai_limits(payload: Mapping[str, Any]) -> List[Mapping[str, Any]]:
 def _zai_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
     code = _usage_number(payload.get("code"))
     if code is not None and code != 200:
+        msg = _clean_text(payload.get("msg") or payload.get("message"), 160)
+        # "当前用户不存在coding plan" — the key is valid but the account has no
+        # Coding Plan, and Z.AI's usage API only reports Coding Plan quotas.
+        # That is "nothing to monitor", not a fault.
+        if msg and "coding plan" in msg.lower():
+            return _provider_payload(
+                "zai",
+                status="not_configured",
+                message=(
+                    "Z.AI reports this account has no Coding Plan subscription; "
+                    "its usage API only exposes Coding Plan quotas, so there is nothing to monitor."
+                ),
+            )
         return _provider_payload(
-            "zai", status="unavailable", message=f"Z.AI usage service returned code {code:g}."
+            "zai",
+            status="unavailable",
+            message=f"Z.AI usage service returned code {code:g}." + (f" {msg}" if msg else ""),
         )
     windows: List[Dict[str, Any]] = []
     for raw in _zai_limits(payload):
