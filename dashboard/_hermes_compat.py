@@ -107,6 +107,25 @@ def _resolve_anthropic_oauth() -> Tuple[str, bool]:
         return "", False
 
 
+def _resolve_anthropic_pool_oauth() -> str:
+    """OAuth token from Hermes' Anthropic credential pool, read directly.
+
+    Hermes' resolver lets an explicit ANTHROPIC_API_KEY shadow saved OAuth
+    logins, but the account-usage endpoint only accepts OAuth — so the
+    collector needs the pool login even when the resolver returns an API key.
+    Empty string when no OAuth login is stored.
+    """
+    try:
+        from agent import anthropic_adapter
+
+        token = str(anthropic_adapter._resolve_anthropic_pool_token() or "").strip()
+        if token and anthropic_adapter._is_oauth_token(token):
+            return token
+    except Exception:
+        pass
+    return ""
+
+
 def _hermes_configured_provider_ids() -> List[str]:
     """Provider ids Hermes holds credentials for, from the live PROVIDER_REGISTRY.
 

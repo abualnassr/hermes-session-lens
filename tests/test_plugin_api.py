@@ -937,6 +937,41 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertEqual(payload["windows"][0]["unit"], "tokens")
         self.assertIn("2027", payload["windows"][0]["reset_at"])
 
+    def test_anthropic_usage_payload_mirrors_hermes_window_parsing(self):
+        from dashboard._providers import anthropic as anthropic_provider
+
+        payload = anthropic_provider._anthropic_usage_payload(
+            {
+                "five_hour": {"utilization": 0.42, "resets_at": "2027-01-15T21:00:00+00:00"},
+                "seven_day": {"utilization": 25, "resets_at": "2027-01-19T07:00:00+00:00"},
+                "extra_usage": {"is_enabled": True, "used_credits": 1.5, "monthly_limit": 20, "currency": "USD"},
+            }
+        )
+        self.assertEqual(payload["status"], "ok")
+        self.assertEqual(
+            [(w["label"], w["percentage_used"]) for w in payload["windows"]],
+            [("Current session", 42.0), ("Current week", 25.0)],
+        )
+        self.assertEqual(payload["details"], ["Extra usage: 1.50 / 20.00 USD"])
+
+    def test_anthropic_api_key_shadowing_falls_back_to_pool_oauth(self):
+        from dashboard._providers import anthropic as anthropic_provider
+
+        sentinel = api._provider_payload("anthropic", status="ok")
+        with patch.object(anthropic_provider, "_resolve_anthropic_oauth", return_value=("sk-ant-api-key", False)):
+            with patch.object(anthropic_provider, "_resolve_anthropic_pool_oauth", return_value="pool-oauth-token"):
+                with patch.object(anthropic_provider, "_collect_anthropic_direct", return_value=sentinel) as direct:
+                    result = anthropic_provider._collect_anthropic_usage()
+        direct.assert_called_once_with("pool-oauth-token")
+        self.assertIs(result, sentinel)
+
+        # API key but no saved OAuth login: explain the requirement plainly.
+        with patch.object(anthropic_provider, "_resolve_anthropic_oauth", return_value=("sk-ant-api-key", False)):
+            with patch.object(anthropic_provider, "_resolve_anthropic_pool_oauth", return_value=""):
+                result = anthropic_provider._collect_anthropic_usage()
+        self.assertEqual(result["status"], "not_configured")
+        self.assertIn("Sign in with Claude in Hermes", result["message"])
+
     def test_zai_no_coding_plan_is_nothing_to_monitor_not_a_fault(self):
         payload = api._zai_payload({"code": 500, "msg": "当前用户不存在coding plan", "success": False})
         self.assertEqual(payload["status"], "not_configured")
