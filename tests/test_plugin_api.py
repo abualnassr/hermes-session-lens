@@ -1283,11 +1283,16 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertIn("pct < last[1] - 1", source)
         self.assertIn("function usageSlopeForecast", source)
         self.assertIn("recorded burn slope", source)
-        self.assertIn("Usage burn sparkline", source)
-        # A flat series must not render — it looks like a stray divider rule.
-        self.assertIn("maxP - minP < 0.2", source)
-        # Small drifts render as gentle slopes, not cliffs.
-        self.assertIn("Math.max(5, maxP - minP)", source)
+        # Sparklines were removed at the user's request (0.19.0); history
+        # still feeds the slope forecast.
+        self.assertNotIn("UsageSparkline", source)
+
+    def test_refresh_buttons_spin_with_animated_icon(self):
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("function SpinIcon", source)
+        self.assertIn("session-lens-spin", source)
+        # The Codicon "sync~spin" modifier rendered a blank box in Hermes.
+        self.assertNotIn("sync~spin", source)
 
     def test_trace_is_paginated_redacted_and_excludes_system_prompts(self):
         trace = api._trace_sync("session-1", 100, 0)

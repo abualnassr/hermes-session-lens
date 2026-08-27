@@ -1312,7 +1312,7 @@ function SessionsView({ ctx, period, narrow, drill }) {
                     style: { alignItems: 'center', borderBottom: border, color: color.tertiary, display: 'flex', fontSize: '0.6875rem', justifyContent: 'space-between', padding: '0.45rem 0.85rem' },
                     children: [
                       jsx('span', { children: pagination ? `${formatCount(pagination.total)} sessions` : 'Loading sessions…' }),
-                      listQuery.isFetching ? jsx(Codicon, { name: 'sync~spin', size: '0.7rem' }) : null
+                      listQuery.isFetching ? jsx(SpinIcon, { size: '0.7rem' }) : null
                     ]
                   }),
                   listQuery.isLoading
@@ -2028,50 +2028,17 @@ function usageSlopeForecast(series, resetAt) {
   return { exhaustAt: exhaustMs / 1000, spanHours: spanMs / 3_600_000, samples: n }
 }
 
-function UsageSparkline({ series, danger }) {
-  if (!Array.isArray(series) || series.length < 3) return null
-  const width = 240
-  const height = 22
-  const t0 = series[0][0]
-  const spanT = Math.max(1, series[series.length - 1][0] - t0)
-  const pcts = series.map(point => point[1])
-  const minP = Math.min(...pcts)
-  const maxP = Math.max(...pcts)
-  // A flat series draws a line indistinguishable from a divider rule; show
-  // the sparkline only once there is recorded movement to look at.
-  if (maxP - minP < 0.2) return null
-  // Never stretch less than a 5-point span to full height — a 1% drift
-  // should look like a gentle slope, not a cliff.
-  const spanP = Math.max(5, maxP - minP)
-  const coords = series.map(([t, p]) =>
-    `${(((t - t0) / spanT) * (width - 4) + 2).toFixed(1)},${(height - 3 - ((p - minP) / spanP) * (height - 6)).toFixed(1)}`
-  )
-  const [endX, endY] = coords[coords.length - 1].split(',')
-  const hours = spanT / 3_600_000
-  const spanLabel = hours >= 1.5 ? `${Math.round(hours)}h` : `${Math.max(1, Math.round(hours * 60))}m`
-  return jsx('div', {
-    title: `Recorded burn over the last ${spanLabel} (${series.length} readings, sampled while Session Lens is open).`,
-    style: { lineHeight: 0 },
-    children: jsxs('svg', {
-      width: '100%',
-      height,
-      viewBox: `0 0 ${width} ${height}`,
-      preserveAspectRatio: 'none',
-      'aria-label': 'Usage burn sparkline',
-      role: 'img',
-      children: [
-        jsx('polyline', {
-          points: coords.join(' '),
-          fill: 'none',
-          stroke: danger ? color.danger : color.accent,
-          strokeWidth: 1.4,
-          strokeLinejoin: 'round',
-          strokeLinecap: 'round',
-          opacity: 0.85
-        }),
-        jsx('circle', { cx: endX, cy: endY, r: 1.9, fill: danger ? color.danger : color.accent })
-      ]
-    })
+function SpinIcon({ size }) {
+  // Hermes' Codicon component does not understand codicon spin-modifier
+  // names (they rendered a blank box), so the rotation is animated here.
+  return jsxs(Fragment, {
+    children: [
+      jsx('style', { children: '@keyframes session-lens-spin { from { transform: rotate(0deg) } to { transform: rotate(360deg) } }' }),
+      jsx('span', {
+        style: { animation: 'session-lens-spin 1.1s linear infinite', display: 'inline-flex', lineHeight: 0 },
+        children: jsx(Codicon, { name: 'sync', size })
+      })
+    ]
   })
 }
 
@@ -2129,7 +2096,6 @@ function UsageWindow({ window, series }) {
             })
           })
         : null,
-      window.kind === 'quota' ? jsx(UsageSparkline, { series, danger }) : null,
       exhaustAt
         ? jsx('div', {
             title: slope
@@ -2202,7 +2168,7 @@ function UsageProvider({ provider, history, onRefresh }) {
                     'aria-label': `Refresh ${provider.label} usage`,
                     title: `Refresh only ${provider.label}. The other cards keep their current readings.`,
                     style: { alignItems: 'center', background: 'transparent', border: 'none', color: color.quaternary, cursor: busy ? 'default' : 'pointer', display: 'flex', outlineColor: color.accent, padding: '0.1rem' },
-                    children: jsx(Codicon, { name: busy ? 'sync~spin' : 'refresh', size: '0.7rem' })
+                    children: busy ? jsx(SpinIcon, { size: '0.7rem' }) : jsx(Codicon, { name: 'refresh', size: '0.7rem' })
                   })
                 : null
             ]
@@ -2796,11 +2762,11 @@ function SessionLensPage({ ctx }) {
                 'aria-label': 'Refresh Session Lens',
                 title: 'Refresh Session Lens',
                 disabled: aiManualRefreshing,
-                children: jsx(Codicon, {
-                  name: (tab === 'ai-usage' || tab === 'ai-models'
-                    ? aiManualRefreshing || aiUsageQuery.isFetching || (tab === 'ai-models' && aiModelsQuery.isFetching)
-                    : overviewQuery.isFetching) ? 'sync~spin' : 'refresh'
-                })
+                children: (tab === 'ai-usage' || tab === 'ai-models'
+                  ? aiManualRefreshing || aiUsageQuery.isFetching || (tab === 'ai-models' && aiModelsQuery.isFetching)
+                  : overviewQuery.isFetching)
+                  ? jsx(SpinIcon, {})
+                  : jsx(Codicon, { name: 'refresh' })
               })
             ]
           })
