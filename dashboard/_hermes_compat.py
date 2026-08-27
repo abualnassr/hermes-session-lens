@@ -6,7 +6,7 @@ import hashlib
 import os
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterator, Optional, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Tuple
 
 try:
     from hermes_constants import get_hermes_home
@@ -105,6 +105,47 @@ def _resolve_anthropic_oauth() -> Tuple[str, bool]:
         return token, bool(token_check(token))
     except Exception:
         return "", False
+
+
+def _hermes_configured_provider_ids() -> List[str]:
+    """Provider ids Hermes holds credentials for, from the live PROVIDER_REGISTRY.
+
+    Model-provider plugins register ProviderProfiles into this registry (see
+    the Hermes developer guide), so a third-party provider the user installs
+    shows up here without Session Lens code changes. Local-only: API keys via
+    the same safe resolver `_resolve_hermes_api_key` uses, OAuth-style
+    providers via stored auth state. Returns [] outside Hermes.
+    """
+    configured: List[str] = []
+    try:
+        from hermes_cli import auth as hermes_auth
+
+        registry = getattr(hermes_auth, "PROVIDER_REGISTRY", None) or {}
+        secret_resolver = getattr(hermes_auth, "_resolve_api_key_provider_secret", None)
+        load_auth_store = getattr(hermes_auth, "_load_auth_store", None)
+        load_provider_state = getattr(hermes_auth, "_load_provider_state", None)
+        auth_store = None
+        if callable(load_auth_store):
+            try:
+                auth_store = load_auth_store()
+            except Exception:
+                auth_store = None
+        for provider_id, pconfig in registry.items():
+            try:
+                if str(getattr(pconfig, "auth_type", "") or "") == "api_key":
+                    if not callable(secret_resolver):
+                        continue
+                    token, _source = secret_resolver(provider_id, pconfig)
+                    if str(token or "").strip():
+                        configured.append(str(provider_id))
+                elif auth_store is not None and callable(load_provider_state):
+                    if load_provider_state(auth_store, provider_id):
+                        configured.append(str(provider_id))
+            except Exception:
+                continue
+    except Exception:
+        return []
+    return configured
 
 
 def _compat_capabilities() -> Dict[str, str]:

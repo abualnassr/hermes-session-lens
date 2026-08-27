@@ -3127,6 +3127,7 @@ def _ai_usage_sync(fresh: bool = False, only_provider: Optional[str] = None) -> 
         providers = [results[provider] for provider in _AI_USAGE_PROVIDER_ORDER]
         payload = {
             "providers": providers,
+            "hermes_configured_unsupported": _usage_unsupported_configured(),
             "summary": _ai_usage_summary(providers),
             "generated_at": time.time(),
             "cached": False,
@@ -3165,6 +3166,43 @@ def _fold_usage_last_success(provider: str, result: Dict[str, Any]) -> Dict[str,
             }
         )
     return result
+
+
+# Registry ids (and their aliases) already covered by a usage collector.
+_USAGE_COVERED_PROVIDER_IDS = {
+    "openai-codex", "codex",
+    "anthropic", "anthropic-oauth", "claude",
+    "nous",
+    "openrouter",
+    "deepseek",
+    "xai", "xai-oauth", "grok",
+    "kimi", "kimi-coding", "kimi-coding-cn", "moonshot",
+    "zai", "zai-coding",
+}
+
+
+def _usage_unsupported_configured() -> List[Dict[str, str]]:
+    """Providers configured in Hermes that expose no usage API we can read.
+
+    Sourced from Hermes' live provider registry, so third-party provider
+    plugins appear here too. Distinguishes "cannot monitor" from "nothing to
+    monitor" on the AI Usage page.
+    """
+    entries: List[Dict[str, str]] = []
+    for provider_id in _hermes_configured_provider_ids():
+        key = str(provider_id).strip().lower()
+        if not key or key in _USAGE_COVERED_PROVIDER_IDS:
+            continue
+        meta = _MODEL_ROUTE_META.get(key) or {}
+        entries.append({"id": key, "label": str(meta.get("provider") or _humanize_identifier(key))})
+    seen: set[str] = set()
+    unique: List[Dict[str, str]] = []
+    for entry in sorted(entries, key=lambda item: item["label"].lower()):
+        if entry["label"].lower() in seen:
+            continue
+        seen.add(entry["label"].lower())
+        unique.append(entry)
+    return unique
 
 
 _USAGE_BILLING_KEYS = {

@@ -2412,10 +2412,15 @@ function AIUsageView({ query, narrow, refreshError, history, onRefreshProvider }
               onRefresh: onRefreshProvider
             })
           : jsx(EmptyState, {
-              title: 'No AI providers are connected',
-              description: unconfigured.length
-                ? `Session Lens can monitor account allowances for ${unconfigured.map(provider => provider.label).join(', ')}. Sign in or add the API key in Hermes and the provider appears here automatically.`
-                : 'No provider credentials were found in Hermes.'
+              title: 'No monitorable AI providers are connected',
+              description: [
+                (data?.hermes_configured_unsupported || []).length
+                  ? `Hermes has credentials for ${data.hermes_configured_unsupported.map(item => item.label).join(', ')}, but those providers expose no account-usage API Session Lens can read.`
+                  : null,
+                unconfigured.length
+                  ? `Session Lens can monitor account allowances for ${unconfigured.map(provider => provider.label).join(', ')}. Sign in or add the API key in Hermes and the provider appears here automatically.`
+                  : 'No provider credentials were found in Hermes.'
+              ].filter(Boolean).join(' ')
             }),
         configured.length && unconfigured.length
           ? jsxs('div', {
@@ -2426,6 +2431,20 @@ function AIUsageView({ query, narrow, refreshError, history, onRefreshProvider }
                   children: [
                     jsx('span', { style: { color: color.tertiary, fontWeight: 600 }, children: 'Also supported: ' }),
                     `${unconfigured.map(provider => provider.label).join(' · ')} — sign in or add the key in Hermes and they appear here.`
+                  ]
+                })
+              ]
+            })
+          : null,
+        (data?.hermes_configured_unsupported || []).length
+          ? jsxs('div', {
+              style: { alignItems: 'flex-start', color: color.quaternary, display: 'flex', fontSize: '0.6875rem', gap: '0.5rem', lineHeight: 1.5 },
+              children: [
+                jsx(Codicon, { name: 'circle-slash', size: '0.75rem', style: { marginTop: '0.15rem' } }),
+                jsxs('span', {
+                  children: [
+                    jsx('span', { style: { color: color.tertiary, fontWeight: 600 }, children: 'Configured in Hermes, not yet monitorable: ' }),
+                    `${data.hermes_configured_unsupported.map(item => item.label).join(' · ')} — these providers expose no account-usage API Session Lens can read.`
                   ]
                 })
               ]

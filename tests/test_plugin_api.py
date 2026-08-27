@@ -1074,7 +1074,7 @@ class SessionLensApiTests(unittest.TestCase):
         source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
         self.assertIn("provider.status !== 'not_configured'", source)
         self.assertIn("Also supported: ", source)
-        self.assertIn("No AI providers are connected", source)
+        self.assertIn("No monitorable AI providers are connected", source)
         self.assertIn("more supported", source)
 
     def test_ai_usage_single_provider_refresh_merges_into_cached_payload(self):
@@ -1154,6 +1154,38 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertIn("Recorded locally: ", source)
         self.assertIn("Refresh only ${provider.label}", source)
         self.assertIn("provider=${encodeURIComponent(provider)}", source)
+
+    def test_ai_usage_reports_configured_but_unsupported_registry_providers(self):
+        # Outside Hermes the registry is unreachable and the list is empty.
+        self.assertEqual(api._usage_unsupported_configured(), [])
+
+        with patch.object(
+            api,
+            "_hermes_configured_provider_ids",
+            return_value=["deepseek", "alibaba", "alibaba-coding-plan", "qwen-oauth", "nvidia", "my-custom-llm"],
+        ):
+            entries = api._usage_unsupported_configured()
+        labels = [entry["label"] for entry in entries]
+        # deepseek is covered by a collector; Qwen ids dedupe to one label.
+        self.assertEqual(labels, ["My Custom Llm", "NVIDIA", "Qwen"])
+
+            # And the payload carries the list for the UI footer.
+        collectors = {
+            f"_collect_{provider}_usage": Mock(
+                return_value=api._provider_payload(provider, status="not_configured")
+            )
+            for provider in api._AI_USAGE_PROVIDER_ORDER
+        }
+        with patch.object(api, "_hermes_configured_provider_ids", return_value=["nvidia"]):
+            with patch.multiple(api, **collectors):
+                payload = api._ai_usage_sync(True)
+        self.assertEqual(payload["hermes_configured_unsupported"], [{"id": "nvidia", "label": "NVIDIA"}])
+
+    def test_ai_usage_ui_names_unmonitorable_configured_providers(self):
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("Configured in Hermes, not yet monitorable: ", source)
+        self.assertIn("hermes_configured_unsupported", source)
+        self.assertIn("No monitorable AI providers are connected", source)
 
     def test_attention_quota_notes_come_from_cached_usage_only(self):
         api._ai_usage_cache = None
