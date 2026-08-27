@@ -1077,6 +1077,17 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertIn("No AI providers are connected", source)
         self.assertIn("more supported", source)
 
+    def test_ai_usage_ui_records_burn_history_and_forecasts_from_slope(self):
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("ctx.storage.get('usageHistory')", source)
+        # Cached responses repeat the same reading and must never be recorded.
+        self.assertIn("if (!data || data.cached) return", source)
+        # A percentage drop means the window reset; the series starts over.
+        self.assertIn("pct < last[1] - 1", source)
+        self.assertIn("function usageSlopeForecast", source)
+        self.assertIn("recorded burn slope", source)
+        self.assertIn("Usage burn sparkline", source)
+
     def test_trace_is_paginated_redacted_and_excludes_system_prompts(self):
         trace = api._trace_sync("session-1", 100, 0)
         kinds = {event["kind"] for event in trace["events"]}

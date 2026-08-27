@@ -1974,7 +1974,76 @@ function formatUsageAmount(value, unit) {
   return normalisedUnit ? `${formatted} ${normalisedUnit}` : formatted
 }
 
-function UsageWindow({ window }) {
+function usageSlopeForecast(series, resetAt) {
+  if (!Array.isArray(series) || series.length < 3) return null
+  const cutoff = Date.now() - 3 * 3_600_000
+  const recent = series.filter(point => point[0] >= cutoff)
+  const points = recent.length >= 3 ? recent : series.slice(-6)
+  if (points.length < 3) return null
+  const spanMs = points[points.length - 1][0] - points[0][0]
+  if (spanMs < 20 * 60_000) return null
+  const n = points.length
+  const meanT = points.reduce((sum, point) => sum + point[0], 0) / n
+  const meanP = points.reduce((sum, point) => sum + point[1], 0) / n
+  let numerator = 0
+  let denominator = 0
+  for (const [t, p] of points) {
+    numerator += (t - meanT) * (p - meanP)
+    denominator += (t - meanT) ** 2
+  }
+  if (!denominator) return null
+  const slope = numerator / denominator
+  if (slope <= 1e-9) return null
+  const [lastT, lastP] = points[points.length - 1]
+  const exhaustMs = lastT + (100 - lastP) / slope
+  if (!Number.isFinite(exhaustMs) || exhaustMs < Date.now() - 3_600_000) return null
+  const reset = timestampDate(resetAt)
+  if (reset && exhaustMs >= reset.getTime()) return null
+  return { exhaustAt: exhaustMs / 1000, spanHours: spanMs / 3_600_000, samples: n }
+}
+
+function UsageSparkline({ series, danger }) {
+  if (!Array.isArray(series) || series.length < 3) return null
+  const width = 240
+  const height = 22
+  const t0 = series[0][0]
+  const spanT = Math.max(1, series[series.length - 1][0] - t0)
+  const pcts = series.map(point => point[1])
+  const minP = Math.min(...pcts)
+  const spanP = Math.max(1, Math.max(...pcts) - minP)
+  const coords = series.map(([t, p]) =>
+    `${(((t - t0) / spanT) * (width - 4) + 2).toFixed(1)},${(height - 3 - ((p - minP) / spanP) * (height - 6)).toFixed(1)}`
+  )
+  const [endX, endY] = coords[coords.length - 1].split(',')
+  const hours = spanT / 3_600_000
+  const spanLabel = hours >= 1.5 ? `${Math.round(hours)}h` : `${Math.max(1, Math.round(hours * 60))}m`
+  return jsx('div', {
+    title: `Recorded burn over the last ${spanLabel} (${series.length} readings, sampled while Session Lens is open).`,
+    style: { lineHeight: 0 },
+    children: jsxs('svg', {
+      width: '100%',
+      height,
+      viewBox: `0 0 ${width} ${height}`,
+      preserveAspectRatio: 'none',
+      'aria-label': 'Usage burn sparkline',
+      role: 'img',
+      children: [
+        jsx('polyline', {
+          points: coords.join(' '),
+          fill: 'none',
+          stroke: danger ? color.danger : color.accent,
+          strokeWidth: 1.4,
+          strokeLinejoin: 'round',
+          strokeLinecap: 'round',
+          opacity: 0.85
+        }),
+        jsx('circle', { cx: endX, cy: endY, r: 1.9, fill: danger ? color.danger : color.accent })
+      ]
+    })
+  })
+}
+
+function UsageWindow({ window, series }) {
   const rawUsed = window.percentage_used
   const rawRemaining = window.percentage_remaining
   const hasPercent = rawUsed !== null && rawUsed !== undefined && Number.isFinite(Number(rawUsed))
@@ -1986,7 +2055,10 @@ function UsageWindow({ window }) {
   const usedAmount = formatUsageAmount(window.used, window.unit)
   const limitAmount = formatUsageAmount(window.limit, window.unit)
   const value = remainingAmount || (remainingPercent !== null ? `${Math.round(remainingPercent)}% remaining` : 'Recorded balance')
-  const exhaustAt = window.kind === 'quota' && hasPercent ? quotaExhaustAt(window, used) : null
+  const slope = window.kind === 'quota' && hasPercent ? usageSlopeForecast(series, window.reset_at) : null
+  const exhaustAt = slope
+    ? slope.exhaustAt
+    : window.kind === 'quota' && hasPercent ? quotaExhaustAt(window, used) : null
   const detailParts = []
   if (usedAmount && limitAmount) detailParts.push(`${usedAmount} used of ${limitAmount}`)
   if (window.detail) detailParts.push(window.detail)
@@ -2022,9 +2094,12 @@ function UsageWindow({ window }) {
             })
           })
         : null,
+      window.kind === 'quota' ? jsx(UsageSparkline, { series, danger }) : null,
       exhaustAt
         ? jsx('div', {
-            title: 'Linear extrapolation of the current burn rate over the elapsed share of this window.',
+            title: slope
+              ? `Extrapolated from the recorded burn slope of the last ${slope.spanHours >= 1.5 ? `${Math.round(slope.spanHours)} hours` : `${Math.max(1, Math.round(slope.spanHours * 60))} minutes`} (${slope.samples} readings).`
+              : 'Linear extrapolation of the current burn rate over the elapsed share of this window.',
             style: { color: used >= 90 ? color.danger : color.warning, fontSize: '0.6875rem', fontWeight: 600 },
             children: `At this pace, empty ~${formatShortDate(exhaustAt)} — before the reset.`
           })
@@ -2039,7 +2114,7 @@ function UsageWindow({ window }) {
   })
 }
 
-function UsageProvider({ provider }) {
+function UsageProvider({ provider, history }) {
   const status = usageStatus(provider)
   const messageDanger = ['expired', 'forbidden', 'unavailable'].includes(provider.status)
   return jsxs('section', {
@@ -2091,7 +2166,7 @@ function UsageProvider({ provider }) {
           })
         : null,
       provider.windows?.length
-        ? jsx('div', { style: { marginTop: '0.65rem' }, children: provider.windows.map(window => jsx(UsageWindow, { window }, `${provider.provider}-${window.id}`)) })
+        ? jsx('div', { style: { marginTop: '0.65rem' }, children: provider.windows.map(window => jsx(UsageWindow, { window, series: history?.[`${provider.provider}:${window.id}`] }, `${provider.provider}-${window.id}`)) })
         : jsx('div', {
             style: { borderTop: border, color: color.quaternary, fontSize: '0.75rem', marginTop: '0.75rem', paddingTop: '0.75rem' },
             children: provider.status === 'not_configured'
@@ -2114,7 +2189,7 @@ function UsageProvider({ provider }) {
   })
 }
 
-function UsageProviderGroup({ title, description, providers, narrow, id }) {
+function UsageProviderGroup({ title, description, providers, narrow, id, history }) {
   if (!providers.length) return null
   return jsxs('section', {
     'aria-labelledby': id,
@@ -2135,7 +2210,7 @@ function UsageProviderGroup({ title, description, providers, narrow, id }) {
       }),
       jsx('div', {
         style: { display: 'grid', gap: '0.85rem', gridTemplateColumns: narrow ? 'minmax(0, 1fr)' : 'repeat(2, minmax(0, 1fr))' },
-        children: providers.map(provider => jsx(UsageProvider, { provider }, provider.provider))
+        children: providers.map(provider => jsx(UsageProvider, { provider, history }, provider.provider))
       })
     ]
   })
@@ -2177,7 +2252,7 @@ function AIUsageStatStrip({ data }) {
   })
 }
 
-function AIUsageView({ query, narrow, refreshError }) {
+function AIUsageView({ query, narrow, refreshError, history }) {
   if (query.isLoading) return jsx(LoadingBlock, { rows: 8 })
   if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'AI usage is unavailable' })
   const data = query.data
@@ -2210,7 +2285,8 @@ function AIUsageView({ query, narrow, refreshError }) {
               title: 'Your providers',
               description: 'Account limits and balances for the providers Hermes holds credentials for.',
               providers: orderedProviders,
-              narrow
+              narrow,
+              history
             })
           : jsx(EmptyState, {
               title: 'No AI providers are connected',
@@ -2368,6 +2444,48 @@ function SessionLensPage({ ctx }) {
     enabled: tab === 'ai-models',
     refetchInterval: tab === 'ai-models' ? 300_000 : false
   })
+  // Client-side burn history: each FRESH /ai-usage reading appends one point
+  // per quota window, persisted in ctx.storage. Cached responses repeat the
+  // same reading, so they are never recorded — duplicates would flatten the
+  // burn slope the sparkline and forecast are computed from.
+  const [usageHistory, setUsageHistory] = useState(() => {
+    const stored = ctx.storage.get('usageHistory')
+    return stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : {}
+  })
+  useEffect(() => {
+    const data = aiUsageQuery.data
+    if (!data || data.cached) return
+    const t = Math.round(Number(data.generated_at) * 1000) || Date.now()
+    setUsageHistory(current => {
+      const next = { ...current }
+      let changed = false
+      for (const provider of data.providers || []) {
+        if (provider.status !== 'ok') continue
+        for (const window of provider.windows || []) {
+          const pct = Number(window.percentage_used)
+          if (!Number.isFinite(pct)) continue
+          const key = `${provider.provider}:${window.id}`
+          let series = Array.isArray(next[key]) ? next[key] : []
+          const last = series[series.length - 1]
+          if (last && t - last[0] < 60_000) continue
+          if (last && pct < last[1] - 1) series = []
+          next[key] = [...series.filter(point => t - point[0] < 48 * 3_600_000), [t, pct]].slice(-288)
+          changed = true
+        }
+      }
+      if (!changed) return current
+      const keys = Object.keys(next)
+      if (keys.length > 40) {
+        for (const key of keys
+          .sort((a, b) => (next[a][next[a].length - 1]?.[0] || 0) - (next[b][next[b].length - 1]?.[0] || 0))
+          .slice(0, keys.length - 40)) delete next[key]
+      }
+      return next
+    })
+  }, [aiUsageQuery.data])
+  useEffect(() => {
+    ctx.storage.set('usageHistory', usageHistory)
+  }, [ctx, usageHistory])
 
   useEffect(() => {
     ctx.storage.set('activeTab', tab)
@@ -2440,7 +2558,8 @@ function SessionLensPage({ ctx }) {
   if (tab === 'ai-usage') content = jsx(AIUsageView, {
     query: aiUsageQuery,
     narrow: Boolean(viewport?.narrow),
-    refreshError: aiRefreshError
+    refreshError: aiRefreshError,
+    history: usageHistory
   })
   if (tab === 'ai-models') content = jsx(AIModelsView, {
     onDrill: drillToSessions,
