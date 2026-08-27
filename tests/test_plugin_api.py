@@ -1240,6 +1240,8 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertIn("function usageSlopeForecast", source)
         self.assertIn("recorded burn slope", source)
         self.assertIn("Usage burn sparkline", source)
+        # A flat series must not render — it looks like a stray divider rule.
+        self.assertIn("maxP - minP < 0.2", source)
 
     def test_trace_is_paginated_redacted_and_excludes_system_prompts(self):
         trace = api._trace_sync("session-1", 100, 0)

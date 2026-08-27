@@ -2036,7 +2036,11 @@ function UsageSparkline({ series, danger }) {
   const spanT = Math.max(1, series[series.length - 1][0] - t0)
   const pcts = series.map(point => point[1])
   const minP = Math.min(...pcts)
-  const spanP = Math.max(1, Math.max(...pcts) - minP)
+  const maxP = Math.max(...pcts)
+  // A flat series draws a line indistinguishable from a divider rule; show
+  // the sparkline only once there is recorded movement to look at.
+  if (maxP - minP < 0.2) return null
+  const spanP = Math.max(1, maxP - minP)
   const coords = series.map(([t, p]) =>
     `${(((t - t0) / spanT) * (width - 4) + 2).toFixed(1)},${(height - 3 - ((p - minP) / spanP) * (height - 6)).toFixed(1)}`
   )
