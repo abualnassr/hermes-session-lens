@@ -716,6 +716,361 @@ async def digest(
     return await asyncio.to_thread(_digest_sync, days, start_at, end_at)
 
 
+def _path_basename(path: Any) -> str:
+    text = str(path or "").replace("\\", "/").rstrip("/")
+    if not text:
+        return ""
+    return text.split("/")[-1] or text
+
+
+def _projects_sync(
+    days: int,
+    start_at: Optional[float] = None,
+    end_at: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Roll session accounting up by repo, then working directory, then source."""
+    period_start, period_end = _period_bounds(days, start_at, end_at)
+    session_sql, session_params = _period_sql("started_at", period_start, period_end)
+    joined_sql, joined_params = _period_sql("s.started_at", period_start, period_end)
+    with _database() as db:
+        connection = _db_connection(db)
+        rows = [
+            _row_dict(row)
+            for row in connection.execute(
+                f"""
+                SELECT id, source, model, git_repo_root, cwd, started_at,
+                       last_activity_at, input_tokens, output_tokens,
+                       cache_read_tokens, cache_write_tokens,
+                       estimated_cost_usd, actual_cost_usd, cost_status
+                FROM sessions
+                WHERE {session_sql} AND coalesce(hidden,0)=0
+                """,
+                tuple(session_params),
+            ).fetchall()
+        ]
+        failure_counts = _confirmed_failure_counts(
+            connection, joined_sql + " AND coalesce(s.hidden,0)=0", joined_params
+        )
+
+    groups: Dict[str, Dict[str, Any]] = {}
+    with_directory = 0
+    for session in rows:
+        repo = str(session.get("git_repo_root") or "").strip()
+        cwd = str(session.get("cwd") or "").strip()
+        source = str(session.get("source") or "unknown").strip() or "unknown"
+        if repo:
+            kind, path = "repo", repo
+            label = _path_basename(repo) or repo
+        elif cwd:
+            kind, path = "directory", cwd
+            label = _path_basename(cwd) or cwd
+        else:
+            kind, path = "source", ""
+            label = f"{source} · no recorded directory"
+        if kind != "source":
+            with_directory += 1
+        key = f"{kind}|{(path or label).lower()}"
+        group = groups.setdefault(
+            key,
+            {
+                "kind": kind,
+                "label": label,
+                "path": path or None,
+                "sessions": 0,
+                "total_tokens": 0,
+                "recorded_cost_usd": 0.0,
+                "unpriced_sessions": 0,
+                "failure_events": 0,
+                "last_activity_at": None,
+                "models_map": Counter(),
+            },
+        )
+        group["sessions"] += 1
+        group["total_tokens"] += sum(
+            _integer(session.get(field))
+            for field in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
+        )
+        actual = _number(session.get("actual_cost_usd"))
+        estimated = _number(session.get("estimated_cost_usd"))
+        status = str(session.get("cost_status") or "").strip().lower()
+        if actual > 0:
+            group["recorded_cost_usd"] += actual
+        elif estimated > 0:
+            group["recorded_cost_usd"] += estimated
+        elif status not in {"included", "subscription", "free"}:
+            group["unpriced_sessions"] += 1
+        group["failure_events"] += failure_counts.get(str(session.get("id")), 0)
+        group["last_activity_at"] = max(
+            _number(group.get("last_activity_at"), 0),
+            _number(session.get("last_activity_at") or session.get("started_at"), 0),
+        ) or None
+        model = str(session.get("model") or "").strip()
+        if model:
+            group["models_map"][model] += 1
+
+    projects: List[Dict[str, Any]] = []
+    for group in groups.values():
+        models = group.pop("models_map")
+        group["recorded_cost_usd"] = round(group["recorded_cost_usd"], 4)
+        group["models"] = [
+            {"model": model, "sessions": count} for model, count in models.most_common(3)
+        ]
+        projects.append(group)
+    projects.sort(
+        key=lambda item: (-_number(item.get("recorded_cost_usd")), -_integer(item.get("total_tokens")))
+    )
+    truncated = len(projects) > 50
+    return {
+        "period_days": days,
+        "period": _period_payload(days, period_start, period_end),
+        "projects": projects[:50],
+        "totals": {
+            "groups": len(projects),
+            "sessions": len(rows),
+            "sessions_with_directory": with_directory,
+            "sessions_without_directory": len(rows) - with_directory,
+            "truncated": truncated,
+        },
+        "generated_at": time.time(),
+    }
+
+
+@router.get("/projects")
+async def projects(
+    days: int = Query(30, ge=0, le=3650),
+    start_at: Optional[float] = Query(None, ge=0),
+    end_at: Optional[float] = Query(None, ge=0),
+) -> Dict[str, Any]:
+    return await asyncio.to_thread(_projects_sync, days, start_at, end_at)
+
+
+_AGENT_RUNS_PER_JOB = 10
+_AGENT_MAX_JOBS = 30
+
+
+def _agent_job_label(title: Any) -> str:
+    text = _clean_text(title, 120)
+    if not text:
+        return "(untitled cron job)"
+    return text.rsplit(" · ", 1)[0].strip() or text
+
+
+def _agent_runs_sync(
+    days: int,
+    start_at: Optional[float] = None,
+    end_at: Optional[float] = None,
+) -> Dict[str, Any]:
+    """Group cron sessions into per-job run histories."""
+    period_start, period_end = _period_bounds(days, start_at, end_at)
+    session_sql, session_params = _period_sql("started_at", period_start, period_end)
+    with _database() as db:
+        connection = _db_connection(db)
+        rows = [
+            _row_dict(row)
+            for row in connection.execute(
+                f"""
+                SELECT id, title, model, profile_name, started_at, ended_at,
+                       end_reason, last_activity_at, input_tokens, output_tokens,
+                       cache_read_tokens, cache_write_tokens,
+                       estimated_cost_usd, actual_cost_usd, cost_status, cost_source
+                FROM sessions
+                WHERE {session_sql} AND coalesce(hidden,0)=0 AND source='cron'
+                ORDER BY started_at DESC
+                """,
+                tuple(session_params),
+            ).fetchall()
+        ]
+
+    jobs: Dict[str, Dict[str, Any]] = {}
+    for session in rows:
+        label = _agent_job_label(session.get("title"))
+        job = jobs.setdefault(
+            label.lower(),
+            {
+                "label": label,
+                "profile": session.get("profile_name"),
+                "runs": [],
+                "runs_recorded": 0,
+                "failed_runs": 0,
+                "completed_runs": 0,
+                "duration_seconds_sum": 0.0,
+                "duration_samples": 0,
+                "cost_sum": 0.0,
+                "tokens_sum": 0,
+            },
+        )
+        outcome = _session_outcome(session)["outcome"]
+        started = _number(session.get("started_at"), 0)
+        ended = _number(session.get("ended_at")) if session.get("ended_at") is not None else None
+        duration = max(0.0, ended - started) if ended and started else None
+        cost_view = _cost_view(session)
+        total_tokens = sum(
+            _integer(session.get(field))
+            for field in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
+        )
+        job["runs_recorded"] += 1
+        if outcome == "failed":
+            job["failed_runs"] += 1
+        if outcome == "completed":
+            job["completed_runs"] += 1
+        if duration is not None:
+            job["duration_seconds_sum"] += duration
+            job["duration_samples"] += 1
+        job["cost_sum"] += max(0.0, _number(cost_view.get("display_cost_usd")))
+        job["tokens_sum"] += total_tokens
+        if len(job["runs"]) < _AGENT_RUNS_PER_JOB:
+            job["runs"].append(
+                {
+                    "session_id": str(session.get("id")),
+                    "started_at": session.get("started_at"),
+                    "outcome": outcome,
+                    "duration_seconds": duration,
+                    "total_tokens": total_tokens,
+                    "display_cost_usd": cost_view.get("display_cost_usd"),
+                    "cost_kind": cost_view.get("cost_kind"),
+                }
+            )
+
+    job_rows: List[Dict[str, Any]] = []
+    for job in jobs.values():
+        runs = job["runs"]
+        streak = 0
+        streak_outcome = runs[0]["outcome"] if runs else None
+        for run in runs:
+            if run["outcome"] == streak_outcome:
+                streak += 1
+            else:
+                break
+        job_rows.append(
+            {
+                "label": job["label"],
+                "profile": job["profile"],
+                "runs": runs,
+                "runs_recorded": job["runs_recorded"],
+                "failed_runs": job["failed_runs"],
+                "completed_runs": job["completed_runs"],
+                "avg_duration_seconds": (
+                    job["duration_seconds_sum"] / job["duration_samples"]
+                    if job["duration_samples"]
+                    else None
+                ),
+                "avg_cost_usd": (
+                    round(job["cost_sum"] / job["runs_recorded"], 4) if job["runs_recorded"] else None
+                ),
+                "total_tokens": job["tokens_sum"],
+                "last_run_at": runs[0]["started_at"] if runs else None,
+                "last_outcome": streak_outcome,
+                "current_streak": streak,
+            }
+        )
+    job_rows.sort(key=lambda item: -_number(item.get("last_run_at"), 0))
+    truncated = len(job_rows) > _AGENT_MAX_JOBS
+    return {
+        "period_days": days,
+        "period": _period_payload(days, period_start, period_end),
+        "jobs": job_rows[:_AGENT_MAX_JOBS],
+        "totals": {
+            "jobs": len(job_rows),
+            "runs": len(rows),
+            "failed_runs": sum(item["failed_runs"] for item in job_rows),
+            "truncated": truncated,
+        },
+        "generated_at": time.time(),
+    }
+
+
+@router.get("/agent-runs")
+async def agent_runs(
+    days: int = Query(30, ge=0, le=3650),
+    start_at: Optional[float] = Query(None, ge=0),
+    end_at: Optional[float] = Query(None, ge=0),
+) -> Dict[str, Any]:
+    return await asyncio.to_thread(_agent_runs_sync, days, start_at, end_at)
+
+
+def _compression_sync() -> Dict[str, Any]:
+    """Summarize recorded context-compression distress across all sessions."""
+    now = time.time()
+    with _database() as db:
+        connection = _db_connection(db)
+        columns = _table_columns(connection, "sessions")
+        streak_expr = (
+            "coalesce(compression_fallback_streak,0)"
+            if "compression_fallback_streak" in columns
+            else "0"
+        )
+        ineffective_expr = (
+            "coalesce(compression_ineffective_count,0)"
+            if "compression_ineffective_count" in columns
+            else "0"
+        )
+        error_expr = (
+            "compression_failure_error" if "compression_failure_error" in columns else "NULL"
+        )
+        cooldown_expr = (
+            "coalesce(compression_failure_cooldown_until,0)"
+            if "compression_failure_cooldown_until" in columns
+            else "0"
+        )
+        summary = _row_dict(
+            connection.execute(
+                f"""
+                SELECT COUNT(*) AS sessions,
+                       SUM(CASE WHEN {streak_expr} > 0 THEN 1 ELSE 0 END) AS fallback_sessions,
+                       SUM(CASE WHEN {ineffective_expr} > 0 THEN 1 ELSE 0 END) AS ineffective_sessions,
+                       SUM(CASE WHEN {error_expr} IS NOT NULL THEN 1 ELSE 0 END) AS failed_sessions,
+                       SUM(CASE WHEN {cooldown_expr} > ? THEN 1 ELSE 0 END) AS cooldown_sessions
+                FROM sessions
+                WHERE coalesce(hidden,0)=0
+                """,
+                (now,),
+            ).fetchone()
+        )
+        offenders = [
+            _row_dict(row)
+            for row in connection.execute(
+                f"""
+                SELECT id, title, model, started_at,
+                       {streak_expr} AS fallback_streak,
+                       {ineffective_expr} AS ineffective_count,
+                       {error_expr} AS failure_error,
+                       {cooldown_expr} AS cooldown_until
+                FROM sessions
+                WHERE coalesce(hidden,0)=0
+                  AND ({streak_expr} > 0 OR {ineffective_expr} > 0 OR {error_expr} IS NOT NULL)
+                ORDER BY {streak_expr} + {ineffective_expr} DESC
+                LIMIT 5
+                """
+            ).fetchall()
+        ]
+    return {
+        "sessions": _integer(summary.get("sessions")),
+        "fallback_sessions": _integer(summary.get("fallback_sessions")),
+        "ineffective_sessions": _integer(summary.get("ineffective_sessions")),
+        "failed_sessions": _integer(summary.get("failed_sessions")),
+        "cooldown_sessions": _integer(summary.get("cooldown_sessions")),
+        "offenders": [
+            {
+                "id": str(item.get("id")),
+                "title": _clean_text(item.get("title"), 120) or str(item.get("id")),
+                "model": item.get("model"),
+                "started_at": item.get("started_at"),
+                "fallback_streak": _integer(item.get("fallback_streak")),
+                "ineffective_count": _integer(item.get("ineffective_count")),
+                "failure_error": _clean_text(item.get("failure_error"), 200) or None,
+                "in_cooldown": _number(item.get("cooldown_until")) > now,
+            }
+            for item in offenders
+        ],
+        "generated_at": now,
+    }
+
+
+@router.get("/compression")
+async def compression() -> Dict[str, Any]:
+    return await asyncio.to_thread(_compression_sync)
+
+
 ATTENTION_OPEN_HOURS = 24
 ATTENTION_MIN_TOKENS = 5_000_000
 _ATTENTION_REAPED_END_REASONS = {"startup_orphan_reap", "max_runtime", "timeout"}

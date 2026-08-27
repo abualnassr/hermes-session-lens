@@ -488,6 +488,100 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertIsNone(api._quota_exhaust_at("Weekly quota", reset_at, 15))
         self.assertIsNone(api._quota_exhaust_at("Balance", reset_at, 50))
 
+    def test_projects_group_by_repo_directory_then_source(self):
+        connection = sqlite3.connect(self.db_path)
+        try:
+            connection.execute(
+                """
+                INSERT INTO sessions (id, source, model, started_at, last_activity_at, ended_at,
+                                      git_repo_root, input_tokens, output_tokens, actual_cost_usd, message_count)
+                VALUES ('session-repo', 'desktop', 'provider/model-a', 1800000300, 1800000400, 1800000400,
+                        'C:\work\demo-repo', 2000, 1000, 0.5, 3)
+                """
+            )
+            connection.execute(
+                """
+                INSERT INTO sessions (id, source, model, started_at, last_activity_at,
+                                      input_tokens, output_tokens, message_count)
+                VALUES ('session-nodir', 'telegram', 'provider/model-a', 1800000500, 1800000600, 700, 300, 3)
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        payload = api._projects_sync(0)
+        kinds = {item["label"]: item for item in payload["projects"]}
+        self.assertIn("demo-repo", kinds)
+        self.assertEqual(kinds["demo-repo"]["kind"], "repo")
+        self.assertEqual(kinds["demo-repo"]["recorded_cost_usd"], 0.5)
+        self.assertIn("demo", kinds)
+        self.assertEqual(kinds["demo"]["kind"], "directory")
+        self.assertIn("telegram · no recorded directory", kinds)
+        self.assertEqual(payload["totals"]["sessions_without_directory"], 1)
+
+    def test_agent_runs_group_cron_sessions_by_title_prefix(self):
+        connection = sqlite3.connect(self.db_path)
+        try:
+            for index, (end_reason, ended) in enumerate(
+                [("cron_complete", True), ("error", True), ("cron_complete", True)]
+            ):
+                connection.execute(
+                    """
+                    INSERT INTO sessions (id, source, model, title, started_at, ended_at,
+                                          end_reason, last_activity_at, input_tokens,
+                                          output_tokens, estimated_cost_usd, message_count)
+                    VALUES (?, 'cron', 'provider/model-a', ?, ?, ?, ?, ?, 100, 50, 0.02, 3)
+                    """,
+                    (
+                        f"cron-run-{index}",
+                        f"Nightly digest · Aug {10 + index}",
+                        1_800_100_000 + index * 86400,
+                        1_800_100_000 + index * 86400 + 120 if ended else None,
+                        end_reason,
+                        1_800_100_000 + index * 86400 + 120,
+                    ),
+                )
+            connection.commit()
+        finally:
+            connection.close()
+        payload = api._agent_runs_sync(0)
+        jobs = {item["label"]: item for item in payload["jobs"]}
+        self.assertIn("Nightly digest", jobs)
+        job = jobs["Nightly digest"]
+        self.assertEqual(job["runs_recorded"], 3)
+        self.assertEqual(job["failed_runs"], 1)
+        self.assertEqual(job["runs"][0]["outcome"], "completed")
+        self.assertEqual(job["runs"][1]["outcome"], "failed")
+        self.assertEqual(job["current_streak"], 1)
+        self.assertAlmostEqual(job["avg_duration_seconds"], 120.0)
+
+    def test_compression_summary_reports_distress_and_quiet_state(self):
+        quiet = api._compression_sync()
+        self.assertEqual(quiet["fallback_sessions"], 0)
+        self.assertEqual(quiet["offenders"], [])
+        connection = sqlite3.connect(self.db_path)
+        try:
+            connection.execute(
+                """
+                INSERT INTO sessions (id, source, model, title, started_at, last_activity_at,
+                                      compression_fallback_streak, compression_ineffective_count,
+                                      compression_failure_error, message_count)
+                VALUES ('session-squeeze', 'desktop', 'provider/model-a', 'Long build',
+                        1800000700, 1800000800, 3, 2, 'token_limit password=abc123', 3)
+                """
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        payload = api._compression_sync()
+        self.assertEqual(payload["fallback_sessions"], 1)
+        self.assertEqual(payload["ineffective_sessions"], 1)
+        self.assertEqual(payload["failed_sessions"], 1)
+        offender = payload["offenders"][0]
+        self.assertEqual(offender["title"], "Long build")
+        self.assertEqual(offender["fallback_streak"], 3)
+        self.assertNotIn("abc123", offender["failure_error"])
+
     def test_attention_flags_runaway_and_reaped_sessions(self):
         connection = sqlite3.connect(self.db_path)
         try:

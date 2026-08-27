@@ -104,7 +104,7 @@ components:
 
 Hermes Session Lens is an **Operate** surface inside Hermes Desktop: one native observatory connecting provider capacity and session evidence to accounting and operational health. It inherits Hermes typography, controls, codicons, focus behavior, and light/dark theme roles; it does not establish a separate brand skin.
 
-This design document describes Hermes Session Lens `0.12.1`.
+This design document describes Hermes Session Lens `0.13.0`.
 
 The interface is compact, quiet, and evidence-first. A user finds a session, verifies trace and accounting, then inspects runtime, profile, or schedule state without leaving Hermes. Progressive disclosure carries the density, while explicit provenance, bounded excerpts, and read-only language make the trust boundary visible.
 
@@ -207,7 +207,8 @@ The form language is compact and lightly softened. Native/select controls use re
 ### Navigation
 
 - **View tabs:** Sessions, Overview, Operations, Tools, System, AI Usage, and AI Models remain stable and horizontally scrollable. Active state uses stronger text and an accent underline. Skill invocations render as a section inside Tools.
-- **Operations segments:** Health, Profiles, and Schedules use the Hermes segmented control.
+- **Operations segments:** Health, Profiles, and Schedules use the Hermes segmented control. Health ends with a context-compression readout that stays a single quiet line until distress is recorded. Schedules opens with the agent run-health scoreboard: one row per cron job (grouped by title prefix), a latest-runs strip with outcome-toned squares (latest rightmost, tooltips carrying date, outcome, duration, tokens, and cost), failure and streak counts, and per-run averages; job names drill through to the Sessions view.
+- **Overview projects:** "Where the spend goes" rolls sessions up by git repository, then working directory, then source, and states plainly how many sessions record no directory. Costs show unpriced counts rather than pretending zero.
 - **Detail segments:** Summary, Trace, Tools, Failures, and Files preserve their order and surface counts when known.
 
 ### Session rows and status pills

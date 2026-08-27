@@ -1395,7 +1395,92 @@ function DailyBars({ rows }) {
   })
 }
 
-function OverviewView({ query }) {
+function formatDurationShort(seconds) {
+  if (seconds === null || seconds === undefined) return '—'
+  const value = Number(seconds) || 0
+  if (value < 90) return `${Math.round(value)}s`
+  if (value < 5400) return `${(value / 60).toFixed(value < 600 ? 1 : 0)}m`
+  return `${(value / 3600).toFixed(1)}h`
+}
+
+function ProjectsSection({ ctx, period }) {
+  const query = useQuery({
+    queryKey: [PLUGIN_ID, 'projects', period.days, period.start_at, period.end_at],
+    queryFn: () => ctx.rest(apiPath('/projects', period)),
+    refetchInterval: 120_000
+  })
+  if (query.isLoading) return jsx(LoadingBlock, { rows: 4 })
+  if (query.isError) return jsx('p', { style: { color: color.tertiary, fontSize: '0.6875rem' }, children: 'Project rollup is temporarily unavailable.' })
+  const data = query.data
+  const totals = data.totals || {}
+  return jsxs('section', {
+    children: [
+      jsx(SectionHeading, {
+        title: 'Where the spend goes',
+        description: `Sessions rolled up by git repository, then working directory, then source. ${formatCount(totals.sessions_without_directory)} of ${formatCount(totals.sessions)} sessions record no directory and group by source.`
+      }),
+      jsx(SimpleTable, {
+        columns: [
+          {
+            key: 'label',
+            label: 'Project',
+            render: row => jsxs('span', {
+              title: row.path || undefined,
+              style: { display: 'grid', gap: '0.1rem', minWidth: 0 },
+              children: [
+                jsx('span', { style: { fontWeight: 600, overflowWrap: 'anywhere' }, children: row.label }),
+                jsx('span', { style: { color: color.quaternary, fontSize: '0.625rem' }, children: row.kind === 'repo' ? 'git repository' : row.kind === 'directory' ? 'working directory' : 'grouped by source' })
+              ]
+            })
+          },
+          { key: 'sessions', label: 'Sessions', align: 'right', render: row => formatCount(row.sessions) },
+          { key: 'total_tokens', label: 'Tokens', align: 'right', render: row => formatCount(row.total_tokens) },
+          {
+            key: 'recorded_cost_usd',
+            label: 'Recorded cost',
+            align: 'right',
+            render: row => jsxs('span', {
+              style: { display: 'grid', gap: '0.1rem', justifyItems: 'end' },
+              children: [
+                jsx('span', { children: formatCost(row.recorded_cost_usd, 'actual') }),
+                Number(row.unpriced_sessions) > 0
+                  ? jsx('span', { style: { color: color.quaternary, fontSize: '0.625rem' }, children: `${formatCount(row.unpriced_sessions)} unpriced` })
+                  : null
+              ]
+            })
+          },
+          {
+            key: 'failure_events',
+            label: 'Failures',
+            align: 'right',
+            render: row => Number(row.failure_events) > 0
+              ? jsx(Pill, { tone: 'danger', children: formatCount(row.failure_events) })
+              : '0'
+          },
+          {
+            key: 'models',
+            label: 'Models',
+            muted: true,
+            sortValue: row => (row.models || []).map(item => item.model).join(', '),
+            render: row => (row.models || []).map(item => _modelBasename(item.model)).join(' · ') || '—'
+          },
+          { key: 'last_activity_at', label: 'Last active', render: row => formatShortDate(row.last_activity_at), muted: true }
+        ],
+        rows: data.projects,
+        emptyTitle: 'No sessions in this period',
+        emptyDescription: 'The selected period contains no recorded sessions to roll up.'
+      })
+    ]
+  })
+}
+
+function _modelBasename(model) {
+  const text = String(model || '')
+  const slash = text.lastIndexOf('/')
+  return slash >= 0 ? text.slice(slash + 1) : text
+}
+
+function OverviewView({ query, ctx, period }) {
   if (query.isLoading) return jsx(LoadingBlock, { rows: 8 })
   if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'Overview unavailable' })
   const data = query.data
@@ -1410,6 +1495,7 @@ function OverviewView({ query }) {
             jsx(DailyBars, { rows: data.daily })
           ]
         }),
+        jsx(ProjectsSection, { ctx, period }),
         jsxs('section', {
           children: [
             jsx(SectionHeading, { title: 'Models', description: 'Per-model usage rows include auxiliary work such as compression and title generation.' }),
@@ -1533,6 +1619,51 @@ function ToolsView({ ctx, period }) {
   })
 }
 
+function CompressionStrip({ ctx }) {
+  const query = useQuery({
+    queryKey: [PLUGIN_ID, 'compression'],
+    queryFn: () => ctx.rest('/compression'),
+    refetchInterval: 300_000
+  })
+  const data = query.data
+  if (!data) return null
+  const distressed = data.fallback_sessions + data.ineffective_sessions + data.failed_sessions + data.cooldown_sessions
+  if (!distressed) {
+    return jsx('p', {
+      style: { color: color.quaternary, fontSize: '0.6875rem', margin: 0 },
+      children: `Context compression: no distress recorded across ${formatCount(data.sessions)} sessions.`
+    })
+  }
+  return jsxs('section', {
+    style: { display: 'grid', gap: '0.5rem' },
+    children: [
+      jsx(SectionHeading, {
+        title: 'Context compression distress',
+        description: 'Sessions where Hermes recorded compression falling back, failing, or not reclaiming space.'
+      }),
+      jsx('div', {
+        style: { borderTop: border, display: 'grid', gridTemplateColumns: 'repeat(4, minmax(7rem, 1fr))', overflowX: 'auto' },
+        children: [
+          jsx(Metric, { label: 'Fallback streaks', value: formatCount(data.fallback_sessions), danger: data.fallback_sessions > 0 }, 'fallback'),
+          jsx(Metric, { label: 'Ineffective passes', value: formatCount(data.ineffective_sessions), danger: data.ineffective_sessions > 0 }, 'ineffective'),
+          jsx(Metric, { label: 'Compression failures', value: formatCount(data.failed_sessions), danger: data.failed_sessions > 0 }, 'failed'),
+          jsx(Metric, { label: 'In cooldown now', value: formatCount(data.cooldown_sessions), danger: data.cooldown_sessions > 0 }, 'cooldown')
+        ]
+      }),
+      jsx('div', {
+        style: { display: 'grid', gap: '0.2rem' },
+        children: (data.offenders || []).map(item => jsxs('div', {
+          style: { alignItems: 'baseline', display: 'flex', gap: '0.75rem', justifyContent: 'space-between' },
+          children: [
+            jsx('span', { style: { color: color.secondary, fontSize: '0.6875rem', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: item.title }),
+            jsx('span', { style: { ...tabular, color: color.tertiary, flexShrink: 0, fontSize: '0.625rem' }, children: `streak ${formatCount(item.fallback_streak)} · ineffective ${formatCount(item.ineffective_count)}${item.in_cooldown ? ' · cooling down' : ''}` })
+          ]
+        }, item.id))
+      })
+    ]
+  })
+}
+
 function RuntimeHealth({ ctx, period }) {
   const telemetryQuery = useQuery({
     queryKey: [PLUGIN_ID, 'telemetry', period.days, period.start_at, period.end_at],
@@ -1613,7 +1744,8 @@ function RuntimeHealth({ ctx, period }) {
             emptyDescription: 'The selected log window contains no recognized executor metrics.'
           })
         ]
-      })
+      }),
+      jsx(CompressionStrip, { ctx })
     ]
   })
 }
@@ -1652,7 +1784,81 @@ function ProfilesView({ ctx, period }) {
   })
 }
 
-function SchedulesView({ ctx }) {
+const _RUN_TONES = {
+  completed: 'success',
+  clean: 'success',
+  failed: 'danger',
+  cancelled: 'warning',
+  running: 'accent',
+  open: 'accent'
+}
+
+function AgentRunStrip({ runs }) {
+  const ordered = [...(runs || [])].reverse()
+  return jsx('div', {
+    style: { display: 'flex', gap: '0.18rem' },
+    children: ordered.map(run => {
+      const tone = _RUN_TONES[run.outcome] || 'neutral'
+      const fill = tone === 'neutral' ? color.stroke : toneColor(tone)
+      return jsx('span', {
+        title: `${formatShortDate(run.started_at)} · ${run.outcome} · ${formatDurationShort(run.duration_seconds)} · ${formatCount(run.total_tokens)} tok · ${formatCost(run.display_cost_usd, run.cost_kind)}`,
+        style: { background: fill, borderRadius: '2px', display: 'block', height: '0.85rem', opacity: tone === 'neutral' ? 0.6 : 0.9, width: '0.55rem' }
+      }, run.session_id)
+    })
+  })
+}
+
+function AgentScoreboard({ ctx, period, onSelectJob }) {
+  const query = useQuery({
+    queryKey: [PLUGIN_ID, 'agent-runs', period.days, period.start_at, period.end_at],
+    queryFn: () => ctx.rest(apiPath('/agent-runs', period)),
+    refetchInterval: 120_000
+  })
+  if (query.isLoading) return jsx(LoadingBlock, { rows: 3 })
+  if (query.isError) return jsx('p', { style: { color: color.tertiary, fontSize: '0.6875rem' }, children: 'Agent run history is temporarily unavailable.' })
+  const data = query.data
+  const jobs = data?.jobs || []
+  if (!jobs.length) return null
+  return jsxs('section', {
+    style: { display: 'grid', gap: '0.6rem' },
+    children: [
+      jsx(SectionHeading, {
+        title: 'Agent run health',
+        description: `${formatCount(data.totals.runs)} cron runs across ${formatCount(data.totals.jobs)} jobs in the selected period · ${formatCount(data.totals.failed_runs)} failed. Latest run is rightmost.`
+      }),
+      jsx('div', {
+        style: { border, borderRadius: '6px', display: 'grid' },
+        children: jobs.map(job => {
+          const failTone = job.failed_runs > 0 ? color.danger : color.tertiary
+          const streakNote = job.current_streak > 1 ? ` · ${formatCount(job.current_streak)}× ${job.last_outcome} streak` : ''
+          return jsxs('div', {
+            style: { alignItems: 'center', borderBottom: border, display: 'flex', flexWrap: 'wrap', gap: '0.5rem 1rem', padding: '0.55rem 0.75rem' },
+            children: [
+              jsx('button', {
+                type: 'button',
+                onClick: () => onSelectJob(job.label),
+                title: 'Show this job\u2019s sessions in the Sessions view',
+                style: { background: 'transparent', border: 'none', color: color.primary, cursor: 'pointer', flex: '1 1 14rem', font: 'inherit', fontSize: '0.75rem', fontWeight: 650, minWidth: 0, outlineColor: color.accent, overflowWrap: 'anywhere', padding: 0, textAlign: 'left' },
+                children: job.label
+              }),
+              jsx(AgentRunStrip, { runs: job.runs }),
+              jsx('span', {
+                style: { ...tabular, color: failTone, flexShrink: 0, fontSize: '0.625rem' },
+                children: `${formatCount(job.runs_recorded)} runs · ${formatCount(job.failed_runs)} failed${streakNote}`
+              }),
+              jsx('span', {
+                style: { ...tabular, color: color.quaternary, flexShrink: 0, fontSize: '0.625rem' },
+                children: `avg ${formatDurationShort(job.avg_duration_seconds)} · avg ${formatCost(job.avg_cost_usd, 'actual')} · last ${formatRelativeTime(job.last_run_at)}`
+              })
+            ]
+          }, job.label)
+        })
+      })
+    ]
+  })
+}
+
+function SchedulesView({ ctx, period, onSelectJob }) {
   const query = useQuery({
     queryKey: [PLUGIN_ID, 'schedules'],
     queryFn: () => ctx.rest('/schedules'),
@@ -1664,6 +1870,7 @@ function SchedulesView({ ctx }) {
   return jsxs('div', {
     style: { display: 'grid', gap: '1rem' },
     children: [
+      jsx(AgentScoreboard, { ctx, period, onSelectJob }),
       jsx(SectionHeading, {
         title: 'Scheduled jobs',
         description: `${formatCount(data.totals.enabled)} of ${formatCount(data.totals.jobs)} jobs enabled. Prompts are intentionally excluded.`
@@ -1686,7 +1893,7 @@ function SchedulesView({ ctx }) {
   })
 }
 
-function OperationsView({ ctx, period }) {
+function OperationsView({ ctx, period, onDrill }) {
   const [section, setSection] = useState('health')
   const options = [
     { id: 'health', label: 'Health' },
@@ -1695,7 +1902,7 @@ function OperationsView({ ctx, period }) {
   ]
   let content = jsx(RuntimeHealth, { ctx, period })
   if (section === 'profiles') content = jsx(ProfilesView, { ctx, period })
-  if (section === 'schedules') content = jsx(SchedulesView, { ctx })
+  if (section === 'schedules') content = jsx(SchedulesView, { ctx, period, onSelectJob: label => onDrill && onDrill({ search: label }) })
   return jsx('div', {
     style: { flex: 1, minHeight: 0, overflow: 'auto', padding: '1rem' },
     children: jsxs('div', {
@@ -2185,8 +2392,8 @@ function SessionLensPage({ ctx }) {
     setTab('sessions')
   }
   let content = jsx(SessionsView, { ctx, period, narrow: Boolean(viewport?.narrow), drill })
-  if (tab === 'overview') content = jsx(OverviewView, { query: overviewQuery })
-  if (tab === 'operations') content = jsx(OperationsView, { ctx, period })
+  if (tab === 'overview') content = jsx(OverviewView, { query: overviewQuery, ctx, period })
+  if (tab === 'operations') content = jsx(OperationsView, { ctx, period, onDrill: drillToSessions })
   if (tab === 'tools') content = jsx(ToolsView, { ctx, period })
   if (tab === 'system') content = jsx(SystemView, { ctx })
   if (tab === 'ai-usage') content = jsx(AIUsageView, {
