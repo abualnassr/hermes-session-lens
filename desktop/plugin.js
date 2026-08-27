@@ -2040,7 +2040,9 @@ function UsageSparkline({ series, danger }) {
   // A flat series draws a line indistinguishable from a divider rule; show
   // the sparkline only once there is recorded movement to look at.
   if (maxP - minP < 0.2) return null
-  const spanP = Math.max(1, maxP - minP)
+  // Never stretch less than a 5-point span to full height — a 1% drift
+  // should look like a gentle slope, not a cliff.
+  const spanP = Math.max(5, maxP - minP)
   const coords = series.map(([t, p]) =>
     `${(((t - t0) / spanT) * (width - 4) + 2).toFixed(1)},${(height - 3 - ((p - minP) / spanP) * (height - 6)).toFixed(1)}`
   )
