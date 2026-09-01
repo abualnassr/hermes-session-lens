@@ -2790,6 +2790,22 @@ async def ai_models(
     return await asyncio.to_thread(_scoped_call, profiles, _ai_models_sync, days, start_at, end_at, fresh)
 
 
+def _tool_group(name: str) -> Tuple[str, str, str]:
+    """(kind, group, short_name) for a recorded tool name.
+
+    Hermes names MCP tools mcp__<server>__<tool>; everything else is a
+    built-in agent tool.
+    """
+    text = str(name or "")
+    if text.startswith("mcp__"):
+        rest = text[len("mcp__"):]
+        server, sep, short = rest.partition("__")
+        if sep and server:
+            return ("mcp", server, short or rest)
+        return ("mcp", rest or "mcp", rest or text)
+    return ("builtin", "built-in", text)
+
+
 def _tools_sync(
     days: int,
     start_at: Optional[float] = None,
@@ -2818,18 +2834,22 @@ def _tools_sync(
         truncated = len(assistant_rows) > 50000
         assistant_rows = assistant_rows[:50000]
         assistant: Dict[str, Dict[str, Any]] = {}
+        trend_end = period_end or time.time()
+        trend_start = trend_end - 7 * 86400
         for row in assistant_rows:
             for call in _iter_tool_calls(row["tool_calls"]):
                 name = call["name"]
                 entry = assistant.setdefault(
                     name,
-                    {"calls": 0, "sessions": set(), "last_used_at": None},
+                    {"calls": 0, "sessions": set(), "last_used_at": None, "days": Counter()},
                 )
                 entry["calls"] += 1
                 entry["sessions"].add(row["session_id"])
                 timestamp = _number(row["timestamp"], 0)
                 if timestamp and (not entry["last_used_at"] or timestamp > entry["last_used_at"]):
                     entry["last_used_at"] = timestamp
+                if timestamp and trend_start <= timestamp <= trend_end:
+                    entry["days"][dt.datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d")] += 1
 
         result_rows = _db_connection(db).execute(
             f"""
@@ -2856,6 +2876,28 @@ def _tools_sync(
             if tool_name:
                 failures_by_tool[tool_name] += 1
 
+        # Latency and output weight come from the bounded agent logs; their
+        # coverage window is narrower than session accounting, so these fields
+        # describe "recent behavior", not the whole period.
+        log_stats: Dict[str, Dict[str, Any]] = {}
+        for event in _runtime_events().get("tools", []):
+            timestamp = _number(event.get("timestamp"), 0)
+            if period_start and timestamp < period_start:
+                continue
+            if period_end and timestamp > period_end:
+                continue
+            name = str(event.get("tool") or "")
+            if not name:
+                continue
+            stat = log_stats.setdefault(name, {"events": 0, "failed": 0, "durations": [], "chars": 0})
+            stat["events"] += 1
+            if str(event.get("status")) == "failed":
+                stat["failed"] += 1
+            duration = _number(event.get("duration_seconds"))
+            if duration is not None:
+                stat["durations"].append(duration)
+            stat["chars"] += _integer(event.get("output_chars"))
+
         tools = []
         for name in set(assistant) | set(results):
             assistant_entry = assistant.get(name, {})
@@ -2871,25 +2913,109 @@ def _tools_sync(
                 _number(assistant_entry.get("last_used_at"), 0),
                 _number(result_entry.get("last_used_at"), 0),
             ) or None
+            kind, group_name, short_name = _tool_group(name)
+            stat = log_stats.get(name) or {}
+            durations = stat.get("durations") or []
             tools.append(
                 {
                     "name": name,
+                    "kind": kind,
+                    "group": group_name,
+                    "short_name": short_name,
                     "calls": calls,
                     "failures": failures,
                     "sessions": max(assistant_sessions, result_sessions),
                     "last_used_at": last_used_at,
                     "failure_rate": failures / calls if calls else 0,
+                    "latency_p50_seconds": _percentile(durations, 0.50),
+                    "latency_p95_seconds": _percentile(durations, 0.95),
+                    "log_calls": _integer(stat.get("events")),
+                    "log_failures": _integer(stat.get("failed")),
+                    "context_chars": _integer(stat.get("chars")),
                 }
             )
         tools.sort(key=lambda item: (item["failures"], item["calls"], item["name"]), reverse=True)
+
+        groups_map: Dict[Tuple[str, str], Dict[str, Any]] = {}
+        for tool in tools:
+            key = (tool["kind"], tool["group"])
+            group = groups_map.setdefault(
+                key,
+                {
+                    "kind": tool["kind"],
+                    "name": tool["group"],
+                    "calls": 0,
+                    "failures": 0,
+                    "tool_count": 0,
+                    "session_ids": set(),
+                    "max_tool_sessions": 0,
+                    "durations": [],
+                    "context_chars": 0,
+                    "log_calls": 0,
+                    "log_failures": 0,
+                    "last_used_at": None,
+                    "days": Counter(),
+                },
+            )
+            group["calls"] += tool["calls"]
+            group["failures"] += tool["failures"]
+            group["tool_count"] += 1
+            group["max_tool_sessions"] = max(group["max_tool_sessions"], tool["sessions"])
+            group["session_ids"] |= assistant.get(tool["name"], {}).get("sessions", set())
+            group["context_chars"] += tool["context_chars"]
+            group["log_calls"] += tool["log_calls"]
+            group["log_failures"] += tool["log_failures"]
+            stat = log_stats.get(tool["name"])
+            if stat:
+                group["durations"].extend(stat.get("durations") or [])
+            group["days"].update(assistant.get(tool["name"], {}).get("days", Counter()))
+            if tool["last_used_at"] and (
+                not group["last_used_at"] or tool["last_used_at"] > group["last_used_at"]
+            ):
+                group["last_used_at"] = tool["last_used_at"]
+
+        day_keys = [
+            dt.datetime.fromtimestamp(trend_end - offset * 86400).strftime("%Y-%m-%d")
+            for offset in range(6, -1, -1)
+        ]
+        groups = []
+        for group in groups_map.values():
+            days_counter = group["days"]
+            durations = group["durations"]
+            groups.append(
+                {
+                    "kind": group["kind"],
+                    "name": group["name"],
+                    "tool_count": group["tool_count"],
+                    "calls": group["calls"],
+                    "failures": group["failures"],
+                    "failure_rate": group["failures"] / group["calls"] if group["calls"] else 0,
+                    "sessions": max(len(group["session_ids"]), group["max_tool_sessions"]),
+                    "latency_p50_seconds": _percentile(durations, 0.50),
+                    "latency_p95_seconds": _percentile(durations, 0.95),
+                    "log_calls": group["log_calls"],
+                    "log_failures": group["log_failures"],
+                    "context_chars": group["context_chars"],
+                    "context_tokens_estimate": group["context_chars"] // 4,
+                    "last_used_at": group["last_used_at"],
+                    "trend": [
+                        {"day": day, "requests": days_counter.get(day, 0)} for day in day_keys
+                    ],
+                }
+            )
+        groups.sort(key=lambda item: (item["failures"], item["calls"], item["name"]), reverse=True)
+
         return {
             "period_days": days,
             "period": _period_payload(days, period_start, period_end),
             "tools": tools,
+            "groups": groups,
             "totals": {
                 "calls": sum(item["calls"] for item in tools),
                 "failures": sum(item["failures"] for item in tools),
                 "distinct_tools": len(tools),
+                "mcp_servers": sum(1 for item in groups if item["kind"] == "mcp"),
+                "context_chars": sum(item["context_chars"] for item in groups),
             },
             "truncated": truncated,
             "generated_at": time.time(),

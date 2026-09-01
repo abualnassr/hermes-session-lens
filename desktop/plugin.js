@@ -1601,12 +1601,69 @@ function ToolsView({ ctx, period }) {
       style: { display: 'grid', gap: '1.5rem', margin: '0 auto', maxWidth: '78rem' },
       children: [
         jsx(SectionHeading, {
-          title: 'Tool reliability',
-          description: `${formatCount(data.totals.calls)} recorded calls across ${formatCount(data.totals.distinct_tools)} tools. Failure signatures are conservative and inspectable per session.`
+          title: 'Tools & MCP servers',
+          description: `${formatCount(data.totals.calls)} recorded calls across ${formatCount(data.totals.distinct_tools)} tools${data.totals.mcp_servers ? ` · ${formatCount(data.totals.mcp_servers)} MCP server${data.totals.mcp_servers === 1 ? '' : 's'}` : ''}. Latency and output weight come from bounded local agent logs; context weight estimates the tokens tool results push into model context.`
         }),
         jsx(SimpleTable, {
           columns: [
-            { key: 'name', label: 'Tool' },
+            {
+              key: 'name',
+              label: 'Source',
+              render: row => jsxs('div', {
+                style: { alignItems: 'center', display: 'flex', gap: '0.4rem', minWidth: 0 },
+                children: [
+                  jsx('span', { style: { fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis' }, children: row.name }),
+                  row.kind === 'mcp' ? jsx(Pill, { tone: 'accent', children: 'MCP' }) : null,
+                  jsx('span', { style: { color: color.quaternary, fontSize: '0.625rem', whiteSpace: 'nowrap' }, children: `${formatCount(row.tool_count)} tool${row.tool_count === 1 ? '' : 's'}` })
+                ]
+              })
+            },
+            { key: 'calls', label: 'Calls', align: 'right', render: row => formatCount(row.calls) },
+            { key: 'sessions', label: 'Sessions', align: 'right', render: row => formatCount(row.sessions) },
+            {
+              key: 'failure_rate',
+              label: 'Fail rate',
+              align: 'right',
+              render: row => row.failures
+                ? jsx(Pill, { tone: 'danger', children: `${(Number(row.failure_rate) * 100).toFixed(1)}%` })
+                : '0%'
+            },
+            {
+              key: 'latency_p50_seconds',
+              label: 'p50 / p95',
+              align: 'right',
+              render: row => row.latency_p50_seconds != null
+                ? jsx('span', { style: tabular, title: `Median and 95th-percentile tool latency from ${formatCount(row.log_calls)} logged calls`, children: `${Number(row.latency_p50_seconds).toFixed(1)}s / ${Number(row.latency_p95_seconds).toFixed(1)}s` })
+                : jsx('span', { style: { color: color.quaternary }, children: '—' })
+            },
+            {
+              key: 'context_tokens_estimate',
+              label: 'Context weight',
+              align: 'right',
+              render: row => row.context_chars
+                ? jsx('span', { style: tabular, title: `Tool results returned ${formatCount(row.context_chars)} characters (≈${formatCount(row.context_tokens_estimate)} tokens) into model context within the logged window`, children: `≈${formatCount(row.context_tokens_estimate)} tok` })
+                : jsx('span', { style: { color: color.quaternary }, children: '—' })
+            },
+            { key: 'last_used_at', label: 'Last used', render: row => formatShortDate(row.last_used_at), muted: true },
+            { key: 'trend', label: 'Trend (7d)', align: 'right', render: row => jsx(TrendBars, { rows: row.trend }) }
+          ],
+          rows: data.groups || [],
+          emptyTitle: 'No tool calls recorded',
+          emptyDescription: 'The selected period contains no tool-call evidence.'
+        }),
+        jsx(SectionHeading, {
+          title: 'Per-tool reliability',
+          description: 'Every individual tool, ranked failures-first. Failure signatures are conservative and inspectable per session.'
+        }),
+        jsx(SimpleTable, {
+          columns: [
+            {
+              key: 'name',
+              label: 'Tool',
+              render: row => row.kind === 'mcp'
+                ? jsxs('span', { children: [jsx('span', { style: { color: color.quaternary }, children: `${row.group} · ` }), row.short_name] })
+                : row.name
+            },
             { key: 'calls', label: 'Calls', align: 'right', render: row => formatCount(row.calls) },
             { key: 'sessions', label: 'Sessions', align: 'right', render: row => formatCount(row.sessions) },
             {
@@ -1616,6 +1673,14 @@ function ToolsView({ ctx, period }) {
               render: row => row.failures ? jsx(Pill, { tone: 'danger', children: formatCount(row.failures) }) : '0'
             },
             { key: 'failure_rate', label: 'Failure rate', align: 'right', render: row => `${(Number(row.failure_rate) * 100).toFixed(1)}%` },
+            {
+              key: 'latency_p50_seconds',
+              label: 'p50 latency',
+              align: 'right',
+              render: row => row.latency_p50_seconds != null
+                ? jsx('span', { style: tabular, children: `${Number(row.latency_p50_seconds).toFixed(1)}s` })
+                : jsx('span', { style: { color: color.quaternary }, children: '—' })
+            },
             { key: 'last_used_at', label: 'Last used', render: row => formatShortDate(row.last_used_at), muted: true }
           ],
           rows: data.tools,

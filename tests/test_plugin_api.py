@@ -537,6 +537,54 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertIn("D:\\repo", free_text)
         self.assertIn("note:", free_text)
 
+    def test_tools_group_by_mcp_server_with_log_metrics(self):
+        self.assertEqual(api._tool_group("mcp__brave__search"), ("mcp", "brave", "search"))
+        self.assertEqual(api._tool_group("terminal"), ("builtin", "built-in", "terminal"))
+
+        connection = sqlite3.connect(self.db_path)
+        calls = [{"id": "call-9", "type": "function", "function": {"name": "mcp__brave__search", "arguments": "{}"}}]
+        connection.execute(
+            "INSERT INTO messages (session_id,role,tool_calls,timestamp,active) VALUES (?,?,?,?,1)",
+            ("session-1", "assistant", json.dumps(calls), 1_800_000_020),
+        )
+        connection.execute(
+            "INSERT INTO messages (session_id,role,content,tool_call_id,tool_name,timestamp,active) VALUES (?,?,?,?,?,?,1)",
+            ("session-1", "tool", "results", "call-9", "mcp__brave__search", 1_800_000_021),
+        )
+        connection.commit()
+        connection.close()
+        log_path = self.home / "logs" / "agent.log"
+        log_path.write_text(
+            log_path.read_text(encoding="utf-8")
+            + f"{_stamp(1_800_000_021)} INFO [session-1] agent.tool_executor: "
+            "tool mcp__brave__search completed (0.50s, 1200 chars)\n",
+            encoding="utf-8",
+        )
+
+        payload = api._tools_sync(days=0)
+        groups = {(group["kind"], group["name"]): group for group in payload["groups"]}
+        brave = groups[("mcp", "brave")]
+        self.assertEqual(brave["tool_count"], 1)
+        self.assertEqual(brave["calls"], 1)
+        self.assertEqual(brave["context_chars"], 1200)
+        self.assertEqual(brave["context_tokens_estimate"], 300)
+        self.assertAlmostEqual(brave["latency_p50_seconds"], 0.5)
+        self.assertEqual(len(brave["trend"]), 7)
+        builtin = groups[("builtin", "built-in")]
+        self.assertEqual(builtin["tool_count"], 2)
+        self.assertEqual(payload["totals"]["mcp_servers"], 1)
+        by_name = {tool["name"]: tool for tool in payload["tools"]}
+        self.assertEqual(by_name["mcp__brave__search"]["group"], "brave")
+        self.assertEqual(by_name["mcp__brave__search"]["short_name"], "search")
+        self.assertAlmostEqual(by_name["write_file"]["latency_p50_seconds"], 1.25)
+
+    def test_ui_tools_view_shows_group_inventory(self):
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("Tools & MCP servers", source)
+        self.assertIn("Context weight", source)
+        self.assertIn("rows: data.groups || []", source)
+        self.assertIn("'Trend (7d)'", source)
+
     def test_ui_profile_scope_picker_wired_into_requests(self):
         source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
         self.assertIn("function ProfileScopePicker", source)
