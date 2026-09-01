@@ -3427,6 +3427,7 @@ def _ai_usage_sync(fresh: bool = False, only_provider: Optional[str] = None) -> 
             ]
             result = _fold_usage_last_success(provider, result)
             result["recorded_7d"] = recorded.get(provider)
+            _attach_usage_attribution(provider, result)
             results[provider] = result
 
         providers = []
@@ -3558,6 +3559,204 @@ def _usage_recorded_7d() -> Dict[str, Dict[str, Any]]:
     return recorded
 
 
+
+_USAGE_ATTRIBUTION_TOP = 5
+_USAGE_ATTRIBUTION_FALLBACK_SECONDS = 7 * 86_400.0
+# Model-specific quota windows ("Opus week") only count the matching family.
+_USAGE_MODEL_FAMILIES = ("opus", "sonnet", "haiku")
+_USAGE_MONEY_UNITS = {"usd", "$", "credits", "credit"}
+
+
+def _usage_window_bounds(window: Mapping[str, Any]) -> Tuple[float, Optional[float], str]:
+    """(since, until, basis) for attributing local sessions to a quota window.
+
+    Timed windows count from reset minus the labelled duration; anything
+    without a readable span falls back to the trailing seven days and says
+    so, because a silent fallback would make the share numbers lie.
+    """
+    reset = _usage_reset_epoch(window.get("reset_at"))
+    duration = _quota_window_duration_seconds(window.get("label"))
+    now = time.time()
+    if reset and duration and reset > now and reset - duration < now:
+        return reset - duration, reset, "window"
+    return now - _USAGE_ATTRIBUTION_FALLBACK_SECONDS, None, "trailing_7d"
+
+
+def _usage_window_model_family(label: Any) -> Optional[str]:
+    text = str(label or "").lower()
+    return next((family for family in _USAGE_MODEL_FAMILIES if family in text), None)
+
+
+def _usage_project_key(row: Mapping[str, Any]) -> Tuple[str, str, str, str]:
+    """(kind, label, path, search) mirroring the Overview project rollup's grouping."""
+    repo = str(row.get("git_repo_root") or "").strip()
+    cwd = str(row.get("cwd") or "").strip()
+    source = str(row.get("source") or "unknown").strip() or "unknown"
+    if repo:
+        return "repo", _path_basename(repo) or repo, repo, 'project:"%s"' % repo
+    if cwd:
+        return "directory", _path_basename(cwd) or cwd, cwd, 'project:"%s"' % cwd
+    return "source", source, source, "source:%s" % source
+
+
+def _usage_attribution_rows(provider: str, since: float) -> List[Dict[str, Any]]:
+    billing_keys = _USAGE_BILLING_KEYS.get(provider) or ()
+    if not billing_keys:
+        return []
+    placeholders = ",".join("?" for _ in billing_keys)
+    with _database() as db:
+        rows = _db_connection(db).execute(
+            f"""
+            SELECT u.session_id, u.model, s.title, s.source, s.cwd, s.git_repo_root,
+                   MAX(COALESCE(u.last_seen, u.first_seen, s.last_activity_at, s.started_at, 0)) AS seen_at,
+                   SUM(u.input_tokens + u.output_tokens + u.cache_read_tokens + u.cache_write_tokens) AS tokens,
+                   SUM(CASE WHEN u.actual_cost_usd > 0 THEN u.actual_cost_usd ELSE u.estimated_cost_usd END) AS cost_usd
+            FROM session_model_usage u JOIN sessions s ON s.id = u.session_id
+            WHERE LOWER(u.billing_provider) IN ({placeholders})
+              AND coalesce(s.hidden, 0) = 0
+              AND COALESCE(u.last_seen, u.first_seen, s.last_activity_at, s.started_at, 0) >= ?
+            GROUP BY u.session_id, u.model
+            """,
+            (*[key.lower() for key in billing_keys], since),
+        ).fetchall()
+    return [_row_dict(row) for row in rows]
+
+
+def _usage_window_attribution(
+    window: Mapping[str, Any], rows: List[Mapping[str, Any]]
+) -> Dict[str, Any]:
+    """Rank the local sessions/projects/models that ran inside one quota window.
+
+    Shares are of LOCAL recorded usage — the provider counts in its own
+    units and may include other machines on the same account, so the block
+    never claims to explain the account percentage. When the window carries
+    a money figure, the recorded local cost is compared against it and the
+    unexplained remainder is stated outright.
+    """
+    since, until, basis = _usage_window_bounds(window)
+    family = _usage_window_model_family(window.get("label"))
+    matched = [
+        row
+        for row in rows
+        if _number(row.get("seen_at")) >= since
+        and (family is None or family in str(row.get("model") or "").lower())
+    ]
+    total_tokens = sum(_integer(row.get("tokens")) for row in matched)
+    total_cost = sum(_number(row.get("cost_usd")) for row in matched)
+
+    def share(tokens: int) -> float:
+        return round((tokens / total_tokens) * 100.0, 1) if total_tokens > 0 else 0.0
+
+    sessions: Dict[str, Dict[str, Any]] = {}
+    projects: Dict[str, Dict[str, Any]] = {}
+    models: Dict[str, Dict[str, Any]] = {}
+    for row in matched:
+        session_id = str(row.get("session_id") or "")
+        tokens = _integer(row.get("tokens"))
+        cost = _number(row.get("cost_usd"))
+        kind, label, path, search = _usage_project_key(row)
+        session = sessions.setdefault(
+            session_id,
+            {
+                "id": session_id,
+                "label": _clean_text(row.get("title"), 120) or session_id,
+                "project": label,
+                "models": {},
+                "tokens": 0,
+                "cost_usd": 0.0,
+                "search": "id:%s" % session_id,
+            },
+        )
+        session["tokens"] += tokens
+        session["cost_usd"] += cost
+        model_name = str(row.get("model") or "")
+        session["models"][model_name] = session["models"].get(model_name, 0) + tokens
+        project = projects.setdefault(
+            path,
+            {"label": label, "kind": kind, "tokens": 0, "cost_usd": 0.0, "sessions": set(), "search": search},
+        )
+        project["tokens"] += tokens
+        project["cost_usd"] += cost
+        project["sessions"].add(session_id)
+        model = models.setdefault(
+            model_name,
+            {"label": model_name, "tokens": 0, "cost_usd": 0.0, "sessions": set(), "search": "model:%s" % model_name},
+        )
+        model["tokens"] += tokens
+        model["cost_usd"] += cost
+        model["sessions"].add(session_id)
+
+    def finish(items: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        ranked = sorted(items, key=lambda item: (-item["tokens"], str(item.get("label") or "")))
+        top = ranked[:_USAGE_ATTRIBUTION_TOP]
+        rest = ranked[_USAGE_ATTRIBUTION_TOP:]
+        output = []
+        for item in top:
+            entry = dict(item)
+            if isinstance(entry.get("sessions"), set):
+                entry["sessions"] = len(entry["sessions"])
+            if isinstance(entry.get("models"), dict):
+                entry["model"] = max(entry["models"], key=entry["models"].get) if entry["models"] else None
+                entry.pop("models")
+            entry["cost_usd"] = round(entry["cost_usd"], 4)
+            entry["share_percent"] = share(entry["tokens"])
+            output.append(entry)
+        if rest:
+            rest_tokens = sum(item["tokens"] for item in rest)
+            output.append(
+                {
+                    "label": "%d other" % len(rest),
+                    "other": True,
+                    "count": len(rest),
+                    "tokens": rest_tokens,
+                    "cost_usd": round(sum(item["cost_usd"] for item in rest), 4),
+                    "share_percent": share(rest_tokens),
+                }
+            )
+        return output
+
+    result: Dict[str, Any] = {
+        "basis": basis,
+        "since": since,
+        "until": until,
+        "model_family": family,
+        "sessions": len(sessions),
+        "tokens": total_tokens,
+        "cost_usd": round(total_cost, 4),
+        "by_project": finish(list(projects.values())),
+        "by_session": finish(list(sessions.values())),
+        "by_model": finish(list(models.values())),
+    }
+    unit = str(window.get("unit") or "").strip().lower()
+    used = _number(window.get("used"))
+    if basis == "window" and unit in _USAGE_MONEY_UNITS and used > 0:
+        result["explained"] = {
+            "account_used": round(used, 4),
+            "unit": window.get("unit"),
+            "local_cost_usd": round(total_cost, 4),
+            "percent": round(min(100.0, (total_cost / used) * 100.0), 1),
+        }
+    return result
+
+
+def _attach_usage_attribution(provider: str, result: Dict[str, Any]) -> None:
+    """Add an `attribution` block to each quota window of a base provider card.
+
+    Extra pooled-account cards are skipped: local records name the provider,
+    not which login served the call, so a per-account split would be a guess.
+    """
+    windows = result.get("windows") or []
+    if not windows or result.get("account_extra"):
+        return
+    try:
+        since = min(_usage_window_bounds(window)[0] for window in windows)
+        rows = _usage_attribution_rows(provider, since)
+    except Exception:
+        return
+    for window in windows:
+        window["attribution"] = _usage_window_attribution(window, rows)
+
+
 def _ai_usage_refresh_provider(provider: str, collector: Any) -> Optional[Dict[str, Any]]:
     """Refresh ONE provider into the cached payload; None when no cache exists.
 
@@ -3587,6 +3786,7 @@ def _ai_usage_refresh_provider(provider: str, collector: Any) -> Optional[Dict[s
         extras = [_fold_usage_last_success(str(extra.get("provider")), extra) for extra in extras]
         result = _fold_usage_last_success(provider, result)
         result["recorded_7d"] = recorded.get(provider)
+        _attach_usage_attribution(provider, result)
         providers = []
         for item in base.get("providers", []):
             if item.get("provider") == provider:

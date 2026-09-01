@@ -2130,7 +2130,130 @@ function SpinIcon({ size }) {
   })
 }
 
-function UsageWindow({ window, series }) {
+const usageAttributionViews = [
+  { id: 'project', label: 'Projects' },
+  { id: 'session', label: 'Sessions' },
+  { id: 'model', label: 'Models' }
+]
+
+function UsageAttributionRow({ row, onDrill }) {
+  const share = Math.max(0, Math.min(100, Number(row.share_percent) || 0))
+  const drillable = Boolean(onDrill && row.search && !row.other)
+  const meta = [
+    row.kind && row.kind !== 'repo' ? row.kind : null,
+    row.project && row.project !== row.label ? row.project : null,
+    row.model || null,
+    row.sessions !== undefined && row.sessions !== null ? `${formatCount(row.sessions)} session${Number(row.sessions) === 1 ? '' : 's'}` : null
+  ].filter(Boolean).join(' · ')
+  const label = jsxs('span', {
+    style: { display: 'block', minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+    children: [
+      jsx('span', { style: { color: row.other ? color.tertiary : color.secondary, fontWeight: 600 }, children: row.label }),
+      meta ? jsx('span', { style: { color: color.quaternary, marginLeft: '0.4rem' }, children: meta }) : null
+    ]
+  })
+  return jsxs('div', {
+    role: 'row',
+    style: { alignItems: 'center', display: 'grid', gap: '0.55rem', gridTemplateColumns: 'minmax(0, 1fr) 3.6rem auto', fontSize: '0.6875rem', lineHeight: 1.4 },
+    children: [
+      drillable
+        ? jsx('button', {
+            type: 'button',
+            onClick: () => onDrill({ search: row.search }),
+            title: `Open the Sessions tab filtered to ${row.search}`,
+            style: { background: 'transparent', border: 'none', color: 'inherit', cursor: 'pointer', font: 'inherit', minWidth: 0, outlineColor: color.accent, padding: 0, textAlign: 'left' },
+            children: label
+          })
+        : label,
+      jsx('div', {
+        'aria-hidden': true,
+        style: { background: color.surfaceRaised, borderRadius: '999px', height: '0.3rem', overflow: 'hidden' },
+        children: jsx('div', { style: { background: row.other ? color.stroke : color.accent, borderRadius: '999px', height: '100%', width: `${share}%` } })
+      }),
+      jsxs('span', {
+        style: { ...tabular, color: color.tertiary, textAlign: 'right', whiteSpace: 'nowrap' },
+        children: [
+          jsx('span', { style: { color: color.primary, fontWeight: 600 }, children: `${Math.round(share)}%` }),
+          ` · ${formatCount(row.tokens)} tok`,
+          Number(row.cost_usd) > 0 ? ` · ${formatUsageAmount(row.cost_usd, 'USD')}` : ''
+        ]
+      })
+    ]
+  })
+}
+
+function UsageAttribution({ window, onDrill }) {
+  const [open, setOpen] = useState(false)
+  const [view, setView] = useState('project')
+  const attribution = window.attribution
+  if (!attribution) return null
+  const trailing = attribution.basis === 'trailing_7d'
+  const scope = trailing ? 'the last 7 days' : 'this window'
+  const sessions = Number(attribution.sessions) || 0
+  if (!sessions) {
+    return jsx('div', {
+      style: { color: color.quaternary, fontSize: '0.625rem', lineHeight: 1.45 },
+      children: trailing
+        ? 'No local Hermes sessions recorded against this provider in the last 7 days.'
+        : 'No local Hermes sessions recorded in this window — the account usage came from elsewhere.'
+    })
+  }
+  const lead = (attribution.by_project || []).filter(row => !row.other).slice(0, 2)
+  const headline = lead.map(row => `${row.label} ${Math.round(Number(row.share_percent) || 0)}%`).join(' · ')
+  const totals = [
+    `${formatCount(attribution.tokens)} tok`,
+    Number(attribution.cost_usd) > 0 ? formatUsageAmount(attribution.cost_usd, 'USD') : null,
+    `${formatCount(sessions)} session${sessions === 1 ? '' : 's'}`
+  ].filter(Boolean).join(' · ')
+  const rows = view === 'session'
+    ? attribution.by_session
+    : view === 'model' ? attribution.by_model : attribution.by_project
+  const notes = []
+  if (trailing) notes.push('This allowance has no readable window span, so local records cover the trailing 7 days instead.')
+  if (attribution.model_family) notes.push(`Counting only ${attribution.model_family} models, to match this window.`)
+  const explained = attribution.explained
+  const explainedLine = explained
+    ? explained.percent >= 99
+      ? `Local Hermes sessions account for essentially all of the ${formatUsageAmount(explained.account_used, explained.unit)} used.`
+      : `Local Hermes sessions explain ${formatUsageAmount(explained.local_cost_usd, 'USD')} of the ${formatUsageAmount(explained.account_used, explained.unit)} used (${Math.round(explained.percent)}%); the rest came from other machines, tools, or profiles on this account.`
+    : null
+  return jsxs('div', {
+    style: { display: 'grid', gap: '0.45rem' },
+    children: [
+      jsxs('button', {
+        type: 'button',
+        onClick: () => setOpen(current => !current),
+        'aria-expanded': open,
+        title: 'Local Hermes records that ran inside this quota window. Shares are of locally recorded tokens; the provider counts in its own units and may include other machines on the same account.',
+        style: { alignItems: 'center', background: 'transparent', border: 'none', color: color.tertiary, cursor: 'pointer', display: 'flex', font: 'inherit', fontSize: '0.6875rem', gap: '0.35rem', minWidth: 0, outlineColor: color.accent, padding: 0, textAlign: 'left' },
+        children: [
+          jsx(Codicon, { name: open ? 'chevron-down' : 'chevron-right', size: '0.65rem' }),
+          jsx('span', { style: { color: color.secondary, fontWeight: 600, whiteSpace: 'nowrap' }, children: `What consumed ${scope}` }),
+          jsx('span', { style: { minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: headline ? `${headline} · ${totals}` : totals })
+        ]
+      }),
+      open
+        ? jsxs('div', {
+            role: 'table',
+            'aria-label': `${window.label} usage by ${view}`,
+            style: { display: 'grid', gap: '0.4rem', paddingLeft: '1rem' },
+            children: [
+              jsx(SegmentedControl, { options: usageAttributionViews, value: view, onChange: setView }),
+              ...(rows || []).map((row, index) => jsx(UsageAttributionRow, { row, onDrill }, `${view}-${row.search || row.label || index}`)),
+              explainedLine
+                ? jsx('div', { style: { color: explained.percent < 50 ? color.warning : color.quaternary, fontSize: '0.625rem', lineHeight: 1.45 }, children: explainedLine })
+                : null,
+              notes.length
+                ? jsx('div', { style: { color: color.quaternary, fontSize: '0.625rem', lineHeight: 1.45 }, children: notes.join(' ') })
+                : null
+            ]
+          })
+        : null
+    ]
+  })
+}
+
+function UsageWindow({ window, series, onDrill }) {
   const rawUsed = window.percentage_used
   const rawRemaining = window.percentage_remaining
   const hasPercent = rawUsed !== null && rawUsed !== undefined && Number.isFinite(Number(rawUsed))
@@ -2198,12 +2321,13 @@ function UsageWindow({ window, series }) {
             style: { color: color.quaternary, fontSize: '0.6875rem', lineHeight: 1.45 },
             children: detailParts.join(' · ')
           })
-        : null
+        : null,
+      jsx(UsageAttribution, { window, onDrill })
     ]
   })
 }
 
-function UsageProvider({ provider, history, onRefresh }) {
+function UsageProvider({ provider, history, onRefresh, onDrill }) {
   const status = usageStatus(provider)
   const messageDanger = ['expired', 'forbidden', 'unavailable'].includes(provider.status)
   const [busy, setBusy] = useState(false)
@@ -2281,7 +2405,7 @@ function UsageProvider({ provider, history, onRefresh }) {
           })
         : null,
       provider.windows?.length
-        ? jsx('div', { style: { marginTop: '0.65rem' }, children: provider.windows.map(window => jsx(UsageWindow, { window, series: history?.[`${provider.provider}:${window.id}`] }, `${provider.provider}-${window.id}`)) })
+        ? jsx('div', { style: { marginTop: '0.65rem' }, children: provider.windows.map(window => jsx(UsageWindow, { window, series: history?.[`${provider.provider}:${window.id}`], onDrill }, `${provider.provider}-${window.id}`)) })
         : jsx('div', {
             style: { borderTop: border, color: color.quaternary, fontSize: '0.75rem', marginTop: '0.75rem', paddingTop: '0.75rem' },
             children: provider.status === 'not_configured'
@@ -2311,7 +2435,7 @@ function UsageProvider({ provider, history, onRefresh }) {
   })
 }
 
-function UsageProviderGroup({ title, description, providers, narrow, id, history, onRefresh }) {
+function UsageProviderGroup({ title, description, providers, narrow, id, history, onRefresh, onDrill }) {
   if (!providers.length) return null
   return jsxs('section', {
     'aria-labelledby': id,
@@ -2332,7 +2456,7 @@ function UsageProviderGroup({ title, description, providers, narrow, id, history
       }),
       jsx('div', {
         style: { display: 'grid', gap: '0.85rem', gridTemplateColumns: narrow ? 'minmax(0, 1fr)' : 'repeat(2, minmax(0, 1fr))' },
-        children: providers.map(provider => jsx(UsageProvider, { provider, history, onRefresh }, provider.provider))
+        children: providers.map(provider => jsx(UsageProvider, { provider, history, onRefresh, onDrill }, provider.provider))
       })
     ]
   })
@@ -2437,7 +2561,7 @@ function QuotaAlertStrip({ notes, dismissedIds, onDismiss, onOpen }) {
   })
 }
 
-function AIUsageView({ query, narrow, refreshError, history, onRefreshProvider }) {
+function AIUsageView({ query, narrow, refreshError, history, onRefreshProvider, onDrill }) {
   if (query.isLoading) return jsx(LoadingBlock, { rows: 8 })
   if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'AI usage is unavailable' })
   const data = query.data
@@ -2469,7 +2593,8 @@ function AIUsageView({ query, narrow, refreshError, history, onRefreshProvider }
               providers: orderedProviders,
               narrow,
               history,
-              onRefresh: onRefreshProvider
+              onRefresh: onRefreshProvider,
+              onDrill
             })
           : jsx(EmptyState, {
               title: 'No monitorable AI providers are connected',
@@ -2914,7 +3039,8 @@ function SessionLensPage({ ctx }) {
     narrow: Boolean(viewport?.narrow),
     refreshError: aiRefreshError,
     history: usageHistory,
-    onRefreshProvider: refreshProvider
+    onRefreshProvider: refreshProvider,
+    onDrill: drillToSessions
   })
   if (tab === 'ai-models') content = jsx(AIModelsView, {
     onDrill: drillToSessions,

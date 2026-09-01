@@ -11,7 +11,7 @@ import time
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from datetime import datetime
+from datetime import datetime, timezone
 from unittest.mock import Mock, patch
 
 
@@ -2186,6 +2186,101 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertEqual(schedules["totals"]["jobs"], 1)
         self.assertNotIn("prompt", schedules["schedules"][0])
         self.assertNotIn("must-not-leak", json.dumps(schedules))
+
+
+    def test_usage_attribution_ranks_local_sessions_inside_window(self):
+        connection = sqlite3.connect(self.db_path)
+        try:
+            connection.execute(
+                """
+                INSERT INTO sessions (id, source, model, title, started_at, last_activity_at, git_repo_root, message_count)
+                VALUES ('session-opus', 'desktop', 'claude-opus-5', 'Big refactor', 1800000300, 1800000900, 'C:\\work\\demo-repo', 3)
+                """
+            )
+            connection.execute(
+                SESSION_MODEL_USAGE_INSERT_SQL,
+                ("session-opus", "claude-opus-5", "anthropic-oauth", "subscription", "", 3, 6000, 1500, 0, 0, 0, 0, 0,
+                 "included", "test", 1_800_000_300, 1_800_000_900),
+            )
+            connection.execute(
+                SESSION_MODEL_USAGE_INSERT_SQL,
+                ("session-1", "claude-sonnet-5", "anthropic", "metered", "", 1, 1000, 500, 0, 0, 0, 0.5, 0,
+                 "estimated", "test", 1_800_000_000, 1_800_000_100),
+            )
+            # Older than the window: must never count.
+            connection.execute(
+                "INSERT INTO sessions (id, source, model, started_at, last_activity_at, message_count) "
+                "VALUES ('session-old', 'desktop', 'claude-opus-5', 1799000000, 1799000100, 1)"
+            )
+            connection.execute(
+                SESSION_MODEL_USAGE_INSERT_SQL,
+                ("session-old", "claude-opus-5", "anthropic-oauth", "subscription", "", 1, 99000, 1000, 0, 0, 0, 0, 0,
+                 "included", "test", 1_799_000_000, 1_799_000_100),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        now = 1_800_001_000
+        reset_at = datetime.fromtimestamp(now + 3 * 86_400, timezone.utc).isoformat()
+        card = {
+            "windows": [
+                api._usage_window("Current week", used_percent=60, reset_at=reset_at),
+                api._usage_window("Opus week", used_percent=40, reset_at=reset_at),
+                api._usage_window("Monthly extra usage", used=10, limit=20, unit="USD", reset_at=reset_at),
+                api._usage_window("Credits", kind="balance", remaining=5, unit="USD"),
+            ]
+        }
+        with patch.object(api.time, "time", return_value=now):
+            api._attach_usage_attribution("anthropic", card)
+        week, opus, extra, credits = [window["attribution"] for window in card["windows"]]
+
+        self.assertEqual(week["basis"], "window")
+        self.assertEqual(week["since"], now + 3 * 86_400 - 7 * 86_400)
+        self.assertEqual(week["sessions"], 2)
+        self.assertEqual(week["tokens"], 9000)
+        self.assertAlmostEqual(week["cost_usd"], 0.5)
+        top = week["by_session"][0]
+        self.assertEqual(top["id"], "session-opus")
+        self.assertEqual(top["label"], "Big refactor")
+        self.assertEqual(top["model"], "claude-opus-5")
+        self.assertEqual(top["search"], "id:session-opus")
+        self.assertAlmostEqual(top["share_percent"], 83.3)
+        self.assertEqual(week["by_session"][1]["search"], "id:session-1")
+        project = week["by_project"][0]
+        self.assertEqual((project["label"], project["kind"], project["sessions"]), ("demo-repo", "repo", 1))
+        self.assertEqual(project["search"], 'project:"C:\\work\\demo-repo"')
+        self.assertEqual(week["by_project"][1]["label"], "demo")
+        self.assertEqual([row["label"] for row in week["by_model"]], ["claude-opus-5", "claude-sonnet-5"])
+        self.assertNotIn("explained", week)
+
+        # Model-family windows count only that family.
+        self.assertEqual(opus["model_family"], "opus")
+        self.assertEqual((opus["sessions"], opus["tokens"]), (1, 7500))
+
+        # A money window compares local recorded cost against the account figure.
+        self.assertEqual(extra["explained"], {"account_used": 10.0, "unit": "USD", "local_cost_usd": 0.5, "percent": 5.0})
+
+        # No reset/duration: trailing 7 days, declared as such, still excludes the old session.
+        self.assertEqual(credits["basis"], "trailing_7d")
+        self.assertIsNone(credits["until"])
+        self.assertEqual(credits["sessions"], 2)
+
+    def test_usage_attribution_skips_extra_account_cards_and_tolerates_db_errors(self):
+        extra = {"account_extra": True, "windows": [api._usage_window("Weekly", used_percent=5)]}
+        api._attach_usage_attribution("anthropic", extra)
+        self.assertNotIn("attribution", extra["windows"][0])
+        card = {"windows": [api._usage_window("Weekly", used_percent=5)]}
+        with patch.object(api, "_usage_attribution_rows", side_effect=RuntimeError("db gone")):
+            api._attach_usage_attribution("anthropic", card)
+        self.assertNotIn("attribution", card["windows"][0])
+
+    def test_ai_usage_attribution_is_wired_into_plugin_source(self):
+        source = Path(__file__).resolve().parents[1].joinpath("desktop", "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("function UsageAttribution(", source)
+        self.assertIn("jsx(UsageAttribution, { window, onDrill })", source)
+        self.assertIn("What consumed ${scope}", source)
+        self.assertIn("onDrill: drillToSessions", source[source.index("jsx(AIUsageView, {"):])
+        self.assertIn("the rest came from other machines, tools, or profiles on this account", source)
 
 
 if __name__ == "__main__":
