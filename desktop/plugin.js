@@ -2092,7 +2092,12 @@ const usageProviderIcons = {
   kimi: 'sparkle',
   nous: 'beaker',
   openrouter: 'globe',
-  zai: 'pulse'
+  zai: 'pulse',
+  firecrawl: 'flame',
+  scrapecreators: 'cloud-download',
+  agentmail: 'mail',
+  brightdata: 'globe',
+  monid: 'terminal'
 }
 
 // ============================================================================
@@ -2794,7 +2799,98 @@ function BudgetsSection({ ctx, budgets, onChange, narrow }) {
   })
 }
 
-function AIUsageView({ ctx, query, narrow, refreshError, history, onRefreshProvider, onDrill, budgets, onBudgetsChange }) {
+function serviceInventoryStatus(row) {
+  if (row.status === 'monitored') return { tone: 'accent', label: 'Monitored', icon: 'pass' }
+  if (row.status === 'attention') return { tone: 'danger', label: 'Needs attention', icon: 'warning' }
+  if (row.status === 'monitorable') return { tone: 'neutral', label: 'Not read yet', icon: 'circle-outline' }
+  return { tone: 'neutral', label: 'No usage API', icon: 'circle-slash' }
+}
+
+function ServicesSection({ query, narrow, history, onRefresh }) {
+  const data = query.data
+  const cards = data?.cards || []
+  const inventory = data?.inventory || []
+  const summary = data?.summary || {}
+  return jsxs('div', {
+    style: { display: 'grid', gap: '1rem' },
+    children: [
+      query.isError
+        ? jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'Service balances are unavailable' })
+        : query.isLoading
+          ? jsx(LoadingBlock, { rows: 4 })
+          : cards.length
+            ? jsx(UsageProviderGroup, {
+                id: 'service-usage',
+                title: 'Services & tools',
+                description: 'Credits and balances for the non-model services Hermes holds keys for — search, scraping, mail, data marketplaces — read from each vendor’s own usage endpoint.',
+                providers: [...cards].sort((a, b) => usageUrgency(b) - usageUrgency(a)),
+                narrow,
+                history,
+                onRefresh
+              })
+            : null,
+      data
+        ? jsxs('section', {
+            'aria-labelledby': 'service-inventory',
+            style: { display: 'grid', gap: '0.65rem' },
+            children: [
+              jsxs('div', {
+                children: [
+                  jsx('h3', { id: 'service-inventory', style: { color: color.primary, fontSize: '0.9375rem', fontWeight: 650, lineHeight: 1.35, margin: 0 }, children: 'Everything configured' }),
+                  jsx('p', {
+                    style: { color: color.tertiary, fontSize: '0.6875rem', lineHeight: 1.5, margin: '0.15rem 0 0' },
+                    children: `${formatCount(summary.configured)} non-model service${Number(summary.configured) === 1 ? '' : 's'} found in Hermes — ${formatCount(summary.monitored)} monitored, ${formatCount(summary.unreadable)} with no usage API Session Lens can read. ${data.definition || ''}`
+                  })
+                ]
+              }),
+              jsx(SimpleTable, {
+                columns: [
+                  {
+                    key: 'label',
+                    label: 'Service',
+                    render: row => jsxs('div', {
+                      style: { alignItems: 'center', display: 'flex', gap: '0.4rem', minWidth: 0 },
+                      children: [
+                        jsx('span', { style: { fontWeight: 600 }, children: row.label }),
+                        row.kind === 'mcp' || row.mcp ? jsx(Pill, { tone: 'accent', children: 'MCP' }) : null,
+                        row.kind === 'key' ? jsx(Pill, { tone: 'neutral', children: 'key' }) : null,
+                        row.accounts?.length ? jsx('span', { style: { color: color.quaternary, fontSize: '0.625rem' }, children: `+${row.accounts.length} more key${row.accounts.length === 1 ? '' : 's'}` }) : null
+                      ]
+                    })
+                  },
+                  {
+                    key: 'sources',
+                    label: 'Found via',
+                    render: row => jsx('span', { style: { ...tabular, color: color.tertiary, fontSize: '0.6875rem', overflowWrap: 'anywhere' }, children: (row.sources || []).join(' · ') }),
+                    muted: true
+                  },
+                  {
+                    key: 'status',
+                    label: 'Status',
+                    render: row => {
+                      const status = serviceInventoryStatus(row)
+                      return jsx(Pill, { tone: status.tone, children: jsxs(Fragment, { children: [jsx(Codicon, { name: status.icon, size: '0.65rem' }), status.label] }) })
+                    }
+                  },
+                  {
+                    key: 'note',
+                    label: 'Note',
+                    render: row => jsx('span', { style: { color: color.quaternary, fontSize: '0.6875rem', lineHeight: 1.4 }, children: row.note || (row.status === 'monitored' ? 'Read from the vendor’s usage endpoint.' : '') }),
+                    muted: true
+                  }
+                ],
+                rows: inventory,
+                emptyTitle: 'No non-model services found',
+                emptyDescription: 'Keys in the Hermes .env, mcp_servers in config.yaml, and known CLIs on PATH appear here automatically.'
+              })
+            ]
+          })
+        : null
+    ]
+  })
+}
+
+function AIUsageView({ ctx, query, servicesQuery, narrow, refreshError, history, onRefreshProvider, onRefreshService, onDrill, budgets, onBudgetsChange }) {
   if (query.isLoading) return jsx(LoadingBlock, { rows: 8 })
   if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'AI usage is unavailable' })
   const data = query.data
@@ -2840,6 +2936,7 @@ function AIUsageView({ ctx, query, narrow, refreshError, history, onRefreshProvi
                   : 'No provider credentials were found in Hermes.'
               ].filter(Boolean).join(' ')
             }),
+        jsx(ServicesSection, { query: servicesQuery, narrow, history, onRefresh: onRefreshService }),
         jsx(BudgetsSection, { ctx, budgets, onChange: onBudgetsChange, narrow }),
         configured.length && unconfigured.length
           ? jsxs('div', {
@@ -3093,6 +3190,12 @@ function SessionLensPage({ ctx }) {
     enabled: tab === 'ai-usage' || tab === 'ai-models',
     refetchInterval: tab === 'ai-usage' || tab === 'ai-models' ? 300_000 : false
   })
+  const servicesQuery = useQuery({
+    queryKey: [PLUGIN_ID, 'services'],
+    queryFn: () => ctx.rest('/services'),
+    enabled: tab === 'ai-usage',
+    refetchInterval: tab === 'ai-usage' ? 300_000 : false
+  })
   const aiModelsQuery = useQuery({
     queryKey: [PLUGIN_ID, 'ai-models', period.days, period.start_at, period.end_at],
     queryFn: () => ctx.rest(apiPath('/ai-models', period)),
@@ -3184,7 +3287,17 @@ function SessionLensPage({ ctx }) {
       queryClient.setQueryData([PLUGIN_ID, 'ai-usage'], data)
     } catch (error) {
       refreshErrors.push(`OAuth quotas: ${error?.message || String(error || 'the backend did not return data')}`)
-    } finally {
+    }
+    if (tab === 'ai-usage') {
+      try {
+        const data = await ctx.rest('/services?fresh=true')
+        queryClient.setQueryData([PLUGIN_ID, 'services'], data)
+        queryClient.invalidateQueries({ queryKey: [PLUGIN_ID, 'budgets'] })
+      } catch (error) {
+        refreshErrors.push(`Services: ${error?.message || String(error || 'refresh failed')}`)
+      }
+    }
+    try {
       if (refreshErrors.length) setAiRefreshError(refreshErrors.join(' · '))
       setAiManualRefreshing(false)
     }
@@ -3304,15 +3417,26 @@ function SessionLensPage({ ctx }) {
       setAiRefreshError(`${provider}: ${error?.message || String(error || 'refresh failed')}`)
     }
   }
+  const refreshService = async service => {
+    try {
+      const data = await ctx.rest(`/services?fresh=true&service=${encodeURIComponent(service)}`)
+      queryClient.setQueryData([PLUGIN_ID, 'services'], data)
+      queryClient.invalidateQueries({ queryKey: [PLUGIN_ID, 'budgets'] })
+    } catch (error) {
+      setAiRefreshError(`${service}: ${error?.message || String(error || 'refresh failed')}`)
+    }
+  }
   if (tab === 'ai-usage') content = jsx(AIUsageView, {
     ctx,
     budgets,
     onBudgetsChange: updateBudget,
     query: aiUsageQuery,
+    servicesQuery,
     narrow: Boolean(viewport?.narrow),
     refreshError: aiRefreshError,
     history: usageHistory,
     onRefreshProvider: refreshProvider,
+    onRefreshService: refreshService,
     onDrill: drillToSessions
   })
   if (tab === 'ai-models') content = jsx(AIModelsView, {

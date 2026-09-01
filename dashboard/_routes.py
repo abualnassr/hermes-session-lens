@@ -10,12 +10,14 @@ try:
     from ._classify import *
     from ._reliability import *
     from ._providers import *
+    from ._services import *
 except ImportError:  # pragma: no cover - direct Hermes file loading
     from _common import *
     from _logparse import *
     from _classify import *
     from _reliability import *
     from _providers import *
+    from _services import *
 
 router = APIRouter()
 
@@ -3982,7 +3984,7 @@ def _month_bounds(now: Optional[float] = None) -> Tuple[float, float]:
 
 
 def _budget_provider_label(provider_id: str) -> str:
-    meta = _AI_USAGE_PROVIDER_META.get(provider_id)
+    meta = _AI_USAGE_PROVIDER_META.get(provider_id) or _SERVICE_META.get(provider_id)
     if meta:
         return str(meta["label"])
     route = _MODEL_ROUTE_META.get(provider_id) or {}
@@ -4024,12 +4026,18 @@ def _budget_local_spend(month_start: float, pace_start: float) -> Dict[str, Dict
 
 
 def _budget_account_spend() -> Dict[str, Dict[str, Any]]:
-    """Provider-reported month-to-date spend from the cached /ai-usage payload."""
+    """Month-to-date spend reported by providers and services, from cached payloads only."""
+    cards: List[Mapping[str, Any]] = []
     payload = _ai_usage_cached_payload()
-    if not payload:
+    if payload:
+        cards.extend(payload.get("providers", []))
+    services_payload = _services_cached_payload()
+    if services_payload:
+        cards.extend(services_payload.get("cards", []))
+    if not cards:
         return {}
     account: Dict[str, Dict[str, Any]] = {}
-    for provider in payload.get("providers", []):
+    for provider in cards:
         if provider.get("status") not in {"ok", "stale"} or provider.get("account_extra"):
             continue
         spend = provider.get("account_spend")
@@ -4042,7 +4050,7 @@ def _budget_account_spend() -> Dict[str, Dict[str, Any]]:
             "monthly": monthly,
             "weekly": _number(spend.get("weekly"), None),
             "unit": spend.get("unit") or "USD",
-            "as_of": provider.get("fetched_at") or payload.get("generated_at"),
+            "as_of": provider.get("fetched_at"),
             "stale": bool(provider.get("stale")),
         }
     return account
@@ -4274,6 +4282,11 @@ def _ai_usage_refresh_provider(provider: str, collector: Any) -> Optional[Dict[s
 @router.get("/ai-usage")
 async def ai_usage(fresh: bool = False, provider: Optional[str] = None) -> Dict[str, Any]:
     return await asyncio.to_thread(_ai_usage_sync, fresh, provider)
+
+
+@router.get("/services")
+async def services_route(fresh: bool = False, service: Optional[str] = None) -> Dict[str, Any]:
+    return await asyncio.to_thread(_services_sync, fresh, service)
 
 
 def _system_sync() -> Dict[str, Any]:

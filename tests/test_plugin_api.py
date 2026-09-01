@@ -29,6 +29,7 @@ MODULE_PATH = Path(__file__).resolve().parents[1] / "dashboard" / "_routes.py"
 from dashboard import _classify as classify
 from dashboard import _hermes_compat as hermes_compat
 from dashboard import _routes as api
+from dashboard import _services as services
 
 
 def tool_rows(name: str, arguments: dict | None = None, result: str = "Done!"):
@@ -2454,6 +2455,173 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertIn("activeBudgetsParam = budgetsParam", source)
         self.assertIn("pageAttentionQuery.data?.budgets", source)
         self.assertIn("jsx(BudgetsSection, {", source)
+
+
+    def _write_services_home(self):
+        (self.home / ".env").write_text(
+            "\n".join(
+                [
+                    "# OPENROUTER_API_KEY=commented-out",
+                    "OPENROUTER_API_KEY=llm-key-belongs-to-providers",
+                    "FIRECRAWL_API_KEY=fc-main",
+                    "export FIRECRAWL_API_KEY_N8N=fc-n8n",
+                    "FIRECRAWL_API_URL=https://api.firecrawl.dev",
+                    "BRAVE_SEARCH_API_KEY=brave",
+                    "TELEGRAM_BOT_TOKEN=tg",
+                    "WEIRD_SERVICE_API_KEY=x",
+                    "SCRAPECREATORS_API_KEY=sc",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        (self.home / "config.yaml").write_text(
+            "\n".join(
+                [
+                    "model: something",
+                    "mcp_servers:",
+                    "  firecrawl:",
+                    "    command: npx",
+                    "    enabled: true",
+                    "  brightdata:",
+                    "    url: https://mcp.brightdata.com/mcp?token=secret",
+                    "    enabled: true",
+                    "  custom-thing:",
+                    "    url: https://tools.example.com/mcp",
+                    "    enabled: false",
+                    "other_setting: 1",
+                ]
+            ),
+            encoding="utf-8",
+        )
+
+    def test_services_inventory_reads_env_names_mcp_servers_and_clis_only(self):
+        self._write_services_home()
+        with patch.object(services.shutil, "which", side_effect=lambda name: r"C:\npm\monid.cmd" if name == "monid" else None):
+            inventory = services._services_inventory()
+        self.assertNotIn("openrouter", inventory)
+        firecrawl = inventory["firecrawl"]
+        self.assertEqual(firecrawl["kind"], "service")
+        self.assertTrue(firecrawl["adapter"])
+        self.assertEqual(firecrawl["sources"], ["env:FIRECRAWL_API_KEY", "env:FIRECRAWL_API_KEY_N8N", "mcp:firecrawl"])
+        self.assertEqual(firecrawl["accounts"], ["n8n"])
+        self.assertEqual(firecrawl["mcp"], {"transport": "stdio", "enabled": True, "tool_count": None})
+        brightdata = inventory["brightdata"]
+        self.assertEqual(brightdata["sources"], ["mcp:brightdata (mcp.brightdata.com)"])
+        self.assertNotIn("secret", json.dumps(brightdata))
+        brave = inventory["brave"]
+        self.assertFalse(brave["adapter"])
+        self.assertIn("will not spend", brave["note"])
+        self.assertEqual(inventory["telegram"]["sources"], ["env:TELEGRAM_BOT_TOKEN"])
+        custom = inventory["custom-thing"]
+        self.assertEqual((custom["kind"], custom["mcp"]["enabled"], custom["mcp"]["transport"]), ("mcp", False, "http"))
+        weird = inventory["weird_service"]
+        self.assertEqual((weird["kind"], weird["label"], weird["adapter"]), ("key", "Weird Service", False))
+        monid = inventory["monid"]
+        self.assertEqual(monid["sources"], ["cli:monid"])
+        self.assertEqual(monid["cli_path"], r"C:\npm\monid.cmd")
+        # Values are never part of the inventory.
+        self.assertNotIn("fc-main", json.dumps(inventory))
+
+    def test_service_adapters_parse_verified_response_shapes(self):
+        firecrawl = services._firecrawl_payload(
+            {"success": True, "data": {"remainingCredits": 10778, "planCredits": 1000,
+                                        "billingPeriodStart": "2026-08-29T09:32:35.884Z", "billingPeriodEnd": "2026-09-29T09:32:35.884Z"}},
+            account="n8n",
+        )
+        self.assertEqual(firecrawl["provider"], "firecrawl:n8n")
+        self.assertTrue(firecrawl["account_extra"])
+        window = firecrawl["windows"][0]
+        self.assertEqual((window["kind"], window["remaining"], window["limit"], window["unit"]), ("balance", 10778.0, 1000.0, "credits"))
+        self.assertIsNone(window["percentage_used"])
+        self.assertIn("top-ups", window["detail"])
+        self.assertTrue(window["reset_at"].startswith("2026-09-29"))
+        low = services._firecrawl_payload({"success": True, "data": {"remaining_credits": 250, "plan_credits": 1000}})
+        self.assertEqual(low["windows"][0]["percentage_used"], 75.0)
+
+        scrape = services._scrapecreators_payload({"success": True, "creditCount": 6441, "message": "You have 6441 credits remaining."})
+        self.assertEqual(scrape["windows"][0]["remaining"], 6441.0)
+
+        mail = services._agentmail_payload({"message_count": [{"timestamp": "2026-09-01T21:04:43.917Z", "value": 28}],
+                                            "inbox_count": [{"timestamp": "2026-09-01T21:04:43.917Z", "value": 3}]})
+        self.assertEqual(mail["status"], "ok")
+        self.assertEqual(mail["windows"], [])
+        self.assertIn("28 messages · 3 inboxes", mail["details"][0])
+
+        bright = services._brightdata_payload({"balance": 12.5, "pending_costs": 1.25})
+        self.assertEqual(bright["windows"][0]["remaining"], 12.5)
+        self.assertEqual(bright["details"], ["pending costs: 1.25"])
+
+        now = 1_800_000_000
+        month_start = services._monid_month_start(now)
+        iso = lambda ts: datetime.fromtimestamp(ts, timezone.utc).isoformat().replace("+00:00", "Z")
+        runs = {"items": [
+            {"providerName": "Exa", "cost": {"value": 0.5, "currency": "USD"}, "createdAt": iso(now - 3600)},
+            {"providerName": "Apify", "cost": {"value": 2.0, "currency": "USD"}, "createdAt": iso(max(month_start + 60, now - 6 * 86400))},
+            {"providerName": "Old", "cost": {"value": 9.0, "currency": "USD"}, "createdAt": iso(month_start - 86400)},
+        ]}
+        monid = services._monid_payload({"balance": {"value": 11, "currency": "USD"}, "held": {"value": 0, "currency": "USD"},
+                                         "notes": ["Update available: 0.1.6 → 0.1.7."]}, runs, now)
+        self.assertEqual(monid["windows"][0]["remaining"], 11.0)
+        self.assertEqual(monid["account_spend"]["monthly"], 2.5)
+        self.assertEqual(monid["account_spend"]["daily"], 0.5)
+        self.assertIn("Month to date: 2.50 USD across 2 runs", monid["details"][0])
+        self.assertIn("Top: Apify 2.00 · Exa 0.50", monid["details"][1])
+        self.assertIn("Update available", monid["details"][-1])
+
+    def test_services_sync_flattens_accounts_and_keeps_unreadable_rows(self):
+        self._write_services_home()
+        services._services_cache = None
+        services._services_last_success.clear()
+        primary = services._service_payload("firecrawl", status="ok", windows=[services._usage_window("Credits", kind="balance", remaining=5, unit="credits")])
+        primary["extra_accounts"] = [services._service_payload("firecrawl", status="expired", message="rejected", account="n8n")]
+        collectors = {
+            "firecrawl": Mock(return_value=primary),
+            "scrapecreators": Mock(return_value=services._service_payload("scrapecreators", status="unavailable", message="timeout")),
+            "brightdata": Mock(return_value=services._service_payload("brightdata", status="forbidden", message="no permission")),
+            "monid": Mock(return_value=services._service_payload("monid", status="ok", windows=[])),
+        }
+        with patch.dict(services._SERVICE_COLLECTORS, collectors, clear=True), \
+             patch.object(services.shutil, "which", side_effect=lambda name: "monid" if name == "monid" else None):
+            payload = services._services_sync(fresh=True)
+        ids = [card["provider"] for card in payload["cards"]]
+        self.assertEqual(ids, ["firecrawl", "firecrawl:n8n", "scrapecreators", "brightdata", "monid"])
+        rows = {row["id"]: row for row in payload["inventory"]}
+        self.assertEqual(rows["firecrawl"]["status"], "monitored")
+        self.assertEqual(rows["brightdata"]["status"], "attention")
+        self.assertEqual(rows["brightdata"]["note"], "no permission")
+        self.assertEqual(rows["brave"]["status"], "unreadable")
+        self.assertEqual(rows["custom-thing"]["status"], "unreadable")
+        self.assertEqual(payload["summary"], {"configured": len(rows), "monitored": 2, "attention": 2, "unreadable": 4})
+        # Cached payload serves without collectors; budgets can read it without a fetch.
+        collectors["monid"].reset_mock()
+        again = services._services_sync()
+        self.assertTrue(again["cached"])
+        collectors["monid"].assert_not_called()
+        self.assertIsNotNone(services._services_cached_payload())
+        services._services_cache = None
+
+    def test_budgets_pick_up_service_account_spend(self):
+        now = 1_800_000_000
+        services._services_cache = (now, {"cards": [{"provider": "monid", "status": "ok", "fetched_at": now,
+                                                     "account_spend": {"daily": 0.5, "weekly": 2.5, "monthly": 2.5, "unit": "USD"}}],
+                                          "inventory": [], "generated_at": now})
+        try:
+            with patch.object(api.time, "time", return_value=now):
+                payload = api._budgets_sync({"monid": 20})
+        finally:
+            services._services_cache = None
+        monid = next(item for item in payload["entries"] if item["id"] == "monid")
+        self.assertEqual((monid["label"], monid["spend_source"], monid["spend_usd"]), ("Monid", "account", 2.5))
+        self.assertEqual(monid["status"], "ok")
+
+    def test_services_are_wired_into_plugin_source(self):
+        source = Path(__file__).resolve().parents[1].joinpath("desktop", "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("function ServicesSection(", source)
+        self.assertIn("jsx(ServicesSection, {", source)
+        self.assertIn("'/services?fresh=true'", source)
+        self.assertIn("Everything configured", source)
+        routes = {route.path for route in api.router.routes}
+        self.assertIn("/services", routes)
 
 
 if __name__ == "__main__":
