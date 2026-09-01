@@ -2597,7 +2597,7 @@ function ProfileScopePicker({ serving, available, scope, onChange }) {
         ? jsxs('div', {
             role: 'menu',
             'aria-label': 'Profile scope',
-            style: { background: color.surfaceRaised, border, borderRadius: '6px', boxShadow: '0 8px 24px rgba(0,0,0,0.28)', minWidth: '14rem', padding: '0.35rem', position: 'absolute', right: 0, top: 'calc(100% + 0.35rem)', zIndex: 30 },
+            style: { background: `linear-gradient(${color.surfaceRaised}, ${color.surfaceRaised}), var(--ui-bg-primary)`, border, borderRadius: '6px', boxShadow: '0 8px 24px rgba(0,0,0,0.28)', minWidth: '14rem', padding: '0.35rem', position: 'absolute', right: 0, top: 'calc(100% + 0.35rem)', zIndex: 30 },
             children: [
               jsx('button', {
                 type: 'button', role: 'menuitemradio', 'aria-checked': scope == null,
