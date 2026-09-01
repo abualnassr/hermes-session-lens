@@ -128,14 +128,23 @@ def _percentile(values: Iterable[float], percentile: float) -> Optional[float]:
 
 
 def _runtime_events() -> Dict[str, Any]:
-    log_dir = _hermes_home() / "logs"
-    if not log_dir.exists():
+    # The MAX_LOG_FILES bound applies per profile home so a wide scope still
+    # reads each profile's most recent logs rather than starving one of them.
+    candidates: List[Path] = []
+    for home in _scope_homes():
+        log_dir = home / "logs"
+        if not log_dir.exists():
+            continue
+        candidates.extend(
+            sorted(
+                (path for path in log_dir.glob("agent.log*") if path.is_file()),
+                key=lambda path: path.stat().st_mtime,
+                reverse=True,
+            )[:MAX_LOG_FILES]
+        )
+    if not candidates:
         return {"api": [], "errors": [], "tools": [], "timestamps": [], "files": []}
-    candidates = sorted(
-        (path for path in log_dir.glob("agent.log*") if path.is_file()),
-        key=lambda path: path.stat().st_mtime,
-        reverse=True,
-    )[:MAX_LOG_FILES]
+    candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
     api_events: List[Dict[str, Any]] = []
     api_errors: List[Dict[str, Any]] = []
     tool_events: List[Dict[str, Any]] = []

@@ -17,6 +17,33 @@ except ImportError:  # pragma: no cover - direct Hermes file loading
 
 router = APIRouter()
 
+def _parse_profiles_param(raw: str) -> Optional[List[str]]:
+    """Resolve a ?profiles= value to profile names, or None for the serving one.
+
+    "" -> None (serving profile), "all" -> every discovered profile, a
+    comma-list -> the intersection with discovered profiles. Unknown names
+    are ignored; an empty result falls back to the serving profile.
+    """
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    available = _discovered_profiles()
+    if text.lower() == "all":
+        return available or None
+    wanted = {part.strip() for part in text.split(",") if part.strip()}
+    chosen = [name for name in available if name in wanted]
+    return chosen or None
+
+
+def _scoped_call(profiles_param: str, fn: Any, *args: Any, **kwargs: Any) -> Any:
+    """Run one payload builder under the requested profile scope."""
+    _set_profile_scope(_parse_profiles_param(profiles_param))
+    try:
+        return fn(*args, **kwargs)
+    finally:
+        _set_profile_scope(None)
+
+
 def _fts_query(raw: str) -> str:
     tokens = re.findall(r"[^\W_][\w./\\:-]*", raw, flags=re.UNICODE)
     safe = []
@@ -194,6 +221,8 @@ def _list_sessions_sync(
                    s.last_activity_description, s.api_call_count, s.profile_name,
                    s.archived, s.pinned
             """
+        if getattr(db, "union_profiles", None):
+            select_sql = select_sql.rstrip() + ", s.__profile "
         connection = _db_connection(db)
         if free_text:
             like = f"%{free_text.lower()}%"
@@ -260,10 +289,17 @@ def _list_sessions_sync(
 
         materials.sort(key=sort_key, reverse=True)
         total = len(materials)
+        scope_names = _get_profile_scope()
+        single_profile = scope_names[0] if scope_names and len(scope_names) == 1 else None
         sessions = []
         for material in materials[offset : offset + limit]:
             item = _session_payload(material)
             item["search_snippet"] = snippets.get(str(item.get("id")))
+            item["profile"] = (
+                str(material.get("__profile") or "")
+                or single_profile
+                or (None if scope_names else _serving_profile_name())
+            )
             sessions.append(item)
         return {
             "sessions": sessions,
@@ -329,8 +365,11 @@ async def sessions(
     include_archived: bool = False,
     limit: int = Query(50, ge=1, le=MAX_SESSION_PAGE),
     offset: int = Query(0, ge=0),
+    profiles: str = Query(""),
 ) -> Dict[str, Any]:
     return await asyncio.to_thread(
+        _scoped_call,
+        profiles,
         _list_sessions_sync,
         days=days,
         start_at=start_at,
@@ -446,8 +485,8 @@ def _session_detail_sync(session_id: str) -> Dict[str, Any]:
 
 
 @router.get("/sessions/{session_id}")
-async def session_detail(session_id: str) -> Dict[str, Any]:
-    return await asyncio.to_thread(_session_detail_sync, session_id)
+async def session_detail(session_id: str, profiles: str = Query("")) -> Dict[str, Any]:
+    return await asyncio.to_thread(_scoped_call, profiles, _session_detail_sync, session_id)
 
 
 def _trace_sync(session_id: str, limit: int, offset: int) -> Dict[str, Any]:
@@ -551,8 +590,9 @@ async def session_trace(
     session_id: str,
     limit: int = Query(100, ge=1, le=MAX_TRACE_PAGE),
     offset: int = Query(0, ge=0),
+    profiles: str = Query(""),
 ) -> Dict[str, Any]:
-    return await asyncio.to_thread(_trace_sync, session_id, limit, offset)
+    return await asyncio.to_thread(_scoped_call, profiles, _trace_sync, session_id, limit, offset)
 
 
 def _quota_window_duration_seconds(label: Any) -> Optional[float]:
@@ -841,8 +881,9 @@ async def digest(
     days: int = Query(7, ge=0, le=3650),
     start_at: Optional[float] = Query(None, ge=0),
     end_at: Optional[float] = Query(None, ge=0),
+    profiles: str = Query(""),
 ) -> Dict[str, Any]:
-    return await asyncio.to_thread(_digest_sync, days, start_at, end_at)
+    return await asyncio.to_thread(_scoped_call, profiles, _digest_sync, days, start_at, end_at)
 
 
 def _path_basename(path: Any) -> str:
@@ -969,8 +1010,9 @@ async def projects(
     days: int = Query(30, ge=0, le=3650),
     start_at: Optional[float] = Query(None, ge=0),
     end_at: Optional[float] = Query(None, ge=0),
+    profiles: str = Query(""),
 ) -> Dict[str, Any]:
-    return await asyncio.to_thread(_projects_sync, days, start_at, end_at)
+    return await asyncio.to_thread(_scoped_call, profiles, _projects_sync, days, start_at, end_at)
 
 
 _AGENT_RUNS_PER_JOB = 10
@@ -1113,8 +1155,9 @@ async def agent_runs(
     days: int = Query(30, ge=0, le=3650),
     start_at: Optional[float] = Query(None, ge=0),
     end_at: Optional[float] = Query(None, ge=0),
+    profiles: str = Query(""),
 ) -> Dict[str, Any]:
-    return await asyncio.to_thread(_agent_runs_sync, days, start_at, end_at)
+    return await asyncio.to_thread(_scoped_call, profiles, _agent_runs_sync, days, start_at, end_at)
 
 
 def _compression_sync() -> Dict[str, Any]:
@@ -1196,8 +1239,8 @@ def _compression_sync() -> Dict[str, Any]:
 
 
 @router.get("/compression")
-async def compression() -> Dict[str, Any]:
-    return await asyncio.to_thread(_compression_sync)
+async def compression(profiles: str = Query("")) -> Dict[str, Any]:
+    return await asyncio.to_thread(_scoped_call, profiles, _compression_sync)
 
 
 ATTENTION_OPEN_HOURS = 24
@@ -1392,8 +1435,9 @@ async def attention(
     days: int = Query(30, ge=0, le=3650),
     start_at: Optional[float] = Query(None, ge=0),
     end_at: Optional[float] = Query(None, ge=0),
+    profiles: str = Query(""),
 ) -> Dict[str, Any]:
-    return await asyncio.to_thread(_attention_sync, days, start_at, end_at)
+    return await asyncio.to_thread(_scoped_call, profiles, _attention_sync, days, start_at, end_at)
 
 
 @router.get("/telemetry")
@@ -1402,8 +1446,11 @@ async def telemetry(
     start_at: Optional[float] = Query(None, ge=0),
     end_at: Optional[float] = Query(None, ge=0),
     session_id: str = Query("", max_length=240),
+    profiles: str = Query(""),
 ) -> Dict[str, Any]:
     return await asyncio.to_thread(
+        _scoped_call,
+        profiles,
         _telemetry_sync,
         days,
         session_id.strip(),
@@ -1565,8 +1612,9 @@ async def overview(
     days: int = Query(30, ge=0, le=3650),
     start_at: Optional[float] = Query(None, ge=0),
     end_at: Optional[float] = Query(None, ge=0),
+    profiles: str = Query(""),
 ) -> Dict[str, Any]:
-    return await asyncio.to_thread(_overview_sync, days, start_at, end_at)
+    return await asyncio.to_thread(_scoped_call, profiles, _overview_sync, days, start_at, end_at)
 
 
 _MODEL_ROUTE_META: Dict[str, Dict[str, Any]] = {
@@ -2670,8 +2718,6 @@ def _ai_models_database_revision() -> Tuple[Any, ...]:
         last_activity = _db_connection(db).execute(
             "SELECT MAX(coalesce(last_activity_at, started_at)) FROM sessions"
         ).fetchone()[0]
-    database_path = _hermes_home() / "state.db"
-    wal_path = Path(str(database_path) + "-wal")
 
     def signature(path: Path) -> Tuple[int, int]:
         try:
@@ -2680,7 +2726,14 @@ def _ai_models_database_revision() -> Tuple[Any, ...]:
         except OSError:
             return (0, 0)
 
-    return (_number(last_activity, 0), *signature(database_path), *signature(wal_path))
+    parts: List[Any] = [_number(last_activity, 0)]
+    scope = _get_profile_scope()
+    parts.extend(scope or ())
+    for home in _scope_homes():
+        database_path = home / "state.db"
+        parts.extend(signature(database_path))
+        parts.extend(signature(Path(str(database_path) + "-wal")))
+    return tuple(parts)
 
 
 def _ai_models_sync(
@@ -2732,8 +2785,9 @@ async def ai_models(
     start_at: Optional[float] = Query(None, ge=0),
     end_at: Optional[float] = Query(None, ge=0),
     fresh: bool = False,
+    profiles: str = Query(""),
 ) -> Dict[str, Any]:
-    return await asyncio.to_thread(_ai_models_sync, days, start_at, end_at, fresh)
+    return await asyncio.to_thread(_scoped_call, profiles, _ai_models_sync, days, start_at, end_at, fresh)
 
 
 def _tools_sync(
@@ -2847,8 +2901,9 @@ async def tools(
     days: int = Query(30, ge=0, le=3650),
     start_at: Optional[float] = Query(None, ge=0),
     end_at: Optional[float] = Query(None, ge=0),
+    profiles: str = Query(""),
 ) -> Dict[str, Any]:
-    return await asyncio.to_thread(_tools_sync, days, start_at, end_at)
+    return await asyncio.to_thread(_scoped_call, profiles, _tools_sync, days, start_at, end_at)
 
 
 def _skills_sync(
@@ -2921,8 +2976,9 @@ async def skills(
     days: int = Query(30, ge=0, le=3650),
     start_at: Optional[float] = Query(None, ge=0),
     end_at: Optional[float] = Query(None, ge=0),
+    profiles: str = Query(""),
 ) -> Dict[str, Any]:
-    return await asyncio.to_thread(_skills_sync, days, start_at, end_at)
+    return await asyncio.to_thread(_scoped_call, profiles, _skills_sync, days, start_at, end_at)
 
 
 def _profile_db_paths(home: Path) -> List[Tuple[str, Path]]:
@@ -3030,7 +3086,7 @@ def _profiles_sync(
     period_start, period_end = _period_bounds(days, start_at, end_at)
     profiles = []
     errors = []
-    for name, path in _profile_db_paths(_hermes_home()):
+    for name, path in _profile_db_paths(_hermes_root()):
         try:
             profiles.append(_profile_summary(name, path, period_start, period_end))
         except Exception as error:
@@ -3040,6 +3096,7 @@ def _profiles_sync(
         "period_days": days,
         "period": _period_payload(days, period_start, period_end),
         "profiles": profiles,
+        "serving": _serving_profile_name(),
         "totals": {
             "profiles": len(profiles),
             "sessions": sum(item["sessions"] for item in profiles),
@@ -3082,7 +3139,7 @@ def _profile_file_paths(home: Path, relative: Path) -> List[Tuple[str, Path]]:
 
 def _gateway_sync() -> Dict[str, Any]:
     gateways = []
-    for profile, path in _profile_file_paths(_hermes_home(), Path("gateway_state.json")):
+    for profile, path in _profile_file_paths(_hermes_root(), Path("gateway_state.json")):
         state = _read_json_file(path)
         if not isinstance(state, dict):
             continue
@@ -3126,7 +3183,7 @@ async def gateway() -> Dict[str, Any]:
 
 def _schedules_sync() -> Dict[str, Any]:
     schedules = []
-    for profile, path in _profile_file_paths(_hermes_home(), Path("cron") / "jobs.json"):
+    for profile, path in _profile_file_paths(_hermes_root(), Path("cron") / "jobs.json"):
         document = _read_json_file(path)
         jobs = document.get("jobs") if isinstance(document, dict) else document
         if not isinstance(jobs, list):
@@ -3482,7 +3539,7 @@ def _system_sync() -> Dict[str, Any]:
 
 
 @router.get("/system")
-async def system() -> Dict[str, Any]:
-    return await asyncio.to_thread(_system_sync)
+async def system(profiles: str = Query("")) -> Dict[str, Any]:
+    return await asyncio.to_thread(_scoped_call, profiles, _system_sync)
 
 __all__ = [name for name in globals() if not name.startswith("__")]

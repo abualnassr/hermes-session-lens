@@ -452,6 +452,63 @@ class SessionLensApiTests(unittest.TestCase):
         )
         return payload["pagination"]["total"]
 
+    def _make_beta_profile(self):
+        import shutil
+
+        beta_dir = self.home / "profiles" / "beta"
+        beta_dir.mkdir(parents=True)
+        beta_db = beta_dir / "state.db"
+        shutil.copyfile(self.db_path, beta_db)
+        connection = sqlite3.connect(beta_db)
+        connection.execute("UPDATE sessions SET id='beta-session-1', title='Beta work'")
+        connection.execute("UPDATE messages SET session_id='beta-session-1'")
+        connection.execute("UPDATE session_model_usage SET session_id='beta-session-1'")
+        connection.commit()
+        connection.close()
+        return beta_db
+
+    def test_profile_scope_discovery_and_param_parsing(self):
+        self._make_beta_profile()
+        self.assertEqual(api._discovered_profiles(), ["default", "beta"])
+        self.assertIsNone(api._parse_profiles_param(""))
+        self.assertEqual(api._parse_profiles_param("all"), ["default", "beta"])
+        self.assertEqual(api._parse_profiles_param("beta,unknown"), ["beta"])
+        self.assertIsNone(api._parse_profiles_param("unknown"))
+
+    def test_profile_scope_unions_sessions_across_profiles(self):
+        self._make_beta_profile()
+        list_kwargs = dict(
+            days=0, query="", sort="recent", failures_only=False,
+            include_archived=False, limit=50, offset=0,
+        )
+        payload = api._scoped_call("all", api._list_sessions_sync, **list_kwargs)
+        by_id = {item["id"]: item.get("profile") for item in payload["sessions"]}
+        self.assertEqual(by_id, {"session-1": "default", "beta-session-1": "beta"})
+        self.assertEqual(payload["pagination"]["total"], 2)
+
+        beta_only = api._scoped_call("beta", api._list_sessions_sync, **list_kwargs)
+        self.assertEqual([item["id"] for item in beta_only["sessions"]], ["beta-session-1"])
+        self.assertEqual(beta_only["sessions"][0]["profile"], "beta")
+
+        # The scope always resets, even after the scoped call returns.
+        self.assertIsNone(api._get_profile_scope())
+
+        detail = api._scoped_call("beta", api._session_detail_sync, "beta-session-1")
+        self.assertEqual(detail["session"]["id"], "beta-session-1")
+
+    def test_profile_scope_search_and_query_syntax_span_profiles(self):
+        self._make_beta_profile()
+        list_kwargs = dict(
+            days=0, sort="recent", failures_only=False,
+            include_archived=False, limit=50, offset=0,
+        )
+        titled = api._scoped_call("all", api._list_sessions_sync, query="beta work", **list_kwargs)
+        self.assertEqual([item["id"] for item in titled["sessions"]], ["beta-session-1"])
+        self.assertEqual(
+            api._scoped_call("all", api._list_sessions_sync, query="title:beta", **list_kwargs)["pagination"]["total"],
+            1,
+        )
+
     def test_query_syntax_field_predicates_filter_sessions(self):
         self.assertEqual(self._search_total("model:model-a"), 1)
         self.assertEqual(self._search_total("model:model-z"), 0)
@@ -479,6 +536,16 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertEqual(terms, [("model", "model-a")])
         self.assertIn("D:\\repo", free_text)
         self.assertIn("note:", free_text)
+
+    def test_ui_profile_scope_picker_wired_into_requests(self):
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("function ProfileScopePicker", source)
+        self.assertIn("let activeProfilesParam", source)
+        self.assertIn("{ profiles: activeProfilesParam, ...params }", source)
+        self.assertIn("ctx.storage.get('profileScope')", source)
+        self.assertIn("queryClient.invalidateQueries({ queryKey: [PLUGIN_ID] })", source)
+        # The old static chip must not linger next to the picker.
+        self.assertNotIn("children: `data: ${servingProfile} profile`", source)
 
     def test_ui_account_cards_use_base_provider_for_icon_and_refresh(self):
         source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")

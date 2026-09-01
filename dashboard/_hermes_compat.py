@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import hashlib
 import os
+import sqlite3
+import threading
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Tuple
@@ -35,11 +37,171 @@ def _hermes_home() -> Path:
     return Path(os.environ.get("LOCALAPPDATA", Path.home())) / "hermes"
 
 
+# ── Profile scope ─────────────────────────────────────────────────────────
+# A request may ask to read one, several, or all Hermes profiles instead of
+# the profile this backend was launched under. The scope is thread-local:
+# routes set it for the duration of one synchronous payload build and every
+# _database() / _scope_homes() consumer picks it up without new plumbing.
+
+_profile_scope = threading.local()
+
+
+def _hermes_root() -> Path:
+    """The Hermes root that owns all profiles, even when serving one of them."""
+    home = _hermes_home()
+    parts = [part.lower() for part in home.parts]
+    if "profiles" in parts:
+        index = parts.index("profiles")
+        return Path(*home.parts[:index])
+    return home
+
+
+def _profile_home_path(name: str) -> Path:
+    root = _hermes_root()
+    return root if name == "default" else root / "profiles" / name
+
+
+def _discovered_profiles() -> List[str]:
+    """Profile names with a state.db, 'default' first."""
+    root = _hermes_root()
+    names: List[str] = []
+    if (root / "state.db").exists():
+        names.append("default")
+    profiles_root = root / "profiles"
+    try:
+        if profiles_root.exists():
+            for entry in sorted(path for path in profiles_root.iterdir() if path.is_dir()):
+                if (entry / "state.db").exists():
+                    names.append(entry.name)
+    except OSError:
+        pass
+    return names
+
+
+def _set_profile_scope(names: Optional[List[str]]) -> None:
+    _profile_scope.names = list(names) if names else None
+
+
+def _get_profile_scope() -> Optional[List[str]]:
+    return getattr(_profile_scope, "names", None)
+
+
+def _scope_homes() -> List[Path]:
+    """Home directories the active scope covers; the serving home when unset."""
+    names = _get_profile_scope()
+    if not names:
+        return [_hermes_home()]
+    return [_profile_home_path(name) for name in names]
+
+
+def _scope_db_paths() -> List[Tuple[str, Path]]:
+    names = _get_profile_scope()
+    if not names:
+        return []
+    paths = [(name, _profile_home_path(name) / "state.db") for name in names]
+    return [(name, path) for name, path in paths if path.exists()]
+
+
+class _UnionDB:
+    """Read-only view over several profiles' state.db files.
+
+    Attaches every database with mode=ro and shadows the shared tables with
+    TEMP views that UNION ALL across profiles, so the existing single-profile
+    SQL keeps working unchanged. Each view row carries an extra __profile
+    column naming its source profile.
+    """
+
+    _UNION_TABLES = ("sessions", "messages", "session_model_usage", "async_delegations")
+    read_only = True
+
+    def __init__(self, named_paths: List[Tuple[str, Path]]):
+        self._named_paths = list(named_paths)
+        self.union_profiles = [name for name, _path in named_paths]
+        self.db_path = named_paths[0][1]
+        self._conn = sqlite3.connect(f"file:{named_paths[0][1].as_posix()}?mode=ro", uri=True)
+        self._conn.row_factory = sqlite3.Row
+        aliases = ["main"]
+        for index, (_name, path) in enumerate(named_paths[1:], start=1):
+            alias = f"p{index}"
+            self._conn.execute(f"ATTACH DATABASE ? AS {alias}", (f"file:{path.as_posix()}?mode=ro",))
+            aliases.append(alias)
+        for table in self._UNION_TABLES:
+            selects = []
+            for alias, (name, _path) in zip(aliases, named_paths):
+                if self._table_exists(alias, table):
+                    literal = str(name).replace("'", "''")
+                    selects.append(f"SELECT *, '{literal}' AS __profile FROM {alias}.{table}")
+            if selects:
+                self._conn.execute(f"CREATE TEMP VIEW {table} AS " + " UNION ALL ".join(selects))
+
+    def _table_exists(self, alias: str, table: str) -> bool:
+        try:
+            row = self._conn.execute(
+                f"SELECT name FROM {alias}.sqlite_master WHERE type IN ('table','view') AND name = ?",
+                (table,),
+            ).fetchone()
+        except sqlite3.Error:
+            return False
+        return row is not None
+
+    def resolve_session_id(self, session_id: Any) -> Optional[str]:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return None
+        row = self._conn.execute("SELECT id FROM sessions WHERE id = ?", (sid,)).fetchone()
+        if row:
+            return str(row["id"])
+        rows = self._conn.execute(
+            "SELECT DISTINCT id FROM sessions WHERE id LIKE ? LIMIT 2", (sid + "%",)
+        ).fetchall()
+        return str(rows[0]["id"]) if len(rows) == 1 else None
+
+    def search_messages(self, *, query: str, limit: int = 20, fields: Tuple[str, ...] = ()) -> List[Any]:
+        results: List[Any] = []
+        if SessionDB is None:
+            return results
+        for _name, path in self._named_paths:
+            try:
+                db = SessionDB(db_path=path, read_only=True)
+            except Exception:
+                continue
+            try:
+                for row in db.search_messages(query=query, limit=limit, fields=fields) or []:
+                    results.append(row)
+                    if len(results) >= limit:
+                        return results
+            except Exception:
+                pass
+            finally:
+                try:
+                    db.close()
+                except Exception:
+                    pass
+        return results
+
+    def close(self) -> None:
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+
+
 @contextmanager
 def _database(db_path: Optional[Path] = None) -> Iterator[Any]:
     if SessionDB is None:
         _CAPABILITIES["database"] = "unavailable"
         raise RuntimeError("Hermes SessionDB is unavailable in this process")
+    if db_path is None:
+        scoped = _scope_db_paths()
+        if len(scoped) > 1:
+            union = _UnionDB(scoped)
+            try:
+                yield union
+            finally:
+                union.close()
+            return
+        if scoped:
+            db_path = scoped[0][1]
     db = SessionDB(db_path=db_path, read_only=True) if db_path else SessionDB(read_only=True)
     try:
         yield db

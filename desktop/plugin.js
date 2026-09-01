@@ -24,7 +24,7 @@ import {
   useQueryClient,
   useValue
 } from '@hermes/plugin-sdk'
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { Fragment, jsx, jsxs } from 'react/jsx-runtime'
 
 const PLUGIN_ID = 'session-lens'
@@ -71,8 +71,16 @@ const pageTabs = [
 // SHARED FOUNDATION
 // ============================================================================
 
+// Active profile scope for backend reads ('' = the serving profile,
+// 'all' = every profile, or a comma list). Set by SessionLensPage during
+// render; apiPath folds it into every request so views need no plumbing.
+// An explicit params.profiles (e.g. a session detail pinned to its own
+// profile) wins over the page-wide scope.
+let activeProfilesParam = ''
+
 function apiPath(path, params = {}) {
-  const query = Object.entries(params)
+  const merged = activeProfilesParam ? { profiles: activeProfilesParam, ...params } : params
+  const query = Object.entries(merged)
     .filter(([, value]) => value !== undefined && value !== null && value !== '')
     .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`)
     .join('&')
@@ -511,7 +519,14 @@ function SessionRow({ session, selected, onSelect }) {
         children: [
           jsx('span', { style: tabular, children: `${formatCount(session.total_tokens)} tokens` }),
           jsx('span', { style: tabular, children: `${formatCount(session.tool_call_count)} tools` }),
-          jsx(CostLabel, { session })
+          jsx(CostLabel, { session }),
+          session.profile && (activeProfilesParam === 'all' || activeProfilesParam.includes(','))
+            ? jsx('span', {
+                title: `Recorded in the ${session.profile} profile`,
+                style: { background: color.surface, border, borderRadius: '999px', fontSize: '0.6rem', padding: '0.05rem 0.4rem' },
+                children: session.profile
+              })
+            : null
         ]
       }),
       session.model
@@ -1234,9 +1249,10 @@ function SessionsView({ ctx, period, narrow, drill }) {
     }
   }, [sessions, selected])
 
+  const selectedProfile = sessions.find(item => item.id === selected)?.profile || ''
   const detailQuery = useQuery({
-    queryKey: [PLUGIN_ID, 'session', selected],
-    queryFn: () => ctx.rest(`/sessions/${encodeURIComponent(selected)}`),
+    queryKey: [PLUGIN_ID, 'session', selected, selectedProfile],
+    queryFn: () => ctx.rest(apiPath(`/sessions/${encodeURIComponent(selected)}`, selectedProfile ? { profiles: selectedProfile } : {})),
     enabled: Boolean(selected),
     refetchInterval: 30_000
   })
@@ -1641,7 +1657,7 @@ function ToolsView({ ctx, period }) {
 function CompressionStrip({ ctx }) {
   const query = useQuery({
     queryKey: [PLUGIN_ID, 'compression'],
-    queryFn: () => ctx.rest('/compression'),
+    queryFn: () => ctx.rest(apiPath('/compression')),
     refetchInterval: 300_000
   })
   const data = query.data
@@ -2466,7 +2482,7 @@ function DefinitionList({ rows }) {
 function SystemView({ ctx }) {
   const query = useQuery({
     queryKey: [PLUGIN_ID, 'system'],
-    queryFn: () => ctx.rest('/system'),
+    queryFn: () => ctx.rest(apiPath('/system')),
     refetchInterval: 60_000
   })
   if (query.isLoading) return jsx(LoadingBlock, { rows: 8 })
@@ -2533,6 +2549,100 @@ function SystemView({ ctx }) {
 // ============================================================================
 // APPLICATION SHELL
 // ============================================================================
+
+function ProfileScopePicker({ serving, available, scope, onChange }) {
+  const [open, setOpen] = useState(false)
+  const scopedNames = scope === 'all' ? available : Array.isArray(scope) ? scope : []
+  const chipLabel = scope === 'all'
+    ? `data: all profiles (${available.length || '…'})`
+    : scopedNames.length === 1
+      ? `data: ${scopedNames[0]} profile`
+      : scopedNames.length > 1
+        ? `data: ${scopedNames.length} profiles`
+        : serving
+          ? `data: ${serving} profile`
+          : 'data: profile'
+  const isChecked = name => scope === 'all' || (Array.isArray(scope) ? scope.includes(name) : name === serving)
+  const toggleProfile = name => {
+    const current = scope === 'all'
+      ? [...available]
+      : Array.isArray(scope) ? [...scope] : serving ? [serving] : []
+    const next = current.includes(name) ? current.filter(item => item !== name) : [...current, name]
+    if (!next.length) {
+      onChange(null)
+      return
+    }
+    const ordered = available.filter(item => next.includes(item))
+    onChange(ordered.length === available.length && available.length > 1 ? 'all' : ordered)
+  }
+  const itemStyle = active => ({
+    alignItems: 'center', background: active ? color.surface : 'transparent', border: 'none',
+    borderRadius: '4px', color: color.primary, cursor: 'pointer', display: 'flex', fontSize: '0.6875rem',
+    gap: '0.45rem', padding: '0.35rem 0.5rem', textAlign: 'left', width: '100%'
+  })
+  return jsxs('div', {
+    style: { flexShrink: 0, position: 'relative' },
+    children: [
+      jsxs('button', {
+        type: 'button',
+        onClick: () => setOpen(value => !value),
+        'aria-haspopup': 'menu',
+        'aria-expanded': open,
+        title: 'Choose which Hermes profiles the telemetry pages read: the serving profile, any single profile, several, or all of them. Account-level pages (AI Usage) always show account-wide data.',
+        style: { ...tabular, alignItems: 'center', background: color.surfaceRaised, border, borderRadius: '999px', color: color.tertiary, cursor: 'pointer', display: 'flex', flexShrink: 0, fontSize: '0.625rem', gap: '0.3rem', padding: '0.22rem 0.6rem', whiteSpace: 'nowrap' },
+        children: [chipLabel, jsx(Codicon, { name: 'chevron-down', size: '0.6rem' })]
+      }),
+      open ? jsx('div', { onClick: () => setOpen(false), style: { inset: 0, position: 'fixed', zIndex: 29 } }) : null,
+      open
+        ? jsxs('div', {
+            role: 'menu',
+            'aria-label': 'Profile scope',
+            style: { background: color.surfaceRaised, border, borderRadius: '6px', boxShadow: '0 8px 24px rgba(0,0,0,0.28)', minWidth: '14rem', padding: '0.35rem', position: 'absolute', right: 0, top: 'calc(100% + 0.35rem)', zIndex: 30 },
+            children: [
+              jsx('button', {
+                type: 'button', role: 'menuitemradio', 'aria-checked': scope == null,
+                onClick: () => { onChange(null); setOpen(false) },
+                style: itemStyle(scope == null),
+                children: `Serving profile${serving ? ` (${serving})` : ''}`
+              }),
+              jsx('button', {
+                type: 'button', role: 'menuitemradio', 'aria-checked': scope === 'all',
+                onClick: () => { onChange('all'); setOpen(false) },
+                style: itemStyle(scope === 'all'),
+                children: `All profiles${available.length ? ` (${available.length})` : ''}`
+              }),
+              available.length
+                ? jsx('div', { style: { borderTop: border, margin: '0.3rem 0.2rem' } })
+                : null,
+              ...available.map(name => jsxs('div', {
+                style: { alignItems: 'center', display: 'flex', gap: '0.1rem' },
+                children: [
+                  jsx('input', {
+                    type: 'checkbox',
+                    checked: isChecked(name),
+                    onChange: () => toggleProfile(name),
+                    'aria-label': `Include ${name} profile`,
+                    style: { accentColor: color.accent, cursor: 'pointer', margin: '0 0.2rem' }
+                  }),
+                  jsx('button', {
+                    type: 'button', role: 'menuitemradio', 'aria-checked': Array.isArray(scope) && scope.length === 1 && scope[0] === name,
+                    onClick: () => { onChange([name]); setOpen(false) },
+                    title: `Read only the ${name} profile`,
+                    style: itemStyle(Array.isArray(scope) && scope.length === 1 && scope[0] === name),
+                    children: name === serving ? `${name} · serving` : name
+                  })
+                ]
+              }, name)),
+              jsx('div', {
+                style: { borderTop: border, color: color.quaternary, fontSize: '0.6rem', lineHeight: 1.4, margin: '0.3rem 0.2rem 0', padding: '0.35rem 0.3rem 0.15rem' },
+                children: 'Applies to session telemetry pages. AI Usage reads account-wide quotas and is unaffected.'
+              })
+            ]
+          })
+        : null
+    ]
+  })
+}
 
 function SessionLensPage({ ctx }) {
   const viewport = useValue(host.state.viewport)
@@ -2671,6 +2781,38 @@ function SessionLensPage({ ctx }) {
     refetchInterval: 120_000
   })
   const servingProfile = healthQuery.data?.profile_name
+  const [profileScope, setProfileScope] = useState(() => {
+    const stored = ctx.storage.get('profileScope')
+    if (stored === 'all') return 'all'
+    if (Array.isArray(stored)) {
+      const names = stored.filter(item => typeof item === 'string' && item).slice(0, 20)
+      return names.length ? names : null
+    }
+    return null
+  })
+  const profilesParam = profileScope === 'all'
+    ? 'all'
+    : Array.isArray(profileScope) && profileScope.length ? profileScope.join(',') : ''
+  // Assigned during render so every queryFn issued this pass already carries
+  // the scope; the effect below only has to invalidate stale results.
+  activeProfilesParam = profilesParam
+  const profileListQuery = useQuery({
+    queryKey: [PLUGIN_ID, 'profile-names'],
+    queryFn: () => ctx.rest(apiPath('/profiles', { days: 30 })),
+    staleTime: 300_000
+  })
+  const availableProfiles = (profileListQuery.data?.profiles || [])
+    .map(item => item?.name)
+    .filter(Boolean)
+  const scopeInitRef = useRef(false)
+  useEffect(() => {
+    ctx.storage.set('profileScope', profileScope)
+    if (!scopeInitRef.current) {
+      scopeInitRef.current = true
+      return
+    }
+    queryClient.invalidateQueries({ queryKey: [PLUGIN_ID] })
+  }, [profilesParam])
   // Same query key as SessionsView's attention banner, so the two share one
   // request; this page-level copy keeps quota notes visible on every tab.
   const pageAttentionQuery = useQuery({
@@ -2739,13 +2881,12 @@ function SessionLensPage({ ctx }) {
           jsxs('div', {
             style: { alignItems: 'center', display: 'flex', flex: '1 1 auto', flexWrap: 'wrap', gap: '0.5rem', justifyContent: 'flex-end' },
             children: [
-              servingProfile
-                ? jsx('span', {
-                    title: `Every number on this page comes from the “${servingProfile}” profile’s Hermes records. If the desktop is on a different profile whose gateway is not running, requests fall back to this one — the label keeps the data source honest.`,
-                    style: { ...tabular, background: color.surfaceRaised, border, borderRadius: '999px', color: color.tertiary, flexShrink: 0, fontSize: '0.625rem', padding: '0.22rem 0.6rem', whiteSpace: 'nowrap' },
-                    children: `data: ${servingProfile} profile`
-                  })
-                : null,
+              jsx(ProfileScopePicker, {
+                serving: servingProfile,
+                available: availableProfiles,
+                scope: profileScope,
+                onChange: setProfileScope
+              }),
               tab === 'ai-usage'
                 ? jsx(Pill, {
                     tone: 'accent',
