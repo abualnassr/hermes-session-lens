@@ -549,7 +549,7 @@ class SessionLensApiTests(unittest.TestCase):
         )
         connection.execute(
             "INSERT INTO messages (session_id,role,content,tool_call_id,tool_name,timestamp,active) VALUES (?,?,?,?,?,?,1)",
-            ("session-1", "tool", "results", "call-9", "mcp__brave__search", 1_800_000_021),
+            ("session-1", "tool", "r" * 1200, "call-9", "mcp__brave__search", 1_800_000_021),
         )
         connection.commit()
         connection.close()
@@ -2281,6 +2281,66 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertIn("What consumed ${scope}", source)
         self.assertIn("onDrill: drillToSessions", source[source.index("jsx(AIUsageView, {"):])
         self.assertIn("the rest came from other machines, tools, or profiles on this account", source)
+
+
+    def test_tools_context_weight_is_priced_per_session_route(self):
+        connection = sqlite3.connect(self.db_path)
+        try:
+            # Subscription session: tokens count against a quota, never dollars.
+            connection.execute(
+                "INSERT INTO sessions (id, source, model, started_at, last_activity_at, billing_provider, "
+                "billing_mode, cost_status, message_count) VALUES ('session-sub', 'desktop', 'claude-opus-5', "
+                "1800000500, 1800000600, 'anthropic-oauth', 'subscription_included', 'included', 3)"
+            )
+            rows = [
+                ("session-1", "tool", "x" * 4000, "call-ctx", "mcp__ctx__fetch", 1_800_000_050),
+                ("session-1", "assistant", "thinking", None, None, 1_800_000_051),
+                ("session-1", "assistant", "done", None, None, 1_800_000_052),
+                ("session-sub", "tool", "y" * 800, "call-sub", "mcp__ctx__fetch", 1_800_000_550),
+                ("session-sub", "assistant", "ok", None, None, 1_800_000_551),
+            ]
+            for session_id, role, content, call_id, tool_name, timestamp in rows:
+                connection.execute(
+                    "INSERT INTO messages (session_id,role,content,tool_call_id,tool_name,timestamp,active) "
+                    "VALUES (?,?,?,?,?,?,1)",
+                    (session_id, role, content, call_id, tool_name, timestamp),
+                )
+            connection.commit()
+        finally:
+            connection.close()
+
+        def pricing(model, provider, base_url, billing_mode, cost_status):
+            if provider == "anthropic-oauth":
+                return {"kind": "included", "input_per_token": None, "cache_read_per_token": None, "source": None}
+            return {"kind": "priced", "input_per_token": 1e-6, "cache_read_per_token": 1e-7, "source": "test"}
+
+        with patch.object(api, "_context_pricing", side_effect=pricing):
+            payload = api._tools_sync(days=0)
+        tool = next(item for item in payload["tools"] if item["name"] == "mcp__ctx__fetch")
+        self.assertEqual(tool["context_chars"], 4800)
+        self.assertEqual(tool["context_tokens_estimate"], 1200)
+        # 1000 tokens at $1/M enter once; re-sent on two later calls at $0.1/M.
+        self.assertAlmostEqual(tool["context_cost_usd"], 0.001)
+        self.assertEqual(tool["carried_tokens_estimate"], 2200)
+        self.assertAlmostEqual(tool["carried_cost_usd"], 0.0002)
+        self.assertEqual(tool["context_pricing"], "mixed")
+        self.assertAlmostEqual(tool["context_priced_share"], 4000 / 4800, places=3)
+        self.assertAlmostEqual(tool["context_included_share"], 800 / 4800, places=3)
+        group = next(item for item in payload["groups"] if item["name"] == "ctx")
+        self.assertEqual(group["context_chars"], 4800)
+        self.assertAlmostEqual(group["context_cost_usd"], 0.001)
+        self.assertEqual(group["context_pricing"], "mixed")
+        self.assertGreaterEqual(payload["totals"]["context_cost_usd"], 0.001)
+        self.assertIn("context_chars", payload["totals"])
+
+    def test_context_pricing_marks_subscription_routes_included_without_lookup(self):
+        api._context_pricing_cache.clear()
+        with patch.dict("sys.modules", {"agent": None, "agent.usage_pricing": None}):
+            included = api._context_pricing("gpt-5.3-codex", "openai-codex", "", "subscription_included", "included")
+            self.assertEqual(included["kind"], "included")
+            unpriced = api._context_pricing("mystery/model", "custom", "http://localhost:1234/v1", "", "unknown")
+            self.assertEqual(unpriced["kind"], "unpriced")
+        self.assertIn(("mystery/model", "custom", "http://localhost:1234/v1"), api._context_pricing_cache)
 
 
 if __name__ == "__main__":

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import bisect
+
 try:
     from ._common import *
     from ._logparse import *
@@ -2806,6 +2808,175 @@ def _tool_group(name: str) -> Tuple[str, str, str]:
     return ("builtin", "built-in", text)
 
 
+_CONTEXT_PRICING_TTL_SECONDS = 3600.0
+_context_pricing_cache: Dict[Tuple[str, str, str], Tuple[float, Dict[str, Any]]] = {}
+_CONTEXT_SCAN_ROW_CAP = 200_000
+_CONTEXT_CHARS_PER_TOKEN = 4
+
+
+def _context_pricing(
+    model: Any, provider: Any, base_url: Any, billing_mode: Any, cost_status: Any
+) -> Dict[str, Any]:
+    """Per-token input and cache-read rates for a session's billing route.
+
+    kind: "priced" (rates known), "included" (OAuth subscription — tokens
+    count against a quota, never an invoice) or "unpriced". Rates come from
+    Hermes' own pricing module so tool-context dollars reconcile with the
+    session costs Hermes records; nothing is guessed when it has no entry.
+    """
+    route = _route_descriptor(provider, base_url, billing_mode)
+    status = str(cost_status or "").strip().lower()
+    if route["subscription"] or status in {"included", "subscription", "free"} or "included" in str(billing_mode or "").lower():
+        return {"kind": "included", "input_per_token": None, "cache_read_per_token": None, "source": None}
+    key = (str(model or ""), str(provider or ""), str(base_url or ""))
+    now = time.time()
+    cached = _context_pricing_cache.get(key)
+    if cached and now - cached[0] < _CONTEXT_PRICING_TTL_SECONDS:
+        return cached[1]
+    result: Dict[str, Any] = {"kind": "unpriced", "input_per_token": None, "cache_read_per_token": None, "source": None}
+    try:
+        from agent.usage_pricing import get_pricing_entry
+
+        entry = get_pricing_entry(key[0], key[1] or None, key[2] or None)
+    except Exception:
+        entry = None
+    if entry is not None and entry.input_cost_per_million is not None:
+        if str(getattr(entry, "pricing_version", "") or "") == "included-route":
+            result = {"kind": "included", "input_per_token": None, "cache_read_per_token": None, "source": None}
+        else:
+            cache_read = entry.cache_read_cost_per_million
+            result = {
+                "kind": "priced",
+                "input_per_token": float(entry.input_cost_per_million) / 1_000_000.0,
+                "cache_read_per_token": None if cache_read is None else float(cache_read) / 1_000_000.0,
+                "source": str(getattr(entry, "source", "") or "") or None,
+            }
+    _context_pricing_cache[key] = (now, result)
+    return result
+
+
+def _context_weight_by_tool(
+    connection: Any, period_sql: str, period_params: List[float]
+) -> Tuple[Dict[str, Dict[str, Any]], bool]:
+    """Chars each tool returned into model context, priced per session route.
+
+    Every recorded tool-result row entered context once (direct entry at the
+    input rate) and is re-sent on each later assistant call in the session
+    (carried, at the cache-read rate when the route has one). The carried
+    figure is an upper bound: Hermes compaction eventually drops old results
+    from the prompt and that moment is not recorded.
+    """
+    assistant_rows = connection.execute(
+        f"""
+        SELECT m.session_id, m.id
+        FROM messages m JOIN sessions s ON s.id=m.session_id
+        WHERE {period_sql} AND coalesce(s.hidden,0)=0 AND m.role='assistant'
+        ORDER BY m.id DESC LIMIT {_CONTEXT_SCAN_ROW_CAP + 1}
+        """,
+        tuple(period_params),
+    ).fetchall()
+    tool_rows = connection.execute(
+        f"""
+        SELECT m.session_id, m.id, m.tool_name, length(m.content) AS chars,
+               s.model, s.billing_provider, s.billing_base_url, s.billing_mode, s.cost_status
+        FROM messages m JOIN sessions s ON s.id=m.session_id
+        WHERE {period_sql} AND coalesce(s.hidden,0)=0 AND m.role='tool'
+          AND m.tool_name IS NOT NULL AND m.content IS NOT NULL
+        ORDER BY m.id DESC LIMIT {_CONTEXT_SCAN_ROW_CAP + 1}
+        """,
+        tuple(period_params),
+    ).fetchall()
+    truncated = len(assistant_rows) > _CONTEXT_SCAN_ROW_CAP or len(tool_rows) > _CONTEXT_SCAN_ROW_CAP
+    assistant_ids: Dict[str, List[int]] = {}
+    for row in assistant_rows[:_CONTEXT_SCAN_ROW_CAP]:
+        assistant_ids.setdefault(str(row["session_id"]), []).append(_integer(row["id"]))
+    for ids in assistant_ids.values():
+        ids.sort()
+    pricing_by_session: Dict[str, Dict[str, Any]] = {}
+    weights: Dict[str, Dict[str, Any]] = {}
+    for row in tool_rows[:_CONTEXT_SCAN_ROW_CAP]:
+        session_id = str(row["session_id"])
+        name = str(row["tool_name"] or "")
+        chars = _integer(row["chars"])
+        if not name or chars <= 0:
+            continue
+        pricing = pricing_by_session.get(session_id)
+        if pricing is None:
+            pricing = _context_pricing(
+                row["model"], row["billing_provider"], row["billing_base_url"], row["billing_mode"], row["cost_status"]
+            )
+            pricing_by_session[session_id] = pricing
+        ids = assistant_ids.get(session_id) or []
+        later_calls = len(ids) - bisect.bisect_right(ids, _integer(row["id"]))
+        tokens = chars / _CONTEXT_CHARS_PER_TOKEN
+        weight = weights.setdefault(
+            name,
+            {
+                "chars": 0,
+                "priced_chars": 0,
+                "included_chars": 0,
+                "unpriced_chars": 0,
+                "direct_cost_usd": 0.0,
+                "carried_tokens": 0.0,
+                "carried_cost_usd": 0.0,
+                "rows": 0,
+            },
+        )
+        weight["chars"] += chars
+        weight["rows"] += 1
+        weight["carried_tokens"] += tokens * later_calls
+        kind = pricing["kind"]
+        if kind == "priced":
+            weight["priced_chars"] += chars
+            input_rate = _number(pricing.get("input_per_token"))
+            carry_rate = pricing.get("cache_read_per_token")
+            carry_rate = input_rate if carry_rate is None else _number(carry_rate)
+            weight["direct_cost_usd"] += tokens * input_rate
+            weight["carried_cost_usd"] += tokens * later_calls * carry_rate
+        elif kind == "included":
+            weight["included_chars"] += chars
+        else:
+            weight["unpriced_chars"] += chars
+    return weights, truncated
+
+
+def _context_weight_payload(weight: Optional[Mapping[str, Any]]) -> Dict[str, Any]:
+    weight = weight or {}
+    chars = _integer(weight.get("chars"))
+    priced = _integer(weight.get("priced_chars"))
+    included = _integer(weight.get("included_chars"))
+    unpriced = _integer(weight.get("unpriced_chars"))
+    if chars <= 0:
+        kind = "none"
+    elif priced == chars:
+        kind = "priced"
+    elif included == chars:
+        kind = "included"
+    elif unpriced == chars:
+        kind = "unpriced"
+    else:
+        kind = "mixed"
+    return {
+        "context_chars": chars,
+        "context_tokens_estimate": chars // _CONTEXT_CHARS_PER_TOKEN,
+        "context_cost_usd": round(_number(weight.get("direct_cost_usd")), 4),
+        "carried_tokens_estimate": int(_number(weight.get("carried_tokens"))),
+        "carried_cost_usd": round(_number(weight.get("carried_cost_usd")), 4),
+        "context_pricing": kind,
+        "context_priced_share": round(priced / chars, 3) if chars else 0.0,
+        "context_included_share": round(included / chars, 3) if chars else 0.0,
+    }
+
+
+def _merge_context_weight(target: Dict[str, Any], weight: Optional[Mapping[str, Any]]) -> None:
+    if not weight:
+        return
+    for key in ("chars", "priced_chars", "included_chars", "unpriced_chars", "rows"):
+        target[key] = _integer(target.get(key)) + _integer(weight.get(key))
+    for key in ("direct_cost_usd", "carried_tokens", "carried_cost_usd"):
+        target[key] = _number(target.get(key)) + _number(weight.get(key))
+
+
 def _tools_sync(
     days: int,
     start_at: Optional[float] = None,
@@ -2889,14 +3060,18 @@ def _tools_sync(
             name = str(event.get("tool") or "")
             if not name:
                 continue
-            stat = log_stats.setdefault(name, {"events": 0, "failed": 0, "durations": [], "chars": 0})
+            stat = log_stats.setdefault(name, {"events": 0, "failed": 0, "durations": []})
             stat["events"] += 1
             if str(event.get("status")) == "failed":
                 stat["failed"] += 1
             duration = _number(event.get("duration_seconds"))
             if duration is not None:
                 stat["durations"].append(duration)
-            stat["chars"] += _integer(event.get("output_chars"))
+
+        # Context weight comes from the recorded tool-result rows themselves,
+        # so it honors the whole period; each row is priced at its session's
+        # billing route through Hermes' pricing module.
+        weights, context_truncated = _context_weight_by_tool(_db_connection(db), period_sql, period_params)
 
         tools = []
         for name in set(assistant) | set(results):
@@ -2931,7 +3106,7 @@ def _tools_sync(
                     "latency_p95_seconds": _percentile(durations, 0.95),
                     "log_calls": _integer(stat.get("events")),
                     "log_failures": _integer(stat.get("failed")),
-                    "context_chars": _integer(stat.get("chars")),
+                    **_context_weight_payload(weights.get(name)),
                 }
             )
         tools.sort(key=lambda item: (item["failures"], item["calls"], item["name"]), reverse=True)
@@ -2950,7 +3125,7 @@ def _tools_sync(
                     "session_ids": set(),
                     "max_tool_sessions": 0,
                     "durations": [],
-                    "context_chars": 0,
+                    "weight": {},
                     "log_calls": 0,
                     "log_failures": 0,
                     "last_used_at": None,
@@ -2962,7 +3137,7 @@ def _tools_sync(
             group["tool_count"] += 1
             group["max_tool_sessions"] = max(group["max_tool_sessions"], tool["sessions"])
             group["session_ids"] |= assistant.get(tool["name"], {}).get("sessions", set())
-            group["context_chars"] += tool["context_chars"]
+            _merge_context_weight(group["weight"], weights.get(tool["name"]))
             group["log_calls"] += tool["log_calls"]
             group["log_failures"] += tool["log_failures"]
             stat = log_stats.get(tool["name"])
@@ -2995,8 +3170,7 @@ def _tools_sync(
                     "latency_p95_seconds": _percentile(durations, 0.95),
                     "log_calls": group["log_calls"],
                     "log_failures": group["log_failures"],
-                    "context_chars": group["context_chars"],
-                    "context_tokens_estimate": group["context_chars"] // 4,
+                    **_context_weight_payload(group["weight"]),
                     "last_used_at": group["last_used_at"],
                     "trend": [
                         {"day": day, "requests": days_counter.get(day, 0)} for day in day_keys
@@ -3016,8 +3190,11 @@ def _tools_sync(
                 "distinct_tools": len(tools),
                 "mcp_servers": sum(1 for item in groups if item["kind"] == "mcp"),
                 "context_chars": sum(item["context_chars"] for item in groups),
+                "context_cost_usd": round(sum(item["context_cost_usd"] for item in groups), 4),
+                "carried_cost_usd": round(sum(item["carried_cost_usd"] for item in groups), 4),
             },
             "truncated": truncated,
+            "context_truncated": context_truncated,
             "generated_at": time.time(),
         }
 

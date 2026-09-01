@@ -1580,6 +1580,54 @@ function OverviewView({ query, ctx, period }) {
   })
 }
 
+function contextCostLabel(row) {
+  if (!row.context_chars) return null
+  if (row.context_pricing === 'included') return { text: 'quota', muted: true }
+  if (row.context_pricing === 'unpriced') return { text: 'unpriced', muted: true }
+  const cost = Number(row.context_cost_usd) || 0
+  const text = cost > 0 ? formatCost(cost, 'estimated') : '$0.00'
+  if (row.context_pricing === 'mixed') {
+    const quotaShare = Math.round((Number(row.context_included_share) || 0) * 100)
+    return { text: `${text} + quota`, muted: false, note: `${quotaShare}% of these results ran on subscription routes and count against a quota instead.` }
+  }
+  return { text, muted: false }
+}
+
+function contextCostTitle(row) {
+  const parts = [
+    `Tool results returned ${formatCount(row.context_chars)} characters (≈${formatCount(row.context_tokens_estimate)} tokens) into model context in this period.`
+  ]
+  if (row.context_pricing === 'included') {
+    parts.push('These sessions ran on OAuth subscription routes: the tokens count against the provider quota, not an invoice.')
+  } else if (row.context_pricing === 'unpriced') {
+    parts.push('Hermes has no pricing entry for these sessions’ routes, so no dollar figure is claimed.')
+  } else {
+    parts.push(`Direct entry priced at each session’s input rate from Hermes’ pricing tables: ${formatCost(row.context_cost_usd, 'estimated')}.`)
+    if (row.carried_tokens_estimate) {
+      parts.push(`Re-sent on later calls in the same sessions ≈${formatCount(row.carried_tokens_estimate)} tokens, about ${formatCost(row.carried_cost_usd, 'estimated')} at cache-read rates — an upper bound, because compaction eventually drops old results and that moment is not recorded.`)
+    }
+    if (row.context_pricing === 'mixed') {
+      parts.push(`${Math.round((Number(row.context_priced_share) || 0) * 100)}% of the characters were on priced routes; the rest ran on subscription quota or unpriced routes.`)
+    }
+  }
+  return parts.join(' ')
+}
+
+function ContextWeightCell({ row }) {
+  if (!row.context_chars) return jsx('span', { style: { color: color.quaternary }, children: '—' })
+  const cost = contextCostLabel(row)
+  return jsxs('span', {
+    title: contextCostTitle(row),
+    style: { ...tabular, display: 'inline-grid', justifyItems: 'end', lineHeight: 1.3 },
+    children: [
+      jsx('span', { children: `≈${formatCount(row.context_tokens_estimate)} tok` }),
+      cost
+        ? jsx('span', { style: { color: cost.muted ? color.quaternary : color.secondary, fontSize: '0.625rem' }, children: cost.text })
+        : null
+    ]
+  })
+}
+
 function ToolsView({ ctx, period }) {
   const query = useQuery({
     queryKey: [PLUGIN_ID, 'tools', period.days, period.start_at, period.end_at],
@@ -1602,7 +1650,7 @@ function ToolsView({ ctx, period }) {
       children: [
         jsx(SectionHeading, {
           title: 'Tools & MCP servers',
-          description: `${formatCount(data.totals.calls)} recorded calls across ${formatCount(data.totals.distinct_tools)} tools${data.totals.mcp_servers ? ` · ${formatCount(data.totals.mcp_servers)} MCP server${data.totals.mcp_servers === 1 ? '' : 's'}` : ''}. Latency and output weight come from bounded local agent logs; context weight estimates the tokens tool results push into model context.`
+          description: `${formatCount(data.totals.calls)} recorded calls across ${formatCount(data.totals.distinct_tools)} tools${data.totals.mcp_servers ? ` · ${formatCount(data.totals.mcp_servers)} MCP server${data.totals.mcp_servers === 1 ? '' : 's'}` : ''}. Latency comes from bounded local agent logs. Context weight estimates the tokens tool results push into model context (recorded result length ÷ 4) and prices them at each session's billing route via Hermes' pricing tables — hover a value for the direct and carried figures.`
         }),
         jsx(SimpleTable, {
           columns: [
@@ -1640,9 +1688,17 @@ function ToolsView({ ctx, period }) {
               key: 'context_tokens_estimate',
               label: 'Context weight',
               align: 'right',
-              render: row => row.context_chars
-                ? jsx('span', { style: tabular, title: `Tool results returned ${formatCount(row.context_chars)} characters (≈${formatCount(row.context_tokens_estimate)} tokens) into model context within the logged window`, children: `≈${formatCount(row.context_tokens_estimate)} tok` })
-                : jsx('span', { style: { color: color.quaternary }, children: '—' })
+              render: row => jsx(ContextWeightCell, { row })
+            },
+            {
+              key: 'context_cost_usd',
+              label: 'Context cost',
+              align: 'right',
+              render: row => {
+                const cost = contextCostLabel(row)
+                if (!cost) return jsx('span', { style: { color: color.quaternary }, children: '—' })
+                return jsx('span', { title: contextCostTitle(row), style: { ...tabular, color: cost.muted ? color.quaternary : color.primary }, children: cost.text })
+              }
             },
             { key: 'last_used_at', label: 'Last used', render: row => formatShortDate(row.last_used_at), muted: true },
             { key: 'trend', label: 'Trend (7d)', align: 'right', render: row => jsx(TrendBars, { rows: row.trend }) }
@@ -1681,6 +1737,7 @@ function ToolsView({ ctx, period }) {
                 ? jsx('span', { style: tabular, children: `${Number(row.latency_p50_seconds).toFixed(1)}s` })
                 : jsx('span', { style: { color: color.quaternary }, children: '—' })
             },
+            { key: 'context_tokens_estimate', label: 'Context weight', align: 'right', render: row => jsx(ContextWeightCell, { row }) },
             { key: 'last_used_at', label: 'Last used', render: row => formatShortDate(row.last_used_at), muted: true }
           ],
           rows: data.tools,
@@ -1689,6 +1746,9 @@ function ToolsView({ ctx, period }) {
         }),
         data.truncated
           ? jsx('p', { style: { color: color.tertiary, fontSize: '0.6875rem' }, children: 'The aggregate scan reached its 50,000-row safety limit.' })
+          : null,
+        data.context_truncated
+          ? jsx('p', { style: { color: color.tertiary, fontSize: '0.6875rem' }, children: 'The context-weight scan reached its 200,000-row safety limit; weights and costs cover the most recent rows only.' })
           : null,
         skills
           ? jsxs('section', {
