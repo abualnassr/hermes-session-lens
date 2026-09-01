@@ -285,22 +285,26 @@ def _usage_reset_epoch(value: Any) -> Optional[float]:
 
 
 def _ai_usage_summary(providers: List[Dict[str, Any]]) -> Dict[str, Any]:
+    # Reset countdowns consider every card, but the provider counts only the
+    # base providers — a second pooled Claude account must not turn the
+    # "Connected 6/7" stat into 7/8.
     reset_epochs = [
         epoch
         for provider in providers
         for window in provider.get("windows", [])
         if (epoch := _usage_reset_epoch(window.get("reset_at"))) is not None and epoch > time.time()
     ]
-    not_configured = sum(1 for item in providers if item.get("status") == "not_configured")
+    base = [item for item in providers if not item.get("account_extra")]
+    not_configured = sum(1 for item in base if item.get("status") == "not_configured")
     return {
-        "providers": len(providers),
-        "configured": len(providers) - not_configured,
-        "connected": sum(1 for item in providers if item.get("status") == "ok"),
+        "providers": len(base),
+        "configured": len(base) - not_configured,
+        "connected": sum(1 for item in base if item.get("status") == "ok"),
         "not_configured": not_configured,
         "needs_attention": sum(
-            1 for item in providers if item.get("status") in {"expired", "forbidden", "unavailable", "stale"}
+            1 for item in base if item.get("status") in {"expired", "forbidden", "unavailable", "stale"}
         ),
-        "stale": sum(1 for item in providers if item.get("status") == "stale"),
+        "stale": sum(1 for item in base if item.get("status") == "stale"),
         "next_reset_at": _usage_iso(min(reset_epochs)) if reset_epochs else None,
     }
 

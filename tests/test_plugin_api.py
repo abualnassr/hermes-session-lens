@@ -480,6 +480,11 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertIn("D:\\repo", free_text)
         self.assertIn("note:", free_text)
 
+    def test_ui_account_cards_use_base_provider_for_icon_and_refresh(self):
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("usageProviderIcons[provider.base_provider || provider.provider]", source)
+        self.assertIn("onRefresh(provider.base_provider || provider.provider)", source)
+
     def test_ui_search_hint_documents_query_syntax(self):
         source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
         self.assertIn("try model:opus failed:yes", source)
@@ -1064,6 +1069,68 @@ class SessionLensApiTests(unittest.TestCase):
         generic = api._zai_payload({"code": 500, "msg": "internal error", "success": False})
         self.assertEqual(generic["status"], "unavailable")
         self.assertIn("internal error", generic["message"])
+
+    def test_anthropic_multi_account_cards_from_pool(self):
+        from dashboard._providers import anthropic as anthropic_provider
+
+        accounts = [
+            {"label": "work", "token": "tok-primary"},
+            {"label": "personal", "token": "tok-personal"},
+        ]
+        ok = api._provider_payload("anthropic", status="ok")
+        with patch.object(anthropic_provider, "_anthropic_pool_oauth_accounts", return_value=accounts):
+            with patch.object(anthropic_provider, "_collect_anthropic_direct", return_value=dict(ok)) as direct:
+                cards = anthropic_provider._anthropic_account_cards(["tok-primary"])
+        direct.assert_called_once_with("tok-personal")
+        self.assertEqual(len(cards), 1)
+        card = cards[0]
+        self.assertEqual(card["provider"], "anthropic:1")
+        self.assertEqual(card["base_provider"], "anthropic")
+        self.assertEqual(card["account"], "personal")
+        self.assertTrue(card["account_extra"])
+        self.assertIn("personal", card["label"])
+
+    def test_ai_usage_flattens_account_cards_without_inflating_summary(self):
+        def ok(provider):
+            return api._provider_payload(
+                provider,
+                status="ok",
+                windows=[api._usage_window("Weekly", used_percent=25)],
+            )
+
+        anthropic_result = ok("anthropic")
+        extra = ok("anthropic")
+        extra.update(
+            {
+                "provider": "anthropic:1",
+                "base_provider": "anthropic",
+                "account": "personal",
+                "account_extra": True,
+                "label": "Anthropic Claude · personal",
+            }
+        )
+        anthropic_result["extra_accounts"] = [extra]
+        collectors = {
+            "_collect_codex_usage": Mock(return_value=ok("codex")),
+            "_collect_anthropic_usage": Mock(return_value=anthropic_result),
+            "_collect_nous_usage": Mock(return_value=ok("nous")),
+            "_collect_openrouter_usage": Mock(return_value=ok("openrouter")),
+            "_collect_deepseek_usage": Mock(return_value=ok("deepseek")),
+            "_collect_grok_usage": Mock(return_value=ok("grok")),
+            "_collect_kimi_usage": Mock(return_value=ok("kimi")),
+            "_collect_zai_usage": Mock(return_value=ok("zai")),
+        }
+        with patch.multiple(api, **collectors):
+            payload = api._ai_usage_sync(True)
+        ids = [item["provider"] for item in payload["providers"]]
+        self.assertIn("anthropic:1", ids)
+        self.assertEqual(ids.index("anthropic:1"), ids.index("anthropic") + 1)
+        # The extra card never rides along inside the primary payload.
+        base_card = payload["providers"][ids.index("anthropic")]
+        self.assertNotIn("extra_accounts", base_card)
+        # Summary counts base providers only: 8 providers, not 9.
+        self.assertEqual(payload["summary"]["providers"], 8)
+        self.assertEqual(payload["summary"]["connected"], 8)
 
     def test_ai_usage_cache_preserves_last_success_as_stale(self):
         def ok(provider):

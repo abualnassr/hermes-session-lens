@@ -2130,7 +2130,7 @@ function UsageProvider({ provider, history, onRefresh }) {
     if (busy || !onRefresh) return
     setBusy(true)
     try {
-      await onRefresh(provider.provider)
+      await onRefresh(provider.base_provider || provider.provider)
     } finally {
       setBusy(false)
     }
@@ -2144,7 +2144,7 @@ function UsageProvider({ provider, history, onRefresh }) {
           jsxs('div', {
             style: { display: 'flex', gap: '0.6rem', minWidth: 0 },
             children: [
-              jsx(Codicon, { name: usageProviderIcons[provider.provider] || 'dashboard', size: '0.9rem', style: { color: color.tertiary, marginTop: '0.18rem' } }),
+              jsx(Codicon, { name: usageProviderIcons[provider.base_provider || provider.provider] || 'dashboard', size: '0.9rem', style: { color: color.tertiary, marginTop: '0.18rem' } }),
               jsxs('div', {
                 style: { minWidth: 0 },
                 children: [

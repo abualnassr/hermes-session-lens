@@ -93,9 +93,57 @@ def _collect_anthropic_direct(token: str) -> Dict[str, Any]:
         headers.clear()
 
 
+_ANTHROPIC_MAX_EXTRA_ACCOUNTS = 4
+
+
+def _anthropic_account_cards(primary_tokens: List[str]) -> List[Dict[str, Any]]:
+    """One card per additional pooled Claude login, resetwatch-style.
+
+    Skips any account whose token the primary card already consumed, so the
+    same login never renders twice. Each card keeps its own status — an
+    expired second account shows as expired without hiding the healthy one.
+    """
+    cards: List[Dict[str, Any]] = []
+    try:
+        accounts = _anthropic_pool_oauth_accounts()
+    except Exception:
+        return cards
+    index = 0
+    for account in accounts:
+        token = str(account.get("token") or "")
+        if not token or token in primary_tokens:
+            continue
+        index += 1
+        if index > _ANTHROPIC_MAX_EXTRA_ACCOUNTS:
+            break
+        card = _collect_anthropic_direct(token)
+        label = str(account.get("label") or "").strip() or f"account {index}"
+        card["provider"] = f"anthropic:{index}"
+        card["base_provider"] = "anthropic"
+        card["account"] = label
+        card["account_extra"] = True
+        card["label"] = f"{card.get('label') or 'Anthropic Claude'} · {label}"
+        cards.append(card)
+    return cards
+
+
 def _collect_anthropic_usage() -> Dict[str, Any]:
+    result = _collect_anthropic_primary()
+    extras = _anthropic_account_cards(list(result.pop("_tokens_used", []) or []))
+    if extras:
+        result["extra_accounts"] = extras
+    return result
+
+
+def _collect_anthropic_primary() -> Dict[str, Any]:
     token = ""
     tried_tokens: List[str] = []
+
+    def _with_tokens(result: Dict[str, Any]) -> Dict[str, Any]:
+        used = [item for item in [token, *tried_tokens] if item]
+        result["_tokens_used"] = used
+        return result
+
     try:
         token, oauth = _resolve_anthropic_oauth()
         if token and oauth:
@@ -103,12 +151,14 @@ def _collect_anthropic_usage() -> Dict[str, Any]:
 
             snapshot = fetch_account_usage("anthropic")
             if snapshot is None:
-                return _provider_payload(
-                    "anthropic",
-                    status="unavailable",
-                    message="Anthropic did not return account-usage data for the current OAuth login.",
+                return _with_tokens(
+                    _provider_payload(
+                        "anthropic",
+                        status="unavailable",
+                        message="Anthropic did not return account-usage data for the current OAuth login.",
+                    )
                 )
-            return _account_usage_payload("anthropic", snapshot)
+            return _with_tokens(_account_usage_payload("anthropic", snapshot))
         # The resolver returned an API key (or nothing): an explicit
         # ANTHROPIC_API_KEY shadows saved OAuth logins in Hermes, but account
         # limits only exist for OAuth — so read stored logins directly.
@@ -122,26 +172,32 @@ def _collect_anthropic_usage() -> Dict[str, Any]:
             tried_tokens.append(fallback_token)
             result = _collect_anthropic_direct(fallback_token)
             if result.get("status") == "ok":
-                return result
+                return _with_tokens(result)
             fallback_results.append(result)
         if fallback_results:
-            return fallback_results[0]
+            return _with_tokens(fallback_results[0])
         if token:
-            return _provider_payload(
+            return _with_tokens(
+                _provider_payload(
+                    "anthropic",
+                    status="not_configured",
+                    message=(
+                        "Hermes resolves an Anthropic API key, and account limits require an "
+                        "OAuth-backed Claude account. Sign in with Claude in Hermes to add one."
+                    ),
+                )
+            )
+        return _with_tokens(
+            _provider_payload(
                 "anthropic",
                 status="not_configured",
-                message=(
-                    "Hermes resolves an Anthropic API key, and account limits require an "
-                    "OAuth-backed Claude account. Sign in with Claude in Hermes to add one."
-                ),
+                message="No Hermes Anthropic OAuth login was found.",
             )
-        return _provider_payload(
-            "anthropic",
-            status="not_configured",
-            message="No Hermes Anthropic OAuth login was found.",
         )
     except Exception as error:
-        return _provider_payload("anthropic", status="unavailable", message=_provider_message(error))
+        return _with_tokens(
+            _provider_payload("anthropic", status="unavailable", message=_provider_message(error))
+        )
     finally:
         token = ""
         tried_tokens.clear()

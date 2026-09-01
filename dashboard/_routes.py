@@ -3228,17 +3228,28 @@ def _ai_usage_sync(fresh: bool = False, only_provider: Optional[str] = None) -> 
 
     recorded = _usage_recorded_7d()
     with _ai_usage_cache_lock:
+        account_cards: Dict[str, List[Dict[str, Any]]] = {}
         for provider in _AI_USAGE_PROVIDER_ORDER:
             result = results.get(provider) or _provider_payload(
                 provider,
                 status="unavailable",
                 message="Provider collector returned no result.",
             )
+            # Extra per-account cards ride along on the collector result;
+            # split them off before folding so a stale fold of the primary
+            # card never resurrects an old account list.
+            extras = result.pop("extra_accounts", None) or []
+            account_cards[provider] = [
+                _fold_usage_last_success(str(extra.get("provider")), extra) for extra in extras
+            ]
             result = _fold_usage_last_success(provider, result)
             result["recorded_7d"] = recorded.get(provider)
             results[provider] = result
 
-        providers = [results[provider] for provider in _AI_USAGE_PROVIDER_ORDER]
+        providers = []
+        for provider in _AI_USAGE_PROVIDER_ORDER:
+            providers.append(results[provider])
+            providers.extend(account_cards.get(provider) or [])
         payload = {
             "providers": providers,
             "hermes_configured_unsupported": _usage_unsupported_configured(),
@@ -3389,12 +3400,19 @@ def _ai_usage_refresh_provider(provider: str, collector: Any) -> Optional[Dict[s
         )
     recorded = _usage_recorded_7d()
     with _ai_usage_cache_lock:
+        extras = result.pop("extra_accounts", None) or []
+        extras = [_fold_usage_last_success(str(extra.get("provider")), extra) for extra in extras]
         result = _fold_usage_last_success(provider, result)
         result["recorded_7d"] = recorded.get(provider)
-        providers = [
-            result if item.get("provider") == provider else item
-            for item in base.get("providers", [])
-        ]
+        providers = []
+        for item in base.get("providers", []):
+            if item.get("provider") == provider:
+                providers.append(result)
+                providers.extend(extras)
+            elif item.get("base_provider") == provider:
+                continue  # superseded account cards from the previous fetch
+            else:
+                providers.append(item)
         payload = {
             **base,
             "providers": providers,

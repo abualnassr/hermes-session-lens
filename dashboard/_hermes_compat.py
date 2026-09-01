@@ -126,6 +126,34 @@ def _resolve_anthropic_pool_oauth() -> str:
     return ""
 
 
+def _anthropic_pool_oauth_accounts() -> List[Dict[str, str]]:
+    """All Anthropic OAuth logins in Hermes' credential pool, read-only.
+
+    One dict per stored account: {"label", "token"}. Enumerates with
+    clear_expired=False, refresh=False — the same contract as
+    _resolve_anthropic_pool_oauth — so listing accounts never mutates
+    auth.json or triggers a network refresh. Returns [] outside Hermes.
+    """
+    accounts: List[Dict[str, str]] = []
+    try:
+        from agent import anthropic_adapter
+        from agent.credential_pool import AUTH_TYPE_OAUTH, load_pool
+
+        pool = load_pool("anthropic")
+        entries, _pending = pool._available_entries(clear_expired=False, refresh=False)
+        for entry in entries:
+            if getattr(entry, "auth_type", None) != AUTH_TYPE_OAUTH:
+                continue
+            token = str(getattr(entry, "access_token", "") or "").strip()
+            if not token or not anthropic_adapter._is_oauth_token(token):
+                continue
+            label = str(getattr(entry, "label", "") or "").strip() or str(getattr(entry, "id", "") or "")[:8]
+            accounts.append({"label": label[:60], "token": token})
+    except Exception:
+        return accounts
+    return accounts
+
+
 def _resolve_anthropic_claude_code_oauth() -> str:
     """Fresh OAuth token from Claude Code's credential store, read-only.
 
