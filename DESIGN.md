@@ -104,7 +104,7 @@ components:
 
 Hermes Session Lens is an **Operate** surface inside Hermes Desktop: one native observatory connecting provider capacity and session evidence to accounting and operational health. It inherits Hermes typography, controls, codicons, focus behavior, and light/dark theme roles; it does not establish a separate brand skin.
 
-This design document describes Hermes Session Lens `0.25.0`.
+This design document describes Hermes Session Lens `0.26.0`.
 
 The interface is compact, quiet, and evidence-first. A user finds a session, verifies trace and accounting, then inspects runtime, profile, or schedule state without leaving Hermes. Progressive disclosure carries the density, while explicit provenance, bounded excerpts, and read-only language make the trust boundary visible.
 
@@ -220,6 +220,7 @@ The form language is compact and lightly softened. Native/select controls use re
 
 - **Provider grid:** All configured sources—Codex, Anthropic Claude, Nous Portal, OpenRouter, DeepSeek, Grok, Kimi Code Plan, and Z.AI GLM Coding Plan—appear together under Supported providers. Connected providers lead while every other provider retains its configured order. Each provider uses a compact bordered section in a two-column wide layout and a one-column narrow layout; these are operational groupings, not decorative cards.
 - **Quota windows:** Labels and tabular remaining values lead; progress bars carry `progressbar` semantics and never communicate state by color alone. Monetary balances retain their unit and never become a fabricated percentage when no denominator exists.
+- **Monthly budgets:** A bordered list under the provider grid, one row per provider plus an "All providers" total: month-to-date spend with its source named (account / local records), the projected month-end figure, an inline cap field, and a two-layer bar (solid = spent, tinted = projected). Status pills read Over cap / On pace to exceed / Within cap / No cap in words; the projection basis is spelled out on hover.
 - **Burn attribution:** Each window ends with a collapsed "What consumed this window" line whose headline names the top two projects and their local share; expanding it reveals a Projects/Sessions/Models segmented list with share bars, token counts, and drill-through labels. Copy always says "local" and, for money windows, states the unexplained remainder rather than implying the account percentage is accounted for.
 - **Provider states:** Connected, not configured, expired or rejected, forbidden, unavailable, partial, and stale are stated in text. Stale data names the failed refresh while preserving the last successful reading.
 - **Trust boundary:** The view states that credentials stay in the Python backend, browser cookies are not read, and only normalized account usage reaches JavaScript.

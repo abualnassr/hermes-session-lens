@@ -589,7 +589,7 @@ class SessionLensApiTests(unittest.TestCase):
         source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
         self.assertIn("function ProfileScopePicker", source)
         self.assertIn("let activeProfilesParam", source)
-        self.assertIn("{ profiles: activeProfilesParam, ...params }", source)
+        self.assertIn("if (activeProfilesParam) merged.profiles = activeProfilesParam", source)
         self.assertIn("ctx.storage.get('profileScope')", source)
         self.assertIn("queryClient.invalidateQueries({ queryKey: [PLUGIN_ID] })", source)
         # The old static chip must not linger next to the picker.
@@ -2341,6 +2341,110 @@ class SessionLensApiTests(unittest.TestCase):
             unpriced = api._context_pricing("mystery/model", "custom", "http://localhost:1234/v1", "", "unknown")
             self.assertEqual(unpriced["kind"], "unpriced")
         self.assertIn(("mystery/model", "custom", "http://localhost:1234/v1"), api._context_pricing_cache)
+
+
+    def test_budgets_param_parsing_is_forgiving(self):
+        parsed = api._parse_budgets_param("openrouter:150, all:300,bad,zai:abc,:5,anthropic:0,Kimi:12.345")
+        self.assertEqual(parsed, {"openrouter": 150.0, "all": 300.0, "kimi": 12.35})
+        self.assertEqual(api._parse_budgets_param(""), {})
+
+    def test_budgets_project_month_end_from_pace_and_prefer_account_spend(self):
+        now = 1_800_000_000  # 2027-01-15 local-ish; the exact date only needs a mid-month position
+        month_start, month_end = api._month_bounds(now)
+        self.assertLess(month_start, now)
+        self.assertGreater(month_end, now)
+        connection = sqlite3.connect(self.db_path)
+        try:
+            # OpenRouter: $7 this month, $3.50 of it in the last 7 days → $0.50/day.
+            connection.execute(
+                SESSION_MODEL_USAGE_INSERT_SQL,
+                ("session-1", "deepseek/x", "openrouter", "metered", "", 1, 100, 10, 0, 0, 0, 3.5, 0,
+                 "estimated", "test", month_start + 60, month_start + 120),
+            )
+            connection.execute(
+                SESSION_MODEL_USAGE_INSERT_SQL,
+                ("session-1", "deepseek/y", "openrouter", "metered", "", 1, 100, 10, 0, 0, 0, 3.5, 0,
+                 "estimated", "test", now - 3 * 86_400, now - 3 * 86_400 + 60),
+            )
+            # Nous: $2 this month, nothing recent.
+            connection.execute(
+                SESSION_MODEL_USAGE_INSERT_SQL,
+                ("session-1", "nous/h", "nous", "metered", "", 1, 100, 10, 0, 0, 0, 2.0, 0,
+                 "estimated", "test", month_start + 60, month_start + 120),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        days_remaining = (month_end - now) / 86_400
+
+        with patch.object(api.time, "time", return_value=now):
+            payload = api._budgets_sync({"openrouter": 10, "nous": 100, "all": 8})
+        by_id = {item["id"]: item for item in payload["entries"]}
+        openrouter = by_id["openrouter"]
+        self.assertEqual(openrouter["spend_source"], "local")
+        self.assertEqual(openrouter["spend_usd"], 7.0)
+        self.assertAlmostEqual(openrouter["pace_daily_usd"], 0.5)
+        self.assertAlmostEqual(openrouter["projected_usd"], round(7.0 + 0.5 * days_remaining, 2), places=2)
+        self.assertEqual(openrouter["status"], "at_risk" if 7.0 + 0.5 * days_remaining >= 10 else "ok")
+        nous = by_id["nous"]
+        self.assertEqual(nous["projection_basis"], "linear")
+        self.assertEqual(nous["status"], "ok")
+        # setUp's own session adds $0.012 under the unmapped "provider" key.
+        total = payload["total"]
+        self.assertEqual(total["spend_usd"], 9.01)
+        self.assertEqual(total["status"], "over")
+        self.assertEqual(total["spend_source"], "local")
+        note_ids = [note["id"] for note in payload["notes"]]
+        self.assertTrue(any(item.startswith("budget:all:") for item in note_ids))
+        self.assertEqual(payload["notes"][0]["severity"], "danger")
+        self.assertIn("$9.01 spent against a $8.00 monthly cap", payload["notes"][0]["reason"])
+
+        # A cached account figure outranks local records for that provider.
+        cached = {
+            "providers": [
+                {
+                    "provider": "openrouter",
+                    "status": "ok",
+                    "fetched_at": now,
+                    "account_spend": {"daily": 1.0, "weekly": 14.0, "monthly": 126.44, "unit": "USD"},
+                }
+            ],
+            "generated_at": now,
+        }
+        api._ai_usage_cache = (now, cached)
+        with patch.object(api.time, "time", return_value=now):
+            payload = api._budgets_sync({"openrouter": 250})
+        openrouter = next(item for item in payload["entries"] if item["id"] == "openrouter")
+        self.assertEqual(openrouter["spend_source"], "account")
+        self.assertEqual(openrouter["spend_usd"], 126.44)
+        self.assertEqual(openrouter["local_spend_usd"], 7.0)
+        self.assertAlmostEqual(openrouter["pace_daily_usd"], 2.0)
+        self.assertEqual(payload["total"]["spend_source"], "mixed")
+        self.assertEqual(api._budget_attention_notes("openrouter:250"), payload["notes"])
+        self.assertEqual(api._budget_attention_notes(""), [])
+
+    def test_attention_payload_carries_budget_notes(self):
+        with patch.object(api, "_budget_attention_notes", return_value=[{"id": "budget:all:2026-09"}]) as notes:
+            payload = api._attention_sync(0, budgets="all:1")
+        notes.assert_called_once_with("all:1")
+        self.assertEqual(payload["budgets"], [{"id": "budget:all:2026-09"}])
+        routes = {route.path for route in api.router.routes}
+        self.assertIn("/budgets", routes)
+
+    def test_openrouter_exposes_account_spend(self):
+        payload = api._openrouter_payload(
+            {"limit": 100, "limit_remaining": 74.5, "usage_daily": 1.25, "usage_weekly": 4.5, "usage_monthly": 25.5},
+            None,
+        )
+        self.assertEqual(payload["account_spend"], {"daily": 1.25, "weekly": 4.5, "monthly": 25.5, "unit": "USD"})
+
+    def test_budgets_are_wired_into_plugin_source(self):
+        source = Path(__file__).resolve().parents[1].joinpath("desktop", "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("function BudgetsSection(", source)
+        self.assertIn("ctx.storage.set('budgets', budgets)", source)
+        self.assertIn("activeBudgetsParam = budgetsParam", source)
+        self.assertIn("pageAttentionQuery.data?.budgets", source)
+        self.assertIn("jsx(BudgetsSection, {", source)
 
 
 if __name__ == "__main__":

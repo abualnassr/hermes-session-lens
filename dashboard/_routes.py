@@ -1313,6 +1313,7 @@ def _attention_sync(
     days: int,
     start_at: Optional[float] = None,
     end_at: Optional[float] = None,
+    budgets: str = "",
 ) -> Dict[str, Any]:
     """Flag sessions that look like runaway or orphaned work.
 
@@ -1417,6 +1418,7 @@ def _attention_sync(
     return {
         "sessions": flagged[:_ATTENTION_MAX_SESSIONS],
         "quotas": _quota_attention_notes(),
+        "budgets": _budget_attention_notes(budgets),
         "totals": {
             "flagged": len(flagged),
             "open_sessions": open_flagged,
@@ -1438,8 +1440,9 @@ async def attention(
     start_at: Optional[float] = Query(None, ge=0),
     end_at: Optional[float] = Query(None, ge=0),
     profiles: str = Query(""),
+    budgets: str = Query(""),
 ) -> Dict[str, Any]:
-    return await asyncio.to_thread(_scoped_call, profiles, _attention_sync, days, start_at, end_at)
+    return await asyncio.to_thread(_scoped_call, profiles, _attention_sync, days, start_at, end_at, budgets=budgets)
 
 
 @router.get("/telemetry")
@@ -3932,6 +3935,286 @@ def _attach_usage_attribution(provider: str, result: Dict[str, Any]) -> None:
         return
     for window in windows:
         window["attribution"] = _usage_window_attribution(window, rows)
+
+
+
+# ── Monthly budgets ───────────────────────────────────────────────────────
+# Caps live in the desktop's plugin storage and arrive as ?budgets=
+# openrouter:150,all:300 — the backend never writes a file, and a budget is
+# the user's own number, so it belongs on the user's side of the boundary.
+
+_BUDGET_MAX_ENTRIES = 40
+_BUDGET_PACE_DAYS = 7.0
+_BUDGET_ALL_KEY = "all"
+_BUDGET_BILLING_TO_PROVIDER = {
+    key: provider for provider, keys in _USAGE_BILLING_KEYS.items() for key in keys
+}
+
+
+def _parse_budgets_param(raw: str) -> Dict[str, float]:
+    budgets: Dict[str, float] = {}
+    for part in str(raw or "").split(","):
+        key, sep, value = part.strip().partition(":")
+        key = key.strip().lower()
+        if not sep or not key or not re.fullmatch(r"[a-z0-9_.-]{1,40}", key):
+            continue
+        try:
+            amount = float(value.strip())
+        except ValueError:
+            continue
+        if amount > 0 and amount < 1e9:
+            budgets[key] = round(amount, 2)
+        if len(budgets) >= _BUDGET_MAX_ENTRIES:
+            break
+    return budgets
+
+
+def _month_bounds(now: Optional[float] = None) -> Tuple[float, float]:
+    """Local calendar month containing `now`: (start, start of next month)."""
+    moment = dt.datetime.fromtimestamp(now if now is not None else time.time())
+    start = moment.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+    following = (start + dt.timedelta(days=32)).replace(day=1)
+    return start.timestamp(), following.timestamp()
+
+
+def _budget_provider_label(provider_id: str) -> str:
+    meta = _AI_USAGE_PROVIDER_META.get(provider_id)
+    if meta:
+        return str(meta["label"])
+    route = _MODEL_ROUTE_META.get(provider_id) or {}
+    return str(route.get("provider") or _humanize_identifier(provider_id))
+
+
+def _budget_local_spend(month_start: float, pace_start: float) -> Dict[str, Dict[str, Any]]:
+    """Month-to-date and trailing-pace recorded cost per budget provider id."""
+    since = min(month_start, pace_start)
+    try:
+        with _database() as db:
+            rows = _db_connection(db).execute(
+                """
+                SELECT LOWER(billing_provider) AS key,
+                       SUM(CASE WHEN COALESCE(last_seen, first_seen, 0) >= ? THEN
+                           CASE WHEN actual_cost_usd > 0 THEN actual_cost_usd ELSE estimated_cost_usd END ELSE 0 END) AS month_cost,
+                       SUM(CASE WHEN COALESCE(last_seen, first_seen, 0) >= ? THEN
+                           CASE WHEN actual_cost_usd > 0 THEN actual_cost_usd ELSE estimated_cost_usd END ELSE 0 END) AS pace_cost,
+                       COUNT(DISTINCT CASE WHEN COALESCE(last_seen, first_seen, 0) >= ? THEN session_id END) AS sessions
+                FROM session_model_usage
+                WHERE COALESCE(last_seen, first_seen, 0) >= ?
+                GROUP BY LOWER(billing_provider)
+                """,
+                (month_start, pace_start, month_start, since),
+            ).fetchall()
+    except Exception:
+        return {}
+    spend: Dict[str, Dict[str, Any]] = {}
+    for row in rows:
+        key = str(row[0] or "").strip()
+        if not key:
+            continue
+        provider_id = _BUDGET_BILLING_TO_PROVIDER.get(key, key)
+        entry = spend.setdefault(provider_id, {"month_cost": 0.0, "pace_cost": 0.0, "sessions": 0})
+        entry["month_cost"] += _number(row[1])
+        entry["pace_cost"] += _number(row[2])
+        entry["sessions"] += _integer(row[3])
+    return spend
+
+
+def _budget_account_spend() -> Dict[str, Dict[str, Any]]:
+    """Provider-reported month-to-date spend from the cached /ai-usage payload."""
+    payload = _ai_usage_cached_payload()
+    if not payload:
+        return {}
+    account: Dict[str, Dict[str, Any]] = {}
+    for provider in payload.get("providers", []):
+        if provider.get("status") not in {"ok", "stale"} or provider.get("account_extra"):
+            continue
+        spend = provider.get("account_spend")
+        if not isinstance(spend, Mapping):
+            continue
+        monthly = _number(spend.get("monthly"), None)
+        if monthly is None:
+            continue
+        account[str(provider.get("provider"))] = {
+            "monthly": monthly,
+            "weekly": _number(spend.get("weekly"), None),
+            "unit": spend.get("unit") or "USD",
+            "as_of": provider.get("fetched_at") or payload.get("generated_at"),
+            "stale": bool(provider.get("stale")),
+        }
+    return account
+
+
+def _budget_entry(
+    provider_id: str,
+    cap: Optional[float],
+    local: Mapping[str, Any],
+    account: Optional[Mapping[str, Any]],
+    *,
+    now: float,
+    month_start: float,
+    month_end: float,
+) -> Dict[str, Any]:
+    local_month = round(_number(local.get("month_cost")), 4)
+    local_pace = _number(local.get("pace_cost"))
+    if account is not None:
+        spend = _number(account.get("monthly"))
+        source = "account"
+        weekly = account.get("weekly")
+        pace_daily = _number(weekly) / _BUDGET_PACE_DAYS if weekly is not None else local_pace / _BUDGET_PACE_DAYS
+    else:
+        spend = local_month
+        source = "local"
+        pace_daily = local_pace / _BUDGET_PACE_DAYS
+    days_remaining = max(0.0, (month_end - now) / 86400.0)
+    elapsed_fraction = min(1.0, max(0.0, (now - month_start) / (month_end - month_start)))
+    projected = spend + pace_daily * days_remaining
+    basis = "7-day pace"
+    if pace_daily <= 0 and spend > 0 and elapsed_fraction >= 0.05:
+        projected = spend / elapsed_fraction
+        basis = "linear"
+    projected = round(projected, 2)
+    status = "no_cap"
+    cross_at: Optional[float] = None
+    if cap:
+        if spend >= cap:
+            status = "over"
+        elif projected >= cap:
+            status = "at_risk"
+            if pace_daily > 0:
+                cross_at = now + ((cap - spend) / pace_daily) * 86400.0
+        else:
+            status = "ok"
+    return {
+        "id": provider_id,
+        "label": "All providers" if provider_id == _BUDGET_ALL_KEY else _budget_provider_label(provider_id),
+        "cap_usd": cap,
+        "spend_usd": round(spend, 2),
+        "spend_source": source,
+        "local_spend_usd": local_month,
+        "local_sessions": _integer(local.get("sessions")),
+        "pace_daily_usd": round(pace_daily, 4),
+        "projected_usd": projected,
+        "projection_basis": basis,
+        "percent_of_cap": round((spend / cap) * 100.0, 1) if cap else None,
+        "projected_percent_of_cap": round((projected / cap) * 100.0, 1) if cap else None,
+        "status": status,
+        "cross_at": cross_at,
+        "account_as_of": account.get("as_of") if account else None,
+        "account_stale": bool(account.get("stale")) if account else False,
+    }
+
+
+def _budgets_sync(budgets: Mapping[str, float]) -> Dict[str, Any]:
+    now = time.time()
+    month_start, month_end = _month_bounds(now)
+    local = _budget_local_spend(month_start, now - _BUDGET_PACE_DAYS * 86400.0)
+    account = _budget_account_spend()
+    provider_ids = set(local) | set(account) | {key for key in budgets if key != _BUDGET_ALL_KEY}
+    entries: List[Dict[str, Any]] = []
+    for provider_id in sorted(provider_ids):
+        entries.append(
+            _budget_entry(
+                provider_id,
+                budgets.get(provider_id),
+                local.get(provider_id) or {},
+                account.get(provider_id),
+                now=now,
+                month_start=month_start,
+                month_end=month_end,
+            )
+        )
+    entries = [item for item in entries if item["cap_usd"] or item["spend_usd"] > 0 or item["local_spend_usd"] > 0]
+    total_local = {
+        "month_cost": sum(_number(item.get("month_cost")) for item in local.values()),
+        "pace_cost": sum(_number(item.get("pace_cost")) for item in local.values()),
+        "sessions": sum(_integer(item.get("sessions")) for item in local.values()),
+    }
+    # The total takes each provider's best figure: account where reported,
+    # local otherwise. Pace follows the same choice so the projection adds up.
+    total_spend = sum(item["spend_usd"] for item in entries)
+    total_pace = sum(item["pace_daily_usd"] for item in entries)
+    total = _budget_entry(
+        _BUDGET_ALL_KEY,
+        budgets.get(_BUDGET_ALL_KEY),
+        total_local,
+        {"monthly": total_spend, "weekly": total_pace * _BUDGET_PACE_DAYS, "as_of": None, "stale": False},
+        now=now,
+        month_start=month_start,
+        month_end=month_end,
+    )
+    total["spend_source"] = "mixed" if any(item["spend_source"] == "account" for item in entries) else "local"
+    total["account_as_of"] = None
+    severity = {"over": 0, "at_risk": 1, "ok": 2, "no_cap": 3}
+    entries.sort(key=lambda item: (severity[item["status"]], -item["spend_usd"], item["label"]))
+    return {
+        "month": {
+            "start": month_start,
+            "end": month_end,
+            "elapsed_fraction": round(min(1.0, max(0.0, (now - month_start) / (month_end - month_start))), 3),
+            "days_remaining": round(max(0.0, (month_end - now) / 86400.0), 1),
+        },
+        "entries": entries,
+        "total": total,
+        "notes": _budget_attention_notes_from(entries + [total], month_start),
+        "generated_at": now,
+        "definition": (
+            "Month-to-date spend uses the provider's own account figure where it reports one and "
+            "locally recorded session cost otherwise; the projection extends the last seven days' pace "
+            "to month end. Caps are stored in this desktop's plugin storage only."
+        ),
+    }
+
+
+def _budget_attention_notes_from(entries: List[Mapping[str, Any]], month_start: float) -> List[Dict[str, Any]]:
+    notes: List[Dict[str, Any]] = []
+    month_key = dt.datetime.fromtimestamp(month_start).strftime("%Y-%m")
+    for entry in entries:
+        status = entry.get("status")
+        if status not in {"over", "at_risk"}:
+            continue
+        cap = _number(entry.get("cap_usd"))
+        spend = _number(entry.get("spend_usd"))
+        projected = _number(entry.get("projected_usd"))
+        if status == "over":
+            reason = f"${spend:,.2f} spent against a ${cap:,.2f} monthly cap"
+        else:
+            when = entry.get("cross_at")
+            when_label = (
+                f" ~{dt.datetime.fromtimestamp(when).strftime('%b %d')}" if when else ""
+            )
+            reason = f"on pace to pass the ${cap:,.2f} cap{when_label} (projected ${projected:,.2f})"
+        notes.append(
+            {
+                "id": f"budget:{entry.get('id')}:{month_key}",
+                "provider": entry.get("id"),
+                "provider_label": entry.get("label"),
+                "window_label": "Monthly budget",
+                "severity": "danger" if status == "over" else "warning",
+                "percent_used": _number(entry.get("percent_of_cap")),
+                "exhaust_at": None,
+                "reset_at": None,
+                "reason": reason,
+                "as_of": time.time(),
+                "stale": bool(entry.get("account_stale")),
+            }
+        )
+    notes.sort(key=lambda item: (0 if item["severity"] == "danger" else 1, -item["percent_used"]))
+    return notes
+
+
+def _budget_attention_notes(raw: str) -> List[Dict[str, Any]]:
+    budgets = _parse_budgets_param(raw)
+    if not budgets:
+        return []
+    try:
+        return _budgets_sync(budgets)["notes"]
+    except Exception:
+        return []
+
+
+@router.get("/budgets")
+async def budgets_route(budgets: str = Query("")) -> Dict[str, Any]:
+    return await asyncio.to_thread(_budgets_sync, _parse_budgets_param(budgets))
 
 
 def _ai_usage_refresh_provider(provider: str, collector: Any) -> Optional[Dict[str, Any]]:

@@ -19,6 +19,7 @@ def _openrouter_payload(
 ) -> Dict[str, Any]:
     windows: List[Dict[str, Any]] = []
     details: List[str] = []
+    account_spend: Optional[Dict[str, Any]] = None
     if isinstance(key_data, Mapping):
         limit = _usage_number(key_data.get("limit"))
         remaining = _usage_number(key_data.get("limit_remaining"))
@@ -37,6 +38,7 @@ def _openrouter_payload(
                 )
             )
         usage_parts = []
+        spend: Dict[str, Any] = {}
         for key, label in (
             ("usage_daily", "today"),
             ("usage_weekly", "this week"),
@@ -45,8 +47,13 @@ def _openrouter_payload(
             value = _usage_number(key_data.get(key))
             if value is not None:
                 usage_parts.append(f"${value:,.2f} {label}")
+                spend[key.replace("usage_", "")] = value
         if usage_parts:
             details.append("API key usage: " + " · ".join(usage_parts))
+        if spend:
+            # Numeric month-to-date spend feeds the budgets view; the detail
+            # line above stays for people reading the card.
+            account_spend = {**spend, "unit": "USD"}
     if isinstance(credits_data, Mapping):
         total = _usage_number(credits_data.get("total_credits"))
         used = _usage_number(credits_data.get("total_usage"))
@@ -69,7 +76,7 @@ def _openrouter_payload(
             status="unavailable",
             message=partial_message or "OpenRouter returned no recognized usage fields.",
         )
-    return _provider_payload(
+    payload = _provider_payload(
         "openrouter",
         status="ok",
         windows=windows,
@@ -77,6 +84,9 @@ def _openrouter_payload(
         message=partial_message,
         partial=bool(partial_message),
     )
+    if account_spend:
+        payload["account_spend"] = account_spend
+    return payload
 
 
 def _collect_openrouter_usage() -> Dict[str, Any]:

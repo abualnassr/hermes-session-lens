@@ -77,9 +77,12 @@ const pageTabs = [
 // An explicit params.profiles (e.g. a session detail pinned to its own
 // profile) wins over the page-wide scope.
 let activeProfilesParam = ''
+let activeBudgetsParam = ''
 
 function apiPath(path, params = {}) {
-  const merged = activeProfilesParam ? { profiles: activeProfilesParam, ...params } : params
+  const merged = { ...params }
+  if (activeProfilesParam) merged.profiles = activeProfilesParam
+  if (activeBudgetsParam) merged.budgets = activeBudgetsParam
   const query = Object.entries(merged)
     .filter(([, value]) => value !== undefined && value !== null && value !== '')
     .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`)
@@ -2621,7 +2624,177 @@ function QuotaAlertStrip({ notes, dismissedIds, onDismiss, onOpen }) {
   })
 }
 
-function AIUsageView({ query, narrow, refreshError, history, onRefreshProvider, onDrill }) {
+function budgetStatusPill(entry) {
+  if (entry.status === 'over') return { tone: 'danger', label: 'Over cap', icon: 'flame' }
+  if (entry.status === 'at_risk') return { tone: 'warning', label: 'On pace to exceed', icon: 'warning' }
+  if (entry.status === 'ok') return { tone: 'success', label: 'Within cap', icon: 'check' }
+  return { tone: 'neutral', label: 'No cap', icon: 'circle-outline' }
+}
+
+function BudgetCapField({ entry, onChange }) {
+  const [draft, setDraft] = useState(entry.cap_usd == null ? '' : String(entry.cap_usd))
+  useEffect(() => {
+    setDraft(entry.cap_usd == null ? '' : String(entry.cap_usd))
+  }, [entry.cap_usd])
+  const commit = () => {
+    const trimmed = draft.trim()
+    if (!trimmed) {
+      if (entry.cap_usd != null) onChange(entry.id, null)
+      return
+    }
+    const value = Number(trimmed)
+    if (!Number.isFinite(value) || value <= 0) {
+      setDraft(entry.cap_usd == null ? '' : String(entry.cap_usd))
+      return
+    }
+    const rounded = Math.round(value * 100) / 100
+    if (rounded !== entry.cap_usd) onChange(entry.id, rounded)
+  }
+  return jsxs('label', {
+    style: { alignItems: 'center', display: 'inline-flex', gap: '0.25rem', justifyContent: 'flex-end' },
+    children: [
+      jsx('span', { style: { color: color.quaternary, fontSize: '0.6875rem' }, children: '$' }),
+      jsx(Input, {
+        type: 'number',
+        min: 0,
+        step: 1,
+        inputMode: 'decimal',
+        value: draft,
+        placeholder: 'none',
+        'aria-label': `Monthly cap for ${entry.label} in USD`,
+        onChange: event => setDraft(event.target.value),
+        onBlur: commit,
+        onKeyDown: event => {
+          if (event.key === 'Enter') event.currentTarget.blur()
+          if (event.key === 'Escape') setDraft(entry.cap_usd == null ? '' : String(entry.cap_usd))
+        },
+        style: { ...tabular, textAlign: 'right', width: '5.6rem' }
+      })
+    ]
+  })
+}
+
+function BudgetRow({ entry, month, onChange, narrow }) {
+  const pill = budgetStatusPill(entry)
+  const cap = Number(entry.cap_usd) || 0
+  const spendShare = cap ? Math.min(100, (Number(entry.spend_usd) / cap) * 100) : 0
+  const projectedShare = cap ? Math.min(100, (Number(entry.projected_usd) / cap) * 100) : 0
+  const barTone = entry.status === 'over' ? color.danger : entry.status === 'at_risk' ? color.warning : color.accent
+  const sourceLabel = entry.spend_source === 'account'
+    ? 'account'
+    : entry.spend_source === 'mixed' ? 'account + local' : 'local records'
+  const sourceTitle = entry.spend_source === 'account'
+    ? `Reported by the provider for this account${entry.account_as_of ? ` as of ${formatDate(entry.account_as_of)}` : ''}${entry.account_stale ? ' (last known reading)' : ''}. Local sessions recorded ${formatUsageAmount(entry.local_spend_usd, 'USD')} of it.`
+    : entry.spend_source === 'mixed'
+      ? 'Sum of each provider’s best figure: the account number where the provider reports one, local session records otherwise.'
+      : `Recorded locally by ${formatCount(entry.local_sessions)} Hermes session${Number(entry.local_sessions) === 1 ? '' : 's'} this month. Usage from other machines or tools on the same account is not included.`
+  const projectionTitle = entry.projection_basis === 'linear'
+    ? 'No spend in the last seven days; projected by extending the month-to-date average.'
+    : `Month-to-date plus ${formatUsageAmount(entry.pace_daily_usd, 'USD')}/day (last seven days’ pace) for the remaining ${Math.round(month?.days_remaining || 0)} days.`
+  return jsxs('div', {
+    style: { borderTop: border, display: 'grid', gap: '0.45rem', padding: '0.65rem 0' },
+    children: [
+      jsxs('div', {
+        style: { alignItems: 'center', display: 'flex', flexWrap: 'wrap', gap: '0.5rem 0.85rem', justifyContent: 'space-between' },
+        children: [
+          jsxs('div', {
+            style: { alignItems: 'center', display: 'flex', gap: '0.45rem', minWidth: 0 },
+            children: [
+              jsx('span', { style: { color: color.primary, fontSize: '0.75rem', fontWeight: 650 }, children: entry.label }),
+              jsx(Pill, { tone: pill.tone, children: jsxs(Fragment, { children: [jsx(Codicon, { name: pill.icon, size: '0.65rem' }), pill.label] }) })
+            ]
+          }),
+          jsxs('div', {
+            style: { alignItems: 'center', display: 'flex', flexWrap: 'wrap', gap: '0.5rem 1rem' },
+            children: [
+              jsxs('span', {
+                title: sourceTitle,
+                style: { ...tabular, color: color.secondary, fontSize: '0.75rem' },
+                children: [
+                  jsx('span', { style: { color: color.primary, fontWeight: 650 }, children: formatUsageAmount(entry.spend_usd, 'USD') }),
+                  jsx('span', { style: { color: color.quaternary, fontSize: '0.625rem', marginLeft: '0.3rem' }, children: `so far · ${sourceLabel}` })
+                ]
+              }),
+              jsxs('span', {
+                title: projectionTitle,
+                style: { ...tabular, color: color.secondary, fontSize: '0.75rem' },
+                children: [
+                  jsx('span', { style: { color: entry.status === 'over' || entry.status === 'at_risk' ? color.warning : color.primary, fontWeight: 650 }, children: `→ ${formatUsageAmount(entry.projected_usd, 'USD')}` }),
+                  jsx('span', { style: { color: color.quaternary, fontSize: '0.625rem', marginLeft: '0.3rem' }, children: 'projected month end' })
+                ]
+              }),
+              jsx(BudgetCapField, { entry, onChange })
+            ]
+          })
+        ]
+      }),
+      cap
+        ? jsx('div', {
+            role: 'progressbar',
+            'aria-label': `${entry.label} monthly budget`,
+            'aria-valuemin': 0,
+            'aria-valuemax': 100,
+            'aria-valuenow': Math.round(spendShare),
+            title: `${Math.round(Number(entry.percent_of_cap) || 0)}% of the cap spent; ${Math.round(Number(entry.projected_percent_of_cap) || 0)}% projected.`,
+            style: { background: color.surfaceRaised, borderRadius: '999px', height: '0.38rem', overflow: 'hidden', position: 'relative' },
+            children: jsxs(Fragment, {
+              children: [
+                jsx('div', { style: { background: `color-mix(in srgb, ${barTone} 30%, transparent)`, borderRadius: '999px', height: '100%', position: 'absolute', width: `${projectedShare}%` } }),
+                jsx('div', { style: { background: barTone, borderRadius: '999px', height: '100%', position: 'absolute', width: `${spendShare}%` } })
+              ]
+            })
+          })
+        : null,
+      entry.status === 'at_risk' && entry.cross_at
+        ? jsx('div', { style: { color: color.warning, fontSize: '0.6875rem', fontWeight: 600 }, children: `At this pace the cap is passed ~${formatShortDate(entry.cross_at)}.` })
+        : null
+    ]
+  })
+}
+
+function BudgetsSection({ ctx, budgets, onChange, narrow }) {
+  const query = useQuery({
+    queryKey: [PLUGIN_ID, 'budgets'],
+    queryFn: () => ctx.rest(apiPath('/budgets')),
+    refetchInterval: 300_000
+  })
+  const data = query.data
+  const entries = data?.entries || []
+  const total = data?.total
+  const month = data?.month
+  const monthLabel = month?.start ? timestampDate(month.start)?.toLocaleDateString(undefined, { month: 'long', year: 'numeric' }) : ''
+  return jsxs('section', {
+    'aria-labelledby': 'ai-usage-budgets',
+    style: { display: 'grid', gap: '0.65rem' },
+    children: [
+      jsxs('div', {
+        children: [
+          jsx('h3', { id: 'ai-usage-budgets', style: { color: color.primary, fontSize: '0.9375rem', fontWeight: 650, lineHeight: 1.35, margin: 0 }, children: `Monthly budgets${monthLabel ? ` · ${monthLabel}` : ''}` }),
+          jsx('p', {
+            style: { color: color.tertiary, fontSize: '0.6875rem', lineHeight: 1.5, margin: '0.15rem 0 0' },
+            children: `Set a cap per provider (or for everything) and Session Lens projects month-end spend from the last seven days’ pace, warning in the attention strip when the projection crosses it. Spend uses the provider’s account figure where it reports one and local session records otherwise${month ? ` · ${Math.round(month.days_remaining)} days left this month` : ''}. Caps are stored on this desktop only.`
+          })
+        ]
+      }),
+      query.isError
+        ? jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'Budgets are unavailable' })
+        : query.isLoading
+          ? jsx(LoadingBlock, { rows: 3 })
+          : jsxs('div', {
+              style: { border, borderRadius: '6px', padding: '0.2rem 1rem' },
+              children: [
+                total ? jsx(BudgetRow, { entry: total, month, onChange, narrow }) : null,
+                ...entries.map(entry => jsx(BudgetRow, { entry, month, onChange, narrow }, entry.id)),
+                !entries.length
+                  ? jsx('div', { style: { borderTop: border, color: color.quaternary, fontSize: '0.75rem', padding: '0.75rem 0' }, children: 'No provider has recorded spend this month yet. Providers appear here as soon as a session records cost, or set a cap for “All providers” now.' })
+                  : null
+              ]
+            })
+    ]
+  })
+}
+
+function AIUsageView({ ctx, query, narrow, refreshError, history, onRefreshProvider, onDrill, budgets, onBudgetsChange }) {
   if (query.isLoading) return jsx(LoadingBlock, { rows: 8 })
   if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'AI usage is unavailable' })
   const data = query.data
@@ -2667,6 +2840,7 @@ function AIUsageView({ query, narrow, refreshError, history, onRefreshProvider, 
                   : 'No provider credentials were found in Hermes.'
               ].filter(Boolean).join(' ')
             }),
+        jsx(BudgetsSection, { ctx, budgets, onChange: onBudgetsChange, narrow }),
         configured.length && unconfigured.length
           ? jsxs('div', {
               style: { alignItems: 'flex-start', borderTop: border, color: color.quaternary, display: 'flex', fontSize: '0.6875rem', gap: '0.5rem', lineHeight: 1.5, paddingTop: '0.75rem' },
@@ -3077,6 +3251,42 @@ function SessionLensPage({ ctx }) {
   useEffect(() => {
     ctx.storage.set('quotaAlertsDismissed', quotaDismissed)
   }, [ctx, quotaDismissed])
+  // Monthly caps are the user's own numbers: they live in plugin storage on
+  // this desktop and travel to the backend as a query parameter, so the
+  // Python side stays write-free.
+  const [budgets, setBudgets] = useState(() => {
+    const stored = ctx.storage.get('budgets')
+    const clean = {}
+    if (stored && typeof stored === 'object' && !Array.isArray(stored)) {
+      for (const [key, value] of Object.entries(stored)) {
+        if (/^[a-z0-9_.-]{1,40}$/.test(key) && Number.isFinite(Number(value)) && Number(value) > 0) clean[key] = Number(value)
+      }
+    }
+    return clean
+  })
+  const budgetsParam = Object.entries(budgets)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(([key, value]) => `${key}:${value}`)
+    .join(',')
+  activeBudgetsParam = budgetsParam
+  const budgetsInitRef = useRef(false)
+  useEffect(() => {
+    ctx.storage.set('budgets', budgets)
+    if (!budgetsInitRef.current) {
+      budgetsInitRef.current = true
+      return
+    }
+    queryClient.invalidateQueries({ queryKey: [PLUGIN_ID, 'attention'] })
+    queryClient.invalidateQueries({ queryKey: [PLUGIN_ID, 'budgets'] })
+  }, [budgetsParam])
+  const updateBudget = (id, cap) => {
+    setBudgets(current => {
+      const next = { ...current }
+      if (cap == null) delete next[id]
+      else next[id] = cap
+      return next
+    })
+  }
   const drillToSessions = filters => {
     setDrill({ ...filters, key: Date.now() })
     setTab('sessions')
@@ -3095,6 +3305,9 @@ function SessionLensPage({ ctx }) {
     }
   }
   if (tab === 'ai-usage') content = jsx(AIUsageView, {
+    ctx,
+    budgets,
+    onBudgetsChange: updateBudget,
     query: aiUsageQuery,
     narrow: Boolean(viewport?.narrow),
     refreshError: aiRefreshError,
@@ -3204,7 +3417,7 @@ function SessionLensPage({ ctx }) {
       }),
       tab !== 'ai-usage'
         ? jsx(QuotaAlertStrip, {
-            notes: pageAttentionQuery.data?.quotas,
+            notes: [...(pageAttentionQuery.data?.quotas || []), ...(pageAttentionQuery.data?.budgets || [])],
             dismissedIds: quotaDismissed,
             onDismiss: id => setQuotaDismissed(current => [...new Set([...current, id])].slice(-40)),
             onOpen: () => setTab('ai-usage')
