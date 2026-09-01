@@ -3452,6 +3452,7 @@ function quotaWindowDurationSeconds(label) {
   if (text.includes('day')) return 86400
   const hourMatch = text.match(/(\d+(?:\.\d+)?)\s*[- ]?hour|\((\d+(?:\.\d+)?)h\)/)
   if (hourMatch) return Number(hourMatch[1] || hourMatch[2]) * 3600
+  if (text.includes('session')) return 5 * 3600
   return null
 }
 

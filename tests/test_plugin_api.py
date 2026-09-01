@@ -2265,6 +2265,15 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertIsNone(credits["until"])
         self.assertEqual(credits["sessions"], 2)
 
+    def test_quota_window_duration_recognises_session_windows(self):
+        self.assertEqual(api._quota_window_duration_seconds("Current session"), 5 * 3600.0)
+        self.assertEqual(api._quota_window_duration_seconds("Session"), 5 * 3600.0)
+        self.assertEqual(api._quota_window_duration_seconds("Current week"), 7 * 86400.0)
+        self.assertEqual(api._quota_window_duration_seconds("3-hour window"), 3 * 3600.0)
+        self.assertIsNone(api._quota_window_duration_seconds("Account credits"))
+        source = Path(__file__).resolve().parents[1].joinpath("desktop", "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("if (text.includes('session')) return 5 * 3600", source)
+
     def test_usage_attribution_skips_extra_account_cards_and_tolerates_db_errors(self):
         extra = {"account_extra": True, "windows": [api._usage_window("Weekly", used_percent=5)]}
         api._attach_usage_attribution("anthropic", extra)

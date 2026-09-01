@@ -608,6 +608,10 @@ def _quota_window_duration_seconds(label: Any) -> Optional[float]:
     match = re.search(r"(\d+(?:\.\d+)?)\s*[- ]?hour|\((\d+(?:\.\d+)?)h\)", text)
     if match:
         return float(match.group(1) or match.group(2)) * 3600.0
+    # Anthropic's "Current session" and Codex's "Session" are five-hour
+    # rolling windows whose labels carry no number.
+    if "session" in text:
+        return 5 * 3600.0
     return None
 
 
