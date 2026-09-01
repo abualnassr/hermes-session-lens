@@ -440,6 +440,52 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertGreaterEqual(session["failure_count"], 1)
         self.assertEqual(session["total_tokens"], 1750)
 
+    def _search_total(self, query):
+        payload = api._list_sessions_sync(
+            days=0,
+            query=query,
+            sort="failures",
+            failures_only=False,
+            include_archived=False,
+            limit=50,
+            offset=0,
+        )
+        return payload["pagination"]["total"]
+
+    def test_query_syntax_field_predicates_filter_sessions(self):
+        self.assertEqual(self._search_total("model:model-a"), 1)
+        self.assertEqual(self._search_total("model:model-z"), 0)
+        self.assertEqual(self._search_total("project:demo"), 1)
+        self.assertEqual(self._search_total("source:desktop"), 1)
+        self.assertEqual(self._search_total("provider:provider"), 1)
+        self.assertEqual(self._search_total("failed:yes"), 1)
+        self.assertEqual(self._search_total("failed:no"), 0)
+        self.assertEqual(self._search_total("tokens:>1k"), 1)
+        self.assertEqual(self._search_total("tokens:>2k"), 0)
+        self.assertEqual(self._search_total("cost:<1"), 1)
+        self.assertEqual(self._search_total("cost:>1"), 0)
+
+    def test_query_syntax_combines_terms_and_free_text(self):
+        self.assertEqual(self._search_total("project:demo failed:yes"), 1)
+        self.assertEqual(self._search_total("project:demo failed:no"), 0)
+        self.assertEqual(self._search_total('title:"plugin investigation"'), 1)
+        self.assertEqual(self._search_total("plugin model:model-a"), 1)
+        self.assertEqual(self._search_total("plugin model:model-z"), 0)
+
+    def test_query_syntax_unknown_fields_stay_free_text(self):
+        # A Windows path's drive letter must not be swallowed as a field.
+        self.assertEqual(self._search_total("C:\\work"), 1)
+        free_text, terms = api._parse_session_query("note: fix D:\\repo model:model-a")
+        self.assertEqual(terms, [("model", "model-a")])
+        self.assertIn("D:\\repo", free_text)
+        self.assertIn("note:", free_text)
+
+    def test_ui_search_hint_documents_query_syntax(self):
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("try model:opus failed:yes", source)
+        self.assertIn("tokens:>500k", source)
+        self.assertIn("failed:yes|no", source)
+
     def test_detail_detects_failure_file_and_invoked_skill(self):
         detail = api._session_detail_sync("session-1")
         self.assertEqual(len(detail["failures"]), 1)

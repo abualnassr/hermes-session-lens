@@ -47,6 +47,117 @@ def _search_hits(db: Any, query: str) -> Dict[str, str]:
     return snippets
 
 
+_SEARCH_FIELDS = {
+    "model": "model",
+    "project": "project",
+    "path": "project",
+    "cwd": "project",
+    "repo": "project",
+    "source": "source",
+    "agent": "source",
+    "branch": "branch",
+    "provider": "provider",
+    "profile": "profile",
+    "id": "id",
+    "title": "title",
+    "failed": "failed",
+    "failures": "failed",
+    "tokens": "tokens",
+    "cost": "cost",
+}
+
+_SEARCH_FIELD_COLUMNS = {
+    "model": ("model",),
+    "project": ("cwd", "git_repo_root"),
+    "source": ("source", "display_name"),
+    "branch": ("git_branch",),
+    "provider": ("billing_provider", "model"),
+    "profile": ("profile_name",),
+    "id": ("id",),
+    "title": ("title",),
+}
+
+_SEARCH_TOKEN_RE = re.compile(r'(?:(\w+):)?("([^"]*)"|\S+)')
+
+_SEARCH_AMOUNT_RE = re.compile(r"(>=|<=|>|<)?(\d+(?:\.\d+)?)([km]?)")
+
+
+def _search_amount(raw: str) -> Optional[Tuple[str, float]]:
+    match = _SEARCH_AMOUNT_RE.fullmatch(str(raw or "").strip().lower())
+    if not match:
+        return None
+    scale = {"": 1.0, "k": 1_000.0, "m": 1_000_000.0}[match.group(3)]
+    return match.group(1) or ">=", float(match.group(2)) * scale
+
+
+def _parse_session_query(raw: str) -> Tuple[str, List[Tuple[str, Any]]]:
+    """Split a sessions search string into free text and field predicates.
+
+    Unknown fields fall back to plain text, so a Windows path like C:\\work
+    or a casual "note: fix" search never errors or silently matches nothing.
+    """
+    free: List[str] = []
+    terms: List[Tuple[str, Any]] = []
+    for match in _SEARCH_TOKEN_RE.finditer(str(raw or "")):
+        field = (match.group(1) or "").lower()
+        value = match.group(3) if match.group(3) is not None else (match.group(2) or "")
+        key = _SEARCH_FIELDS.get(field) if field else None
+        if key is None:
+            free.append(value if field == "" and match.group(3) is not None else match.group(0))
+            continue
+        if key in ("tokens", "cost"):
+            amount = _search_amount(value)
+            if amount is None:
+                free.append(match.group(0))
+            else:
+                terms.append((key, amount))
+        elif key == "failed":
+            flag = value.strip().lower()
+            if flag in ("yes", "true", "1"):
+                terms.append((key, True))
+            elif flag in ("no", "false", "0"):
+                terms.append((key, False))
+            else:
+                free.append(match.group(0))
+        else:
+            cleaned = value.strip().lower()
+            if cleaned:
+                terms.append((key, cleaned))
+    return " ".join(part for part in free if part).strip(), terms
+
+
+def _session_matches_terms(material: Mapping[str, Any], terms: List[Tuple[str, Any]]) -> bool:
+    for key, value in terms:
+        if key == "failed":
+            if bool(material.get("failure_count")) != value:
+                return False
+        elif key in ("tokens", "cost"):
+            op, threshold = value
+            if key == "tokens":
+                amount = float(
+                    sum(
+                        _integer(material.get(column))
+                        for column in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
+                    )
+                )
+            else:
+                actual = material.get("actual_cost_usd")
+                amount = _number(actual if actual is not None else material.get("estimated_cost_usd"), -1.0)
+            if op == ">" and not amount > threshold:
+                return False
+            if op == ">=" and not amount >= threshold:
+                return False
+            if op == "<" and not amount < threshold:
+                return False
+            if op == "<=" and not amount <= threshold:
+                return False
+        else:
+            columns = _SEARCH_FIELD_COLUMNS[key]
+            if not any(value in str(material.get(column) or "").lower() for column in columns):
+                return False
+    return True
+
+
 def _list_sessions_sync(
     *,
     days: int,
@@ -61,8 +172,9 @@ def _list_sessions_sync(
 ) -> Dict[str, Any]:
     period_start, period_end = _period_bounds(days, start_at, end_at)
     period_sql, period_params = _period_sql("s.started_at", period_start, period_end)
+    free_text, field_terms = _parse_session_query(query)
     with _database() as db:
-        snippets = _search_hits(db, query) if query else {}
+        snippets = _search_hits(db, free_text) if free_text else {}
         params: List[Any] = list(period_params)
         where = [period_sql, "coalesce(s.hidden, 0) = 0"]
         if not include_archived:
@@ -83,8 +195,8 @@ def _list_sessions_sync(
                    s.archived, s.pinned
             """
         connection = _db_connection(db)
-        if query:
-            like = f"%{query.strip().lower()}%"
+        if free_text:
+            like = f"%{free_text.lower()}%"
             text_filters = [
                 "lower(s.id) LIKE ?",
                 "lower(coalesce(s.title, '')) LIKE ?",
@@ -119,6 +231,8 @@ def _list_sessions_sync(
             material = _row_dict(row)
             material["failure_count"] = failure_counts.get(str(material.get("id")), 0)
             if failures_only and not material["failure_count"]:
+                continue
+            if field_terms and not _session_matches_terms(material, field_terms):
                 continue
             materials.append(material)
 

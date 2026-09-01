@@ -1267,7 +1267,8 @@ function SessionsView({ ctx, period, narrow, drill }) {
               type: 'search',
               value: search,
               onChange: event => setSearch(event.target.value),
-              placeholder: 'Search sessions, paths, models, and message text…',
+              placeholder: 'Search sessions and messages… try model:opus failed:yes',
+              title: 'Free text, or filters: model: project: source: branch: provider: profile: id: title: failed:yes|no tokens:>500k cost:>1 — quote values with spaces',
               'aria-label': 'Search sessions'
             })
           }),
@@ -1292,6 +1293,12 @@ function SessionsView({ ctx, period, narrow, drill }) {
           })
         ]
       }),
+      search.includes(':') && !(narrow && narrowPane === 'detail')
+        ? jsx('div', {
+            style: { borderBottom: border, color: color.tertiary, fontSize: '0.625rem', lineHeight: 1.5, padding: '0.3rem 0.85rem' },
+            children: 'Filters: model: · project: · source: · branch: · provider: · profile: · failed:yes|no · tokens:>500k · cost:>1 — quote values with spaces; anything else searches as text'
+          })
+        : null,
       listQuery.isError
         ? jsx(ErrorBlock, { error: listQuery.error, onRetry: listQuery.refetch })
         : jsx('div', {
