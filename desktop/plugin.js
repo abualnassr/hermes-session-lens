@@ -3297,10 +3297,8 @@ function SessionLensPage({ ctx }) {
         refreshErrors.push(`Services: ${error?.message || String(error || 'refresh failed')}`)
       }
     }
-    try {
-      if (refreshErrors.length) setAiRefreshError(refreshErrors.join(' · '))
-      setAiManualRefreshing(false)
-    }
+    if (refreshErrors.length) setAiRefreshError(refreshErrors.join(' · '))
+    setAiManualRefreshing(false)
   }
   const updateCustomStart = value => {
     if (!value) return

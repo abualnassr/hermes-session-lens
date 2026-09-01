@@ -4,7 +4,7 @@ Hermes Session Lens is a native observability page for Hermes Desktop. It appear
 
 It is a unified Hermes plugin—one install contains the native Desktop page and its namespaced Python API. There is no iframe, separate dashboard, Node server, or third-party telemetry service.
 
-This documentation describes Hermes Session Lens `0.27.0`.
+This documentation describes Hermes Session Lens `0.27.1`.
 
 ## What it includes
 
@@ -117,7 +117,7 @@ Run the compatibility tests with the Python environment used by Hermes:
 
 ```text
 python -m unittest discover -s tests -v
-node --check desktop/plugin.js
+node --input-type=module --check < desktop/plugin.js   # plain `node --check` skips .js files that contain `import`
 ```
 
 ## Credits and license

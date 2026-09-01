@@ -2624,5 +2624,20 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertIn("/services", routes)
 
 
+    def test_plugin_source_parses_as_an_es_module(self):
+        """`node --check` silently skips .js files that contain `import`; check as .mjs."""
+        import shutil
+        import subprocess
+
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not installed")
+        source = Path(__file__).resolve().parents[1].joinpath("desktop", "plugin.js")
+        copy = self.home / "plugin-syntax-check.mjs"
+        copy.write_bytes(source.read_bytes())
+        completed = subprocess.run([node, "--check", str(copy)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(completed.returncode, 0, completed.stderr[-800:])
+
+
 if __name__ == "__main__":
     unittest.main()
