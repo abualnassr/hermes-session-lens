@@ -126,6 +126,28 @@ def _resolve_anthropic_pool_oauth() -> str:
     return ""
 
 
+def _resolve_anthropic_claude_code_oauth() -> str:
+    """Fresh OAuth token from Claude Code's credential store, read-only.
+
+    Claude Code refreshes its own token during normal use, so on a machine
+    where Claude Code runs regularly this is the most reliably fresh
+    Anthropic OAuth available. Never refreshes: an expired record returns ""
+    rather than racing Hermes or Claude Code for the single-use refresh
+    token (a lost race kills the login with refresh_token_reused).
+    """
+    try:
+        from agent import anthropic_credentials
+
+        creds = anthropic_credentials.read_claude_code_credentials()
+        if creds and anthropic_credentials.is_claude_code_token_valid(creds):
+            token = str(creds.get("accessToken") or "").strip()
+            if token and anthropic_credentials._is_oauth_token(token):
+                return token
+    except Exception:
+        pass
+    return ""
+
+
 def _hermes_configured_provider_ids() -> List[str]:
     """Provider ids Hermes holds credentials for, from the live PROVIDER_REGISTRY.
 

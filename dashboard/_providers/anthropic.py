@@ -95,6 +95,7 @@ def _collect_anthropic_direct(token: str) -> Dict[str, Any]:
 
 def _collect_anthropic_usage() -> Dict[str, Any]:
     token = ""
+    tried_tokens: List[str] = []
     try:
         token, oauth = _resolve_anthropic_oauth()
         if token and oauth:
@@ -110,10 +111,21 @@ def _collect_anthropic_usage() -> Dict[str, Any]:
             return _account_usage_payload("anthropic", snapshot)
         # The resolver returned an API key (or nothing): an explicit
         # ANTHROPIC_API_KEY shadows saved OAuth logins in Hermes, but account
-        # limits only exist for OAuth — so read the pool login directly.
-        pool_token = _resolve_anthropic_pool_oauth()
-        if pool_token:
-            return _collect_anthropic_direct(pool_token)
+        # limits only exist for OAuth — so read stored logins directly.
+        # Claude Code's own token first: it is refreshed by everyday Claude
+        # Code use, while an unused Hermes pool login goes stale.
+        fallback_results: List[Dict[str, Any]] = []
+        for resolve in (_resolve_anthropic_claude_code_oauth, _resolve_anthropic_pool_oauth):
+            fallback_token = resolve()
+            if not fallback_token or fallback_token in tried_tokens:
+                continue
+            tried_tokens.append(fallback_token)
+            result = _collect_anthropic_direct(fallback_token)
+            if result.get("status") == "ok":
+                return result
+            fallback_results.append(result)
+        if fallback_results:
+            return fallback_results[0]
         if token:
             return _provider_payload(
                 "anthropic",
@@ -132,5 +144,6 @@ def _collect_anthropic_usage() -> Dict[str, Any]:
         return _provider_payload("anthropic", status="unavailable", message=_provider_message(error))
     finally:
         token = ""
+        tried_tokens.clear()
 
 __all__ = [name for name in globals() if not name.startswith("__")]

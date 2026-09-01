@@ -1000,21 +1000,59 @@ class SessionLensApiTests(unittest.TestCase):
         )
         self.assertEqual(payload["details"], ["Extra usage: 1.50 / 20.00 USD"])
 
-    def test_anthropic_api_key_shadowing_falls_back_to_pool_oauth(self):
+    def test_anthropic_api_key_shadowing_falls_back_to_stored_oauth(self):
         from dashboard._providers import anthropic as anthropic_provider
 
-        sentinel = api._provider_payload("anthropic", status="ok")
-        with patch.object(anthropic_provider, "_resolve_anthropic_oauth", return_value=("sk-ant-api-key", False)):
-            with patch.object(anthropic_provider, "_resolve_anthropic_pool_oauth", return_value="pool-oauth-token"):
-                with patch.object(anthropic_provider, "_collect_anthropic_direct", return_value=sentinel) as direct:
-                    result = anthropic_provider._collect_anthropic_usage()
-        direct.assert_called_once_with("pool-oauth-token")
-        self.assertIs(result, sentinel)
+        shadowed = patch.object(
+            anthropic_provider, "_resolve_anthropic_oauth", return_value=("sk-ant-api-key", False)
+        )
+        ok = api._provider_payload("anthropic", status="ok")
+        expired = api._provider_payload("anthropic", status="expired", message="rejected")
+
+        # Claude Code's own token is preferred: it stays fresh through use.
+        with shadowed:
+            with patch.object(anthropic_provider, "_resolve_anthropic_claude_code_oauth", return_value="cc-token"):
+                with patch.object(anthropic_provider, "_resolve_anthropic_pool_oauth", return_value="pool-token"):
+                    with patch.object(anthropic_provider, "_collect_anthropic_direct", return_value=ok) as direct:
+                        result = anthropic_provider._collect_anthropic_usage()
+        direct.assert_called_once_with("cc-token")
+        self.assertIs(result, ok)
+
+        # A rejected Claude Code token falls through to the pool login.
+        with shadowed:
+            with patch.object(anthropic_provider, "_resolve_anthropic_claude_code_oauth", return_value="cc-token"):
+                with patch.object(anthropic_provider, "_resolve_anthropic_pool_oauth", return_value="pool-token"):
+                    with patch.object(
+                        anthropic_provider, "_collect_anthropic_direct", side_effect=[expired, ok]
+                    ) as direct:
+                        result = anthropic_provider._collect_anthropic_usage()
+        self.assertEqual(direct.call_count, 2)
+        direct.assert_any_call("pool-token")
+        self.assertIs(result, ok)
+
+        # No Claude Code credentials: the pool login alone still works.
+        with shadowed:
+            with patch.object(anthropic_provider, "_resolve_anthropic_claude_code_oauth", return_value=""):
+                with patch.object(anthropic_provider, "_resolve_anthropic_pool_oauth", return_value="pool-token"):
+                    with patch.object(anthropic_provider, "_collect_anthropic_direct", return_value=ok) as direct:
+                        result = anthropic_provider._collect_anthropic_usage()
+        direct.assert_called_once_with("pool-token")
+        self.assertIs(result, ok)
+
+        # Every stored login rejected: surface the first failure.
+        with shadowed:
+            with patch.object(anthropic_provider, "_resolve_anthropic_claude_code_oauth", return_value="cc-token"):
+                with patch.object(anthropic_provider, "_resolve_anthropic_pool_oauth", return_value="cc-token"):
+                    with patch.object(anthropic_provider, "_collect_anthropic_direct", return_value=expired) as direct:
+                        result = anthropic_provider._collect_anthropic_usage()
+        direct.assert_called_once_with("cc-token")  # identical tokens tried once
+        self.assertIs(result, expired)
 
         # API key but no saved OAuth login: explain the requirement plainly.
-        with patch.object(anthropic_provider, "_resolve_anthropic_oauth", return_value=("sk-ant-api-key", False)):
-            with patch.object(anthropic_provider, "_resolve_anthropic_pool_oauth", return_value=""):
-                result = anthropic_provider._collect_anthropic_usage()
+        with shadowed:
+            with patch.object(anthropic_provider, "_resolve_anthropic_claude_code_oauth", return_value=""):
+                with patch.object(anthropic_provider, "_resolve_anthropic_pool_oauth", return_value=""):
+                    result = anthropic_provider._collect_anthropic_usage()
         self.assertEqual(result["status"], "not_configured")
         self.assertIn("Sign in with Claude in Hermes", result["message"])
 
