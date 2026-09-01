@@ -533,7 +533,9 @@ def _brightdata_payload(body: Any) -> Dict[str, Any]:
 
 
 def _collect_brightdata() -> Dict[str, Any]:
-    key, _ = _service_secret("MCP_BRIGHTDATA_API_KEY", "BRIGHTDATA_API_KEY", "BRIGHT_DATA_API_KEY")
+    # A dedicated key first: the balance endpoint needs an Admin-permission
+    # token, and the scraping MCP should keep its least-privileged User key.
+    key, _ = _service_secret("BRIGHTDATA_API_KEY", "BRIGHT_DATA_API_KEY", "MCP_BRIGHTDATA_API_KEY")
     if not key:
         return _service_payload("brightdata", status="not_configured", message="No Bright Data API key is set in Hermes.")
     headers = {"Authorization": f"Bearer {key}", "Accept": "application/json"}
@@ -545,7 +547,7 @@ def _collect_brightdata() -> Dict[str, Any]:
         return _service_payload(
             "brightdata",
             status="forbidden",
-            message="The Bright Data token lacks account-balance permission. Grant it under Settings → Users on brightdata.com.",
+            message="This Bright Data key has User permission; the balance endpoint needs an Admin key. Create one under Account Settings → Users and API keys and set it as BRIGHTDATA_API_KEY in the Hermes .env (keep the MCP key as it is).",
         )
     return _credential_status("brightdata", code, error) or _brightdata_payload(body)
 
