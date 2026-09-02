@@ -104,7 +104,7 @@ components:
 
 Hermes Session Lens is an **Operate** surface inside Hermes Desktop: one native observatory connecting provider capacity and session evidence to accounting and operational health. It inherits Hermes typography, controls, codicons, focus behavior, and light/dark theme roles; it does not establish a separate brand skin.
 
-This design document describes Hermes Session Lens `0.29.0`.
+This design document describes Hermes Session Lens `0.30.0`.
 
 The interface is compact, quiet, and evidence-first. A user finds a session, verifies trace and accounting, then inspects runtime, profile, or schedule state without leaving Hermes. Progressive disclosure carries the density, while explicit provenance, bounded excerpts, and read-only language make the trust boundary visible.
 
@@ -220,6 +220,7 @@ The form language is compact and lightly softened. Native/select controls use re
 
 - **Provider grid:** All configured sources—Codex, Anthropic Claude, Nous Portal, OpenRouter, DeepSeek, Grok, Kimi Code Plan, and Z.AI GLM Coding Plan—appear together under Supported providers. Connected providers lead while every other provider retains its configured order. Each provider uses a compact bordered section in a two-column wide layout and a one-column narrow layout; these are operational groupings, not decorative cards.
 - **Quota windows:** Labels and tabular remaining values lead; progress bars carry `progressbar` semantics and never communicate state by color alone. Monetary balances retain their unit and never become a fabricated percentage when no denominator exists.
+- **Rules tab:** A rule list (enable dot, name, profile pill, plain-sentence summary, Edit, Delete) above an inline editor built from the template's fields; the scoreboard shows an "All rules together" table, then one table per rule (turns checked, passed, failed, pass rate, risk bound, rank or "below floor") followed by the failing turns as compact rows with an Open button that drills into the session. Sample floor is an inline number field on the scoreboard heading.
 - **Export menus:** An outline "Export" button in the section heading (or the Sessions toolbar) opens a solid popover listing each format with its filename hint and two small actions, Download and Copy; a spinner replaces the icon while an export builds, and the host toast reports a copy or a failure. Downloads use the desktop's Save File dialog.
 - **Services & tools:** Non-model services reuse the provider card exactly (balance windows, details, status pill, per-card refresh) under their own group, followed by an "Everything configured" evidence table — Service, Found via, Status (Monitored / Needs attention / Not read yet / No usage API), Note — so a configured service is never silently absent.
 - **Monthly budgets:** A bordered list under the provider grid, one row per provider plus an "All providers" total: month-to-date spend with its source named (account / local records), the projected month-end figure, an inline cap field, and a two-layer bar (solid = spent, tinted = projected). Status pills read Over cap / On pace to exceed / Within cap / No cap in words; the projection basis is spelled out on hover.

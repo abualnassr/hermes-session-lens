@@ -62,6 +62,7 @@ const pageTabs = [
   { id: 'overview', label: 'Overview', codicon: 'graph' },
   { id: 'operations', label: 'Operations', codicon: 'pulse' },
   { id: 'tools', label: 'Tools', codicon: 'tools' },
+  { id: 'rules', label: 'Rules', codicon: 'checklist' },
   { id: 'system', label: 'System', codicon: 'server-environment' },
   { id: 'ai-usage', label: 'AI Usage', codicon: 'dashboard' },
   { id: 'ai-models', label: 'AI Models', codicon: 'symbol-enum' }
@@ -79,10 +80,15 @@ const pageTabs = [
 let activeProfilesParam = ''
 let activeBudgetsParam = ''
 
+// Enabled instruction rules as JSON, sent only with /digest so the weekly
+// digest can grade them; the Rules tab sends its own copy to /rules.
+let activeRulesParam = ''
+
 function apiPath(path, params = {}) {
   const merged = { ...params }
   if (activeProfilesParam) merged.profiles = activeProfilesParam
   if (activeBudgetsParam) merged.budgets = activeBudgetsParam
+  if (activeRulesParam && path === '/digest') merged.rules = activeRulesParam
   const query = Object.entries(merged)
     .filter(([, value]) => value !== undefined && value !== null && value !== '')
     .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`)
@@ -3518,10 +3524,492 @@ function ProfileScopePicker({ serving, available, scope, onChange }) {
   })
 }
 
+// ============================================================================
+// RULES TAB — instruction rules graded against recorded turns
+// ============================================================================
+// Self-contained: this block, the tab entry, the RULES_STORAGE_KEY state in
+// SessionLensPage, and the /digest rules parameter are the only touch points.
+
+const RULES_STORAGE_KEY = 'rules'
+const RULES_MIN_SAMPLES_KEY = 'rulesMinSamples'
+
+// TRIAL SEED — Bandar's Kore profile rule, so the tab is not empty on first
+// open. Remove before a public release; a customer starts from the empty state.
+const RULES_TRIAL_SEED = {
+  profile: 'voice-inbox',
+  rules: [
+    { id: 'kore-voice-reply', name: 'Kore voice reply', type: 'require_tool', params: { tool: 'text_to_speech', position: 'any', must_succeed: false }, profile: 'voice-inbox', enabled: true }
+  ]
+}
+
+function newRuleId() {
+  return `rule-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
+}
+
+function ruleFieldDefault(field) {
+  if (field.kind === 'bool') return Boolean(field.default)
+  if (field.kind === 'number') return field.default ?? 1
+  if (field.kind === 'select') return field.default ?? (field.options?.[0]?.[0] || '')
+  return field.default ?? ''
+}
+
+function ruleListText(value) {
+  return Array.isArray(value) ? value.join('\n') : String(value || '')
+}
+
+function ruleSummary(rule, templates) {
+  const template = (templates || []).find(item => item.type === rule.type)
+  const params = rule.params || {}
+  const list = value => (Array.isArray(value) ? value : String(value || '').split(/[\r\n,]+/)).map(item => item.trim()).filter(Boolean)
+  switch (rule.type) {
+    case 'require_tool':
+      return `Every reply must call ${params.tool || '…'}${params.position === 'before_final' ? ' before the final answer' : ''}${params.must_succeed ? ', and the call must succeed' : ''}`
+    case 'forbid_tool':
+      return `${params.tool || '…'} must never be used`
+    case 'tool_order':
+      return `Before using ${params.tool || '…'}, ${params.before || '…'} must have been tried ${params.scope === 'session' ? 'earlier in the session' : 'in the same turn'}`
+    case 'forbid_text':
+      return `Replies must never contain ${list(params.patterns).map(item => `“${item}”`).join(', ') || '…'}`
+    case 'require_text_count':
+      return `Replies must contain “${params.pattern || '…'}” exactly ${Number(params.count ?? 1)} time${Number(params.count ?? 1) === 1 ? '' : 's'}`
+    case 'language_match':
+      return 'The reply language must match the user’s language'
+    case 'forbid_tool_mention':
+      return `Tool calls and results must never mention ${list(params.patterns).map(item => `“${item}”`).join(', ') || '…'}`
+    case 'path_boundary':
+      return `${list(params.tools).join(', ') || 'Tools'} must stay inside ${list(params.roots).join(', ') || '…'}`
+    default:
+      return template?.sentence || rule.type
+  }
+}
+
+function ruleIsComplete(rule, templates) {
+  const template = (templates || []).find(item => item.type === rule.type)
+  if (!template) return false
+  return template.fields.every(field => {
+    if (!field.required) return true
+    const value = rule.params?.[field.key]
+    if (field.kind === 'list') return (Array.isArray(value) ? value : String(value || '').split(/[\r\n,]+/)).some(item => item.trim())
+    return String(value ?? '').trim().length > 0
+  })
+}
+
+function enabledRulesParam(rules) {
+  const enabled = (rules || []).filter(rule => rule.enabled !== false)
+  return enabled.length ? JSON.stringify(enabled) : ''
+}
+
+function RuleField({ field, value, onChange }) {
+  const label = jsx('span', { style: { color: color.tertiary, fontSize: '0.6875rem' }, children: field.label })
+  const hint = field.hint ? jsx('div', { style: { color: color.quaternary, fontSize: '0.625rem', marginTop: '0.2rem' }, children: field.hint }) : null
+  if (field.kind === 'bool') {
+    return jsxs('label', {
+      style: { alignItems: 'center', display: 'flex', gap: '0.45rem', fontSize: '0.75rem' },
+      children: [
+        jsx('input', { type: 'checkbox', checked: Boolean(value), onChange: event => onChange(event.target.checked) }),
+        jsxs('span', { children: [field.label, hint] })
+      ]
+    })
+  }
+  if (field.kind === 'select') {
+    return jsx(NativeSelect, {
+      label: field.label,
+      value: value ?? '',
+      onChange,
+      children: (field.options || []).map(([option, text]) => jsx('option', { value: option, children: text }, option))
+    })
+  }
+  if (field.kind === 'list') {
+    return jsxs('label', {
+      style: { display: 'grid', gap: '0.25rem' },
+      children: [
+        label,
+        jsx(Textarea, { value: ruleListText(value), placeholder: field.placeholder, rows: 3, onChange: event => onChange(event.target.value), style: { fontFamily: 'inherit', fontSize: '0.75rem' } }),
+        hint
+      ]
+    })
+  }
+  return jsxs('label', {
+    style: { display: 'grid', gap: '0.25rem' },
+    children: [
+      label,
+      jsx(Input, {
+        type: field.kind === 'number' ? 'number' : 'text',
+        value: value ?? '',
+        placeholder: field.placeholder,
+        min: field.kind === 'number' ? 0 : undefined,
+        onChange: event => onChange(field.kind === 'number' ? Number(event.target.value) : event.target.value)
+      }),
+      hint
+    ]
+  })
+}
+
+function RuleEditor({ templates, availableProfiles, initial, onSave, onCancel }) {
+  const [draft, setDraft] = useState(() => {
+    const base = initial || { id: newRuleId(), name: '', type: templates[0]?.type || 'require_tool', params: {}, profile: null, enabled: true }
+    const template = templates.find(item => item.type === base.type) || templates[0]
+    const params = { ...base.params }
+    for (const field of template?.fields || []) if (params[field.key] === undefined) params[field.key] = ruleFieldDefault(field)
+    return { ...base, type: template?.type || base.type, params }
+  })
+  const template = templates.find(item => item.type === draft.type) || templates[0]
+  const complete = ruleIsComplete(draft, templates)
+  const changeType = type => {
+    const next = templates.find(item => item.type === type)
+    if (!next) return
+    const params = {}
+    for (const field of next.fields) params[field.key] = ruleFieldDefault(field)
+    setDraft(current => ({ ...current, type, params }))
+  }
+  const save = () => {
+    if (!complete) return
+    const params = { ...draft.params }
+    for (const field of template.fields) {
+      if (field.kind === 'list') params[field.key] = String(params[field.key] || '').split(/[\r\n,]+/).map(item => item.trim()).filter(Boolean)
+    }
+    onSave({ ...draft, params, name: draft.name.trim() || template.label, profile: draft.profile || null })
+  }
+  return jsxs('div', {
+    style: { background: color.surfaceRaised, border, borderRadius: '6px', display: 'grid', gap: '0.7rem', padding: '0.85rem 0.95rem' },
+    children: [
+      jsxs('div', {
+        style: { display: 'grid', gap: '0.7rem', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)' },
+        children: [
+          jsx(NativeSelect, {
+            label: 'Rule type',
+            value: draft.type,
+            onChange: changeType,
+            children: templates.map(item => jsx('option', { value: item.type, children: item.label }, item.type))
+          }),
+          jsx(NativeSelect, {
+            label: 'Profile',
+            value: draft.profile || '',
+            onChange: value => setDraft(current => ({ ...current, profile: value || null })),
+            children: [
+              jsx('option', { value: '', children: 'Any profile in scope' }, 'any'),
+              ...availableProfiles.map(name => jsx('option', { value: name, children: name }, name))
+            ]
+          })
+        ]
+      }),
+      jsx('div', { style: { color: color.tertiary, fontSize: '0.6875rem' }, children: `${template.sentence} — applies to ${template.applies_to}.` }),
+      jsxs('label', {
+        style: { display: 'grid', gap: '0.25rem' },
+        children: [
+          jsx('span', { style: { color: color.tertiary, fontSize: '0.6875rem' }, children: 'Name' }),
+          jsx(Input, { value: draft.name, placeholder: template.label, onChange: event => setDraft(current => ({ ...current, name: event.target.value })) })
+        ]
+      }),
+      template.fields.length
+        ? jsx('div', {
+            style: { display: 'grid', gap: '0.6rem', gridTemplateColumns: 'repeat(auto-fit, minmax(16rem, 1fr))' },
+            children: template.fields.map(field => jsx(RuleField, {
+              field,
+              value: draft.params[field.key],
+              onChange: value => setDraft(current => ({ ...current, params: { ...current.params, [field.key]: value } }))
+            }, field.key))
+          })
+        : null,
+      jsxs('div', {
+        style: { display: 'flex', gap: '0.5rem', justifyContent: 'flex-end' },
+        children: [
+          jsx(Button, { variant: 'outline', size: 'xs', onClick: onCancel, children: 'Cancel' }),
+          jsx(Button, { variant: 'secondary', size: 'xs', disabled: !complete, onClick: save, title: complete ? 'Save this rule' : 'Fill in the required fields first', children: initial ? 'Save rule' : 'Add rule' })
+        ]
+      })
+    ]
+  })
+}
+
+function RuleModelsTable({ models, minSamples, onDrill }) {
+  return jsx(SimpleTable, {
+    columns: [
+      { key: 'model', label: 'Model' },
+      { key: 'applicable', label: 'Turns checked', align: 'right', render: row => formatCount(row.applicable) },
+      { key: 'passed', label: 'Passed', align: 'right', render: row => formatCount(row.passed) },
+      { key: 'failed', label: 'Failed', align: 'right', render: row => row.failed ? jsx(Pill, { tone: 'danger', children: formatCount(row.failed) }) : '0' },
+      { key: 'pass_rate', label: 'Pass rate', align: 'right', render: row => row.pass_rate == null ? '—' : `${(Number(row.pass_rate) * 100).toFixed(0)}%` },
+      {
+        key: 'failure_rate_upper_bound_95',
+        label: 'Risk ≤ (95%)',
+        align: 'right',
+        render: row => row.failure_rate_upper_bound_95 == null
+          ? '—'
+          : jsx('span', { style: tabular, title: 'Upper Wilson bound of the failure rate at 95% confidence — the ranking key', children: `${(Number(row.failure_rate_upper_bound_95) * 100).toFixed(1)}%` })
+      },
+      {
+        key: 'rank',
+        label: 'Rank',
+        align: 'right',
+        sortValue: row => row.rank ?? 999,
+        render: row => row.rank
+          ? jsx(Pill, { tone: row.rank === 1 ? 'accent' : 'neutral', children: `#${row.rank}` })
+          : jsx('span', { style: { color: color.quaternary }, title: `Fewer than ${minSamples} applicable turns — not ranked`, children: 'below floor' })
+      }
+    ],
+    rows: models || [],
+    emptyTitle: 'No applicable turns',
+    emptyDescription: 'No recorded turn in this period met the rule’s conditions.'
+  })
+}
+
+function RuleExamples({ models, onDrill }) {
+  const examples = []
+  for (const model of models || []) {
+    for (const example of model.examples || []) examples.push({ ...example, model: model.model })
+  }
+  if (!examples.length) return null
+  examples.sort((left, right) => Number(right.timestamp || 0) - Number(left.timestamp || 0))
+  return jsxs('div', {
+    style: { display: 'grid', gap: '0.3rem' },
+    children: [
+      jsx('div', { style: { color: color.tertiary, fontSize: '0.6875rem', fontWeight: 600 }, children: `Failing turns (${examples.length} shown)` }),
+      ...examples.slice(0, 12).map((example, index) => jsxs('div', {
+        style: { alignItems: 'center', border, borderRadius: '5px', display: 'flex', fontSize: '0.6875rem', gap: '0.6rem', padding: '0.35rem 0.55rem' },
+        children: [
+          jsx('span', { style: { ...tabular, color: color.quaternary, flexShrink: 0 }, children: formatShortDate(example.timestamp) }),
+          jsx('span', { style: { color: color.secondary, flexShrink: 0 }, children: example.model }),
+          jsx('span', { style: { color: color.primary, flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, title: example.title, children: `${example.title} · turn ${example.turn}` }),
+          jsx('span', { style: { color: color.danger, flexShrink: 0 }, children: example.reason }),
+          onDrill
+            ? jsx(Button, { variant: 'outline', size: 'xs', onClick: () => onDrill({ search: example.search, failuresOnly: false }), children: 'Open' })
+            : null
+        ]
+      }, `${example.session_id}-${example.turn}-${index}`))
+    ]
+  })
+}
+
+function RulesView({ ctx, period, onDrill, rules, onRulesChange, availableProfiles }) {
+  const [editing, setEditing] = useState(null)
+  const [minSamples, setMinSamples] = useState(() => {
+    const stored = Number(ctx.storage.get(RULES_MIN_SAMPLES_KEY))
+    return Number.isFinite(stored) && stored >= 1 ? stored : 5
+  })
+  useEffect(() => { ctx.storage.set(RULES_MIN_SAMPLES_KEY, minSamples) }, [ctx, minSamples])
+  const templatesQuery = useQuery({
+    queryKey: [PLUGIN_ID, 'rules-templates'],
+    queryFn: () => ctx.rest('/rules/templates'),
+    staleTime: Infinity
+  })
+  const templates = templatesQuery.data?.templates || []
+  const rulesParam = enabledRulesParam(rules)
+  const evalQuery = useQuery({
+    queryKey: [PLUGIN_ID, 'rules', period.days, period.start_at, period.end_at, rulesParam, minSamples],
+    queryFn: () => ctx.rest(apiPath('/rules', { ...period, rules: rulesParam, min_samples: minSamples })),
+    enabled: Boolean(rulesParam),
+    placeholderData: previous => previous,
+    refetchInterval: 120_000
+  })
+  const fileInput = useRef(null)
+  const importRules = async event => {
+    const file = event.target.files?.[0]
+    event.target.value = ''
+    if (!file) return
+    try {
+      const parsed = JSON.parse(await file.text())
+      const list = Array.isArray(parsed) ? parsed : parsed?.rules
+      if (!Array.isArray(list)) throw new Error('expected a JSON array of rules')
+      const known = new Set(rules.map(rule => rule.id))
+      const incoming = list
+        .filter(rule => rule && typeof rule === 'object' && typeof rule.type === 'string')
+        .map(rule => ({ ...rule, id: known.has(rule.id) ? newRuleId() : (rule.id || newRuleId()), enabled: rule.enabled !== false }))
+      onRulesChange([...rules, ...incoming])
+      notifyHost('success', `Imported ${incoming.length} rule${incoming.length === 1 ? '' : 's'}.`)
+    } catch (error) {
+      notifyHost('error', `Import failed: ${error?.message || error}`)
+    }
+  }
+  const saveRule = rule => {
+    const exists = rules.some(item => item.id === rule.id)
+    onRulesChange(exists ? rules.map(item => (item.id === rule.id ? rule : item)) : [...rules, rule])
+    setEditing(null)
+  }
+  const result = evalQuery.data
+  const exportItems = [
+    jsonExportItem('rules-json', 'Rules (JSON)', 'Your rule definitions — import them on another machine or profile', 'rules', null, { rules }),
+    {
+      id: 'rules-scores-csv',
+      label: 'Scoreboard (CSV)',
+      hint: 'One row per rule and model: turns checked, passed, failed, pass rate, risk bound, rank',
+      filename: exportFilename('rule-scores', period, 'csv'),
+      mime: 'text/csv;charset=utf-8',
+      build: () => toCsv(
+        [
+          { key: 'rule', label: 'Rule' },
+          { key: 'model', label: 'Model' },
+          { key: 'applicable', label: 'Turns checked' },
+          { key: 'passed', label: 'Passed' },
+          { key: 'failed', label: 'Failed' },
+          { key: 'pass_rate', label: 'Pass rate' },
+          { key: 'failure_rate_upper_bound_95', label: 'Risk bound (95%)' },
+          { key: 'rank', label: 'Rank' }
+        ],
+        (result?.rules || []).flatMap(rule => (rule.models || []).map(model => ({ rule: rule.name, ...model })))
+      )
+    }
+  ]
+  return jsx('div', {
+    style: { flex: 1, minHeight: 0, overflow: 'auto', padding: '1rem' },
+    children: jsxs('div', {
+      style: { display: 'grid', gap: '1.25rem', margin: '0 auto', maxWidth: '84rem' },
+      children: [
+        jsx(SectionHeading, {
+          title: 'Instruction rules',
+          description: 'State an instruction from your SOUL.md as a checkable rule, and Session Lens grades every recorded turn in the selected period against it, per model. Verdicts come from code, not from a judge: a rule either left a trace in the record or it is not offered here.',
+          action: jsxs('div', {
+            style: { alignItems: 'center', display: 'flex', flexShrink: 0, gap: '0.5rem' },
+            children: [
+              jsx('input', { ref: fileInput, type: 'file', accept: 'application/json,.json', hidden: true, onChange: importRules }),
+              jsx(Button, { variant: 'outline', size: 'xs', onClick: () => fileInput.current?.click(), title: 'Import rules from a JSON file exported here', children: jsxs(Fragment, { children: [jsx(Codicon, { name: 'cloud-upload' }), 'Import'] }) }),
+              jsx(ExportMenu, { title: 'Export your rules or the scoreboard', items: exportItems }),
+              jsx(Button, { variant: 'secondary', size: 'xs', disabled: !templates.length || Boolean(editing), onClick: () => setEditing({ mode: 'new' }), children: jsxs(Fragment, { children: [jsx(Codicon, { name: 'add' }), 'Add rule'] }) })
+            ]
+          })
+        }),
+        templatesQuery.isError
+          ? jsx(ErrorBlock, { error: templatesQuery.error, onRetry: templatesQuery.refetch, title: 'Rule templates unavailable' })
+          : null,
+        editing
+          ? jsx(RuleEditor, {
+              templates,
+              availableProfiles,
+              initial: editing.mode === 'edit' ? editing.rule : null,
+              onSave: saveRule,
+              onCancel: () => setEditing(null)
+            })
+          : null,
+        rules.length
+          ? jsx('div', {
+              style: { border, borderRadius: '6px', display: 'grid' },
+              children: rules.map((rule, index) => jsxs('div', {
+                style: { alignItems: 'center', borderTop: index ? border : 'none', display: 'flex', gap: '0.6rem', opacity: rule.enabled === false ? 0.6 : 1, padding: '0.5rem 0.7rem' },
+                children: [
+                  jsx('button', {
+                    type: 'button',
+                    role: 'switch',
+                    'aria-checked': rule.enabled !== false,
+                    title: rule.enabled === false ? 'Enable this rule' : 'Disable this rule (kept, not graded)',
+                    onClick: () => onRulesChange(rules.map(item => (item.id === rule.id ? { ...item, enabled: item.enabled === false } : item))),
+                    style: { background: 'transparent', border: 'none', color: rule.enabled === false ? color.quaternary : color.accent, cursor: 'pointer', padding: 0 },
+                    children: jsx(Codicon, { name: rule.enabled === false ? 'circle-large-outline' : 'pass-filled', size: '0.95rem' })
+                  }),
+                  jsxs('div', {
+                    style: { flex: 1, minWidth: 0 },
+                    children: [
+                      jsxs('div', {
+                        style: { alignItems: 'center', display: 'flex', gap: '0.4rem' },
+                        children: [
+                          jsx('span', { style: { color: color.primary, fontSize: '0.75rem', fontWeight: 600 }, children: rule.name || rule.type }),
+                          rule.profile ? jsx(Pill, { tone: 'accent', title: 'Only turns from this profile are graded', children: rule.profile }) : null,
+                          !ruleIsComplete(rule, templates) && templates.length ? jsx(Pill, { tone: 'danger', children: 'incomplete' }) : null
+                        ]
+                      }),
+                      jsx('div', { style: { color: color.tertiary, fontSize: '0.6875rem' }, children: ruleSummary(rule, templates) })
+                    ]
+                  }),
+                  jsx(Button, { variant: 'outline', size: 'xs', disabled: Boolean(editing), onClick: () => setEditing({ mode: 'edit', rule }), children: 'Edit' }),
+                  jsx(Button, { variant: 'outline', size: 'xs', onClick: () => onRulesChange(rules.filter(item => item.id !== rule.id)), title: 'Delete this rule', children: jsx(Codicon, { name: 'trash' }) })
+                ]
+              }, rule.id))
+            })
+          : jsx(EmptyState, {
+              title: 'No rules yet',
+              description: 'Session Lens can check whether models followed your instructions. Add a rule to start — for example “Every reply must call text_to_speech” or “Replies must never contain D:\\”.'
+            }),
+        rulesParam
+          ? jsxs('section', {
+              style: { display: 'grid', gap: '1rem' },
+              children: [
+                jsx(SectionHeading, {
+                  title: 'Scoreboard',
+                  description: result
+                    ? `${formatCount(result.coverage?.sessions)} sessions · ${formatCount(result.coverage?.turns)} turns in the selected period${result.coverage?.sessions_truncated ? ' (newest 600 sessions only)' : ''} · grouped by the session’s model · ranked by the 95% Wilson upper failure bound.`
+                    : 'Grading the selected period…',
+                  action: jsxs('label', {
+                    style: { alignItems: 'center', color: color.tertiary, display: 'inline-flex', flexShrink: 0, fontSize: '0.6875rem', gap: '0.4rem' },
+                    title: 'Models with fewer applicable turns than this are shown but not ranked',
+                    children: [
+                      'Sample floor',
+                      jsx(Input, { type: 'number', min: 1, max: 200, value: minSamples, onChange: event => setMinSamples(Math.max(1, Math.min(200, Number(event.target.value) || 1))), style: { width: '4.5rem' } })
+                    ]
+                  })
+                }),
+                evalQuery.isError
+                  ? jsx(ErrorBlock, { error: evalQuery.error, onRetry: evalQuery.refetch, title: 'Rule grading unavailable' })
+                  : !result
+                    ? jsx(LoadingBlock, { rows: 4 })
+                    : jsxs(Fragment, {
+                        children: [
+                          jsxs('div', {
+                            children: [
+                              jsx('div', { style: { color: color.secondary, fontSize: '0.75rem', fontWeight: 600, marginBottom: '0.4rem' }, children: 'All rules together' }),
+                              jsx(SimpleTable, {
+                                columns: [
+                                  { key: 'model', label: 'Model' },
+                                  { key: 'rules', label: 'Rules', align: 'right', render: row => formatCount(row.rules) },
+                                  { key: 'applicable', label: 'Turns checked', align: 'right', render: row => formatCount(row.applicable) },
+                                  { key: 'failed', label: 'Failed', align: 'right', render: row => row.failed ? jsx(Pill, { tone: 'danger', children: formatCount(row.failed) }) : '0' },
+                                  { key: 'pass_rate', label: 'Pass rate', align: 'right', render: row => row.pass_rate == null ? '—' : `${(Number(row.pass_rate) * 100).toFixed(0)}%` },
+                                  { key: 'failure_rate_upper_bound_95', label: 'Risk ≤ (95%)', align: 'right', render: row => row.failure_rate_upper_bound_95 == null ? '—' : jsx('span', { style: tabular, children: `${(Number(row.failure_rate_upper_bound_95) * 100).toFixed(1)}%` }) },
+                                  { key: 'rank', label: 'Rank', align: 'right', sortValue: row => row.rank ?? 999, render: row => row.rank ? jsx(Pill, { tone: row.rank === 1 ? 'accent' : 'neutral', children: `#${row.rank}` }) : jsx('span', { style: { color: color.quaternary }, children: 'below floor' }) }
+                                ],
+                                rows: result.overall || [],
+                                emptyTitle: 'No applicable turns',
+                                emptyDescription: 'No recorded turn in this period met any enabled rule’s conditions.'
+                              })
+                            ]
+                          }),
+                          ...(result.rules || []).map(rule => jsxs('div', {
+                            style: { display: 'grid', gap: '0.6rem' },
+                            children: [
+                              jsxs('div', {
+                                children: [
+                                  jsxs('div', {
+                                    style: { alignItems: 'center', display: 'flex', gap: '0.4rem' },
+                                    children: [
+                                      jsx('span', { style: { color: color.secondary, fontSize: '0.75rem', fontWeight: 600 }, children: rule.name }),
+                                      rule.profile ? jsx(Pill, { tone: 'accent', children: rule.profile }) : null,
+                                      jsx('span', { style: { color: color.quaternary, fontSize: '0.625rem' }, children: rule.pass_rate == null ? 'no applicable turns' : `${formatCount(rule.applicable - rule.failed)} of ${formatCount(rule.applicable)} turns passed` })
+                                    ]
+                                  }),
+                                  jsx('div', { style: { color: color.tertiary, fontSize: '0.6875rem' }, children: `${rule.sentence}. Applies to ${rule.applies_to}.` })
+                                ]
+                              }),
+                              jsx(RuleModelsTable, { models: rule.models, minSamples, onDrill }),
+                              jsx(RuleExamples, { models: rule.models, onDrill })
+                            ]
+                          }, rule.id)),
+                          jsxs('div', {
+                            style: { alignItems: 'flex-start', borderTop: border, color: color.tertiary, display: 'flex', fontSize: '0.6875rem', gap: '0.5rem', lineHeight: 1.5, paddingTop: '0.75rem' },
+                            children: [
+                              jsx(Codicon, { name: 'info', size: '0.75rem', style: { marginTop: '0.15rem' } }),
+                              jsx('span', { children: result.definition })
+                            ]
+                          })
+                        ]
+                      })
+              ]
+            })
+          : null
+      ]
+    })
+  })
+}
+
 function SessionLensPage({ ctx }) {
   const viewport = useValue(host.state.viewport)
   const queryClient = useQueryClient()
   const [tab, setTab] = useState(() => ctx.storage.get('activeTab', 'sessions'))
+  const [rules, setRules] = useState(() => {
+    const stored = ctx.storage.get(RULES_STORAGE_KEY)
+    return Array.isArray(stored) ? stored.filter(rule => rule && typeof rule === 'object' && typeof rule.type === 'string') : []
+  })
+  useEffect(() => {
+    ctx.storage.set(RULES_STORAGE_KEY, rules)
+    activeRulesParam = enabledRulesParam(rules)
+  }, [ctx, rules])
   const [drill, setDrill] = useState(null)
   const [aiManualRefreshing, setAiManualRefreshing] = useState(false)
   const [aiRefreshError, setAiRefreshError] = useState('')
@@ -3692,6 +4180,13 @@ function SessionLensPage({ ctx }) {
   const availableProfiles = (profileListQuery.data?.profiles || [])
     .map(item => item?.name)
     .filter(Boolean)
+  useEffect(() => {
+    // TRIAL SEED (see RULES_TRIAL_SEED): first open on a machine with the Kore profile.
+    if (rules.length || ctx.storage.get('rulesSeeded')) return
+    if (!availableProfiles.includes(RULES_TRIAL_SEED.profile)) return
+    ctx.storage.set('rulesSeeded', true)
+    setRules(RULES_TRIAL_SEED.rules)
+  }, [ctx, rules.length, availableProfiles])
   const scopeInitRef = useRef(false)
   useEffect(() => {
     ctx.storage.set('profileScope', profileScope)
@@ -3759,6 +4254,7 @@ function SessionLensPage({ ctx }) {
   if (tab === 'overview') content = jsx(OverviewView, { query: overviewQuery, ctx, period })
   if (tab === 'operations') content = jsx(OperationsView, { ctx, period, onDrill: drillToSessions })
   if (tab === 'tools') content = jsx(ToolsView, { ctx, period })
+  if (tab === 'rules') content = jsx(RulesView, { ctx, period, onDrill: drillToSessions, rules, onRulesChange: setRules, availableProfiles })
   if (tab === 'system') content = jsx(SystemView, { ctx })
   const refreshProvider = async provider => {
     try {

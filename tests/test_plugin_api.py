@@ -30,6 +30,7 @@ from dashboard import _classify as classify
 from dashboard import _hermes_compat as hermes_compat
 from dashboard import _routes as api
 from dashboard import _services as services
+from dashboard import _rules as rules_mod
 
 
 def tool_rows(name: str, arguments: dict | None = None, result: str = "Done!"):
@@ -867,6 +868,217 @@ process.stdout.write(JSON.stringify(out))
         self.assertRegex(result["nameAll"], r"^session-lens-tools-all-\d{8}-\d{4}\.json$")
         self.assertRegex(result["nameCustom"], r"^session-lens-digest-custom-\d{8}-\d{4}\.md$")
         self.assertRegex(result["nameNone"], r"^session-lens-models-\d{8}-\d{4}\.csv$")
+
+    def _seed_rules_sessions(self):
+        """Two sessions on different models with turns that exercise every template."""
+        connection = sqlite3.connect(self.db_path)
+        base = 1_810_000_000
+
+        def call(name, arguments, call_id):
+            return {"id": call_id, "type": "function", "function": {"name": name, "arguments": json.dumps(arguments, ensure_ascii=False)}}
+
+        def add(session, role, ts, content=None, calls=None, tool_name=None, call_id=None):
+            connection.execute(
+                "INSERT INTO messages (session_id,role,content,tool_calls,tool_name,tool_call_id,timestamp,active) VALUES (?,?,?,?,?,?,?,1)",
+                (session, role, content, json.dumps(calls) if calls else None, tool_name, call_id, ts),
+            )
+
+        for sid, model in (("rules-a", "model-alpha"), ("rules-b", "model-beta")):
+            connection.execute(
+                "INSERT INTO sessions (id, source, model, started_at, last_activity_at, message_count, title, profile_name) "
+                "VALUES (?, 'telegram', ?, ?, ?, 6, ?, 'voice-inbox')",
+                (sid, model, base, base + 100, f"Rules fixture {model}"),
+            )
+        # Session A, turn 1: TTS called and succeeds; Arabic in, Arabic out; greets once.
+        add("rules-a", "user", base + 1, content=json.dumps("الله يعطيك العافية، وش وضع الطقس اليوم في الرياض؟"))
+        add("rules-a", "assistant", base + 2, calls=[call("web_search", {"query": "weather Riyadh"}, "a1")])
+        add("rules-a", "tool", base + 3, content="sunny 41C", tool_name="web_search", call_id="a1")
+        add("rules-a", "assistant", base + 4, content="أبو عمر، الجو اليوم مشمس والحرارة واحد وأربعين درجة في الرياض، خذ راحتك.")
+        add("rules-a", "assistant", base + 5, calls=[call("text_to_speech", {"text": "الجو مشمس"}, "a2")])
+        add("rules-a", "tool", base + 6, content='{"ok": true, "path": "C:\\\\voice\\\\out.ogg"}', tool_name="text_to_speech", call_id="a2")
+        # Session A, turn 2: browser used without search first; path outside the allowed root; mentions a forbidden word.
+        add("rules-a", "user", base + 10, content="open the dashboard and save the notes")
+        add("rules-a", "assistant", base + 11, calls=[
+            call("browser_navigate", {"url": "https://example.com"}, "a3"),
+            call("write_file", {"path": "D:\\Bandar Vault\\Maaden\\notes.md", "content": "x"}, "a4"),
+        ])
+        add("rules-a", "tool", base + 12, content="ok", tool_name="browser_navigate", call_id="a3")
+        add("rules-a", "tool", base + 13, content="written", tool_name="write_file", call_id="a4")
+        add("rules-a", "assistant", base + 14, content="Abu Omar, done — saved to D:\\Bandar Vault\\Maaden\\notes.md.\n[[audio_as_voice]]\nMEDIA:C:\\cache\\tts.ogg")
+        # Session B, turn 1: no TTS at all, English reply to Arabic, greets twice.
+        add("rules-b", "user", base + 20, content=json.dumps("سجل لي ملاحظة عن الاجتماع بكرة الساعة عشرة"))
+        add("rules-b", "assistant", base + 21, content="Abu Omar, I noted the meeting tomorrow at ten. Abu Omar, anything else you need for this?")
+        # Session B, turn 2: TTS called but the tool failed; search then browser (order respected); path inside root.
+        add("rules-b", "user", base + 30, content="check the site and file it")
+        add("rules-b", "assistant", base + 31, calls=[call("web_search", {"query": "site"}, "b1")])
+        add("rules-b", "tool", base + 32, content="results", tool_name="web_search", call_id="b1")
+        add("rules-b", "assistant", base + 33, calls=[
+            call("browser_navigate", {"url": "https://example.org"}, "b2"),
+            call("write_file", {"path": "D:/Projects/AssetNerve/notes.md", "content": "see D:\\Elsewhere\\x.md and //schemas.microsoft.com/windows/2004/02/mit/task"}, "b3"),
+            call("text_to_speech", {"text": "done"}, "b4"),
+        ])
+        add("rules-b", "tool", base + 34, content="ok", tool_name="browser_navigate", call_id="b2")
+        add("rules-b", "tool", base + 35, content="written", tool_name="write_file", call_id="b3")
+        add("rules-b", "tool", base + 36, content='{"error": "TTS generation failed (gemini): HTTP 429"}', tool_name="text_to_speech", call_id="b4")
+        add("rules-b", "assistant", base + 37, content="Abu Omar, filed.")
+        connection.commit()
+        connection.close()
+
+    def _rules_fixture_rules(self):
+        return [
+            {"id": "tts", "name": "Voice reply", "type": "require_tool", "params": {"tool": "text_to_speech"}},
+            {"id": "tts-ok", "name": "Voice reply succeeded", "type": "require_tool", "params": {"tool": "text_to_speech", "must_succeed": True}},
+            {"id": "tts-before", "name": "Voice before final", "type": "require_tool", "params": {"tool": "text_to_speech", "position": "before_final"}},
+            {"id": "no-browser", "name": "No browser", "type": "forbid_tool", "params": {"tool": "browser_*"}},
+            {"id": "search-first", "name": "Search first", "type": "tool_order", "params": {"tool": "browser_*", "before": "web_search", "scope": "turn"}},
+            {"id": "no-paths", "name": "No paths", "type": "forbid_text", "params": {"patterns": "D:\\\nsaved to"}},
+            {"id": "greet", "name": "Greet once", "type": "require_text_count", "params": {"pattern": "Abu Omar | أبو عمر", "count": 1}},
+            {"id": "lang", "name": "Language", "type": "language_match", "params": {}},
+            {"id": "no-maaden", "name": "No Maaden", "type": "forbid_tool_mention", "params": {"patterns": ["maaden"]}},
+            {"id": "roots", "name": "Stay in AssetNerve", "type": "path_boundary", "params": {"tools": ["write_file", "terminal"], "roots": ["D:\\Projects\\AssetNerve"]}},
+            {"id": "other-profile", "name": "Elsewhere", "type": "forbid_tool", "params": {"tool": "web_search"}, "profile": "turkey-trip"},
+            {"id": "off", "name": "Disabled", "type": "forbid_tool", "params": {"tool": "web_search"}, "enabled": False},
+            {"id": "bad", "name": "Unknown type", "type": "made_up", "params": {}},
+            {"id": "empty", "name": "Missing field", "type": "forbid_tool", "params": {}},
+        ]
+
+    def test_rules_param_parsing_validates_templates(self):
+        parsed = rules_mod._parse_rules_param(json.dumps(self._rules_fixture_rules()))
+        ids = [rule["id"] for rule in parsed]
+        self.assertNotIn("bad", ids)
+        self.assertNotIn("empty", ids)
+        self.assertIn("off", ids)
+        by_id = {rule["id"]: rule for rule in parsed}
+        self.assertEqual(by_id["no-paths"]["params"]["patterns"], ["D:\\", "saved to"])
+        self.assertEqual(by_id["roots"]["params"]["tools"], ["write_file", "terminal"])
+        self.assertEqual(by_id["tts"]["params"]["position"], "any")
+        self.assertFalse(by_id["tts"]["params"]["must_succeed"])
+        self.assertTrue(by_id["tts-ok"]["params"]["must_succeed"])
+        self.assertFalse(by_id["off"]["enabled"])
+        self.assertEqual(by_id["other-profile"]["profile"], "turkey-trip")
+        self.assertEqual(rules_mod._parse_rules_param(""), [])
+        self.assertEqual(rules_mod._parse_rules_param("not json"), [])
+        self.assertEqual(rules_mod._parse_rules_param(json.dumps({"rules": [{"type": "language_match"}]}))[0]["type"], "language_match")
+
+    def test_rules_evaluate_grades_every_template_per_model(self):
+        self._seed_rules_sessions()
+        parsed = rules_mod._parse_rules_param(json.dumps(self._rules_fixture_rules()))
+        payload = api._rules_evaluate_sync(parsed, 0, min_samples=2)
+        self.assertEqual(payload["coverage"]["turns"], 6)  # 2 fixture sessions x 2 turns + session-1 + session-2 from setUp
+        by_id = {rule["id"]: rule for rule in payload["rules"]}
+        self.assertNotIn("off", by_id)
+        self.assertNotIn("bad", by_id)
+
+        def model_row(rule_id, model):
+            return next(item for item in by_id[rule_id]["models"] if item["model"] == model)
+
+        # require_tool: alpha 1/2 (turn 2 had no TTS), beta 1/2 (turn 1 text only).
+        self.assertEqual((model_row("tts", "model-alpha")["passed"], model_row("tts", "model-alpha")["applicable"]), (1, 2))
+        self.assertEqual((model_row("tts", "model-beta")["passed"], model_row("tts", "model-beta")["applicable"]), (1, 2))
+        self.assertIn("replied with text only", model_row("tts", "model-beta")["examples"][0]["reason"])
+        # must_succeed: beta's turn-2 TTS errored, so beta drops to 0/2.
+        self.assertEqual(model_row("tts-ok", "model-beta")["passed"], 0)
+        self.assertIn("was called but failed", model_row("tts-ok", "model-beta")["examples"][1]["reason"])
+        self.assertEqual(model_row("tts-ok", "model-alpha")["passed"], 1)
+        # before_final: alpha turn 1 called TTS after its final text -> fails; beta turn 2 called it before the final text -> passes.
+        self.assertEqual(model_row("tts-before", "model-alpha")["passed"], 0)
+        self.assertEqual(model_row("tts-before", "model-beta")["passed"], 1)
+        # forbid_tool: both models used browser_* once; turns without tool calls are not applicable.
+        self.assertEqual((model_row("no-browser", "model-alpha")["failed"], model_row("no-browser", "model-alpha")["applicable"]), (1, 2))
+        self.assertEqual((model_row("no-browser", "model-beta")["failed"], model_row("no-browser", "model-beta")["applicable"]), (1, 1))
+        # tool_order: alpha browsed without searching in that turn; beta searched first.
+        self.assertEqual(model_row("search-first", "model-alpha")["failed"], 1)
+        self.assertIn("without trying web_search first", model_row("search-first", "model-alpha")["examples"][0]["reason"])
+        self.assertEqual(model_row("search-first", "model-beta")["failed"], 0)
+        # forbid_text: alpha's turn 2 said "saved to D:\..." (MEDIA marker line itself is ignored); beta is clean.
+        self.assertEqual(model_row("no-paths", "model-alpha")["failed"], 1)
+        self.assertEqual(model_row("no-paths", "model-beta")["failed"], 0)
+        # require_text_count with alternatives: alpha greets once in Arabic and once in English (2/2 pass); beta greets twice in turn 1.
+        self.assertEqual(model_row("greet", "model-alpha")["passed"], 2)
+        self.assertEqual(model_row("greet", "model-beta")["failed"], 1)
+        self.assertIn("appears 2 times, expected 1", model_row("greet", "model-beta")["examples"][0]["reason"])
+        # language_match: alpha replied in Arabic to Arabic; beta replied in English to Arabic; English-in turns are applicable too.
+        self.assertEqual(model_row("lang", "model-alpha")["failed"], 0)
+        self.assertEqual(model_row("lang", "model-beta")["failed"], 1)
+        self.assertIn("user wrote arabic, reply was english", model_row("lang", "model-beta")["examples"][0]["reason"])
+        # forbid_tool_mention: alpha wrote into a Maaden path.
+        self.assertEqual(model_row("no-maaden", "model-alpha")["failed"], 1)
+        self.assertIn("write_file arguments mention", model_row("no-maaden", "model-alpha")["examples"][0]["reason"])
+        self.assertEqual(model_row("no-maaden", "model-beta")["failed"], 0)
+        # path_boundary: alpha outside the root, beta inside (forward slashes normalised).
+        self.assertEqual(model_row("roots", "model-alpha")["failed"], 1)
+        self.assertIn("touched d:/bandar vault/maaden/notes.md", model_row("roots", "model-alpha")["examples"][0]["reason"])
+        self.assertEqual((model_row("roots", "model-beta")["failed"], model_row("roots", "model-beta")["applicable"]), (0, 1))
+        # Profile-scoped rule graded nothing here (fixture sessions are voice-inbox).
+        self.assertEqual(by_id["other-profile"]["applicable"], 0)
+        self.assertGreater(by_id["other-profile"]["skipped_other_profiles"], 0)
+        # Ranking: below the floor -> no rank; examples link to the session.
+        self.assertIsNone(next(item for item in by_id["tts"]["models"] if item["applicable"] < 2)["rank"] if any(item["applicable"] < 2 for item in by_id["tts"]["models"]) else None)
+        self.assertEqual(model_row("tts", "model-alpha")["examples"][0]["search"], "id:rules-a")
+        overall = {item["model"]: item for item in payload["overall"]}
+        self.assertEqual({overall["model-alpha"]["rank"], overall["model-beta"]["rank"]}, {1, 2})
+        best = min(overall.values(), key=lambda item: item["failure_rate_upper_bound_95"])
+        self.assertEqual(best["rank"], 1)
+        self.assertIn("Wilson", payload["definition"])
+        # Sentences are human-readable.
+        self.assertEqual(by_id["tts-before"]["sentence"], "Every reply must call text_to_speech before the final answer")
+        self.assertEqual(by_id["roots"]["sentence"], "write_file, terminal must stay inside D:\\Projects\\AssetNerve")
+
+    def test_rules_turn_building_and_language_detection(self):
+        session = {"id": "s", "model": "m", "profile": "p"}
+        messages = [
+            {"role": "assistant", "content": "preamble nobody asked for", "timestamp": 1},
+            {"role": "user", "content": json.dumps("hello there, how are you today?"), "timestamp": 2},
+            {"role": "assistant", "content": json.dumps([{"type": "text", "text": "Fine."}, {"type": "image", "url": "x"}]), "timestamp": 3},
+            {"role": "assistant", "content": "[[audio_as_voice]]\nMEDIA:C:\\a.ogg", "tool_calls": json.dumps([{"function": {"name": "t", "arguments": {"a": 1}}}]), "timestamp": 4},
+            {"role": "tool", "content": "Error: boom", "tool_name": "t", "timestamp": 5},
+            {"role": "user", "content": "second", "timestamp": 6},
+        ]
+        turns = rules_mod._build_turns(session, messages)
+        self.assertEqual(len(turns), 2)
+        first = turns[0]
+        self.assertEqual(first["user_text"], "hello there, how are you today?")
+        self.assertEqual(rules_mod._turn_text(first), "Fine.")
+        self.assertEqual([call[1] for call in rules_mod._turn_calls(first)], ["t"])
+        self.assertEqual(rules_mod._turn_calls(first)[0][2], '{"a": 1}')
+        self.assertTrue(rules_mod._turn_results(first)[0][3])  # failed result
+        self.assertEqual(turns[1]["events"], [])
+        detect = rules_mod._detect_language
+        self.assertEqual(detect("الله يعطيك العافية يا أبو عمر كيف الحال اليوم"), "arabic")
+        self.assertEqual(detect("Merhaba, bugün hava çok güzel ve deniz sakin, teşekkürler"), "turkish")
+        self.assertEqual(detect("The weather is fine and the sea is calm for you today"), "english")
+        self.assertEqual(detect("abu omar hi"), None)
+        self.assertEqual(detect("Abu Omar, تم حفظ الملاحظة and the meeting is tomorrow morning"), "mixed")
+        self.assertEqual(rules_mod._paths_in_text('{"path": "D:\\\\Projects\\\\X\\\\a.py", "cmd": "cat /etc/hosts"}'), ["d:/projects/x/a.py", "/etc/hosts"])
+        self.assertEqual(rules_mod._paths_in_text("xmlns=\"http://schemas.microsoft.com/windows/2004/02/mit/task\""), [])
+        self.assertEqual(rules_mod._path_bearing_text('{"path": "D:/a/b.md", "content": "text with D:/c/d.md inside"}'), "D:/a/b.md")
+        self.assertEqual(rules_mod._path_bearing_text("plain string D:/x/y.md"), "plain string D:/x/y.md")
+
+    def test_digest_and_routes_carry_rules(self):
+        self._seed_rules_sessions()
+        rules = json.dumps([{"id": "tts", "name": "Voice reply", "type": "require_tool", "params": {"tool": "text_to_speech"}}])
+        with patch.object(api, "_ai_usage_sync", return_value={"providers": []}), \
+             patch.object(api, "_services_sync", return_value={"cards": [], "inventory": [], "summary": None}), \
+             patch.object(api, "_budgets_sync", return_value={"entries": [], "total": None, "month": {}, "notes": []}):
+            payload = api._digest_sync(0, rules=rules)
+            quiet = api._digest_sync(0)
+        self.assertIn("## Instruction rules", payload["markdown"])
+        self.assertIn("- Voice reply: model-", payload["markdown"])
+        self.assertIn("below sample floor", payload["markdown"])
+        self.assertEqual(payload["rules"]["coverage"]["rules_evaluated"], 1)
+        self.assertNotIn("## Instruction rules", quiet["markdown"])
+        self.assertIsNone(quiet["rules"])
+        routes = {route.path for route in api.router.routes}
+        self.assertIn("/rules", routes)
+        self.assertIn("/rules/templates", routes)
+        self.assertEqual({item["type"] for item in rules_mod.RULE_TEMPLATES}, set(rules_mod._EVALUATORS))
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("{ id: 'rules', label: 'Rules', codicon: 'checklist' }", source)
+        self.assertIn("if (activeRulesParam && path === '/digest') merged.rules = activeRulesParam", source)
+        self.assertIn("ctx.storage.set(RULES_STORAGE_KEY, rules)", source)
+        self.assertIn("jsx(RulesView, { ctx, period, onDrill: drillToSessions, rules, onRulesChange: setRules, availableProfiles })", source)
+        self.assertIn("ctx.rest(apiPath('/rules', { ...period, rules: rulesParam, min_samples: minSamples }))", source)
+        self.assertIn("TRIAL SEED", source)
 
     def test_quota_exhaust_forecast_math(self):
         now = time.time()

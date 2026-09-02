@@ -11,6 +11,7 @@ try:
     from ._reliability import *
     from ._providers import *
     from ._services import *
+    from ._rules import *
 except ImportError:  # pragma: no cover - direct Hermes file loading
     from _common import *
     from _logparse import *
@@ -18,6 +19,7 @@ except ImportError:  # pragma: no cover - direct Hermes file loading
     from _reliability import *
     from _providers import *
     from _services import *
+    from _rules import *
 
 router = APIRouter()
 
@@ -924,6 +926,7 @@ def _digest_sync(
     start_at: Optional[float] = None,
     end_at: Optional[float] = None,
     budgets: str = "",
+    rules: str = "",
 ) -> Dict[str, Any]:
     period_start, period_end = _period_bounds(days, start_at, end_at)
     now = time.time()
@@ -1052,6 +1055,13 @@ def _digest_sync(
         budgets_payload: Optional[Dict[str, Any]] = _budgets_sync(_parse_budgets_param(budgets))
     except Exception:
         budgets_payload = None
+    rules_payload: Optional[Dict[str, Any]] = None
+    parsed_rules = _parse_rules_param(rules)
+    if parsed_rules:
+        try:
+            rules_payload = _rules_evaluate_sync(parsed_rules, days, start_at, end_at)
+        except Exception:
+            rules_payload = None
 
     def cost_label(value: Any) -> str:
         return f"${_number(value):.2f}"
@@ -1145,6 +1155,10 @@ def _digest_sync(
     if service_lines:
         lines.extend(service_lines)
         lines.append("")
+    rules_lines = _digest_rules_lines(rules_payload)
+    if rules_lines:
+        lines.extend(rules_lines)
+        lines.append("")
 
     return {
         "period_days": days,
@@ -1164,6 +1178,11 @@ def _digest_sync(
             else None
         ),
         "services": {"summary": services_summary, "rows": service_rows} if services_payload is not None else None,
+        "rules": (
+            {key: rules_payload.get(key) for key in ("rules", "overall", "coverage")}
+            if rules_payload
+            else None
+        ),
         "markdown": "\n".join(lines).rstrip() + "\n",
         "generated_at": now,
     }
@@ -1176,8 +1195,27 @@ async def digest(
     end_at: Optional[float] = Query(None, ge=0),
     profiles: str = Query(""),
     budgets: str = Query(""),
+    rules: str = Query("", max_length=RULES_MAX_PARAM_CHARS),
 ) -> Dict[str, Any]:
-    return await asyncio.to_thread(_scoped_call, profiles, _digest_sync, days, start_at, end_at, budgets=budgets)
+    return await asyncio.to_thread(_scoped_call, profiles, _digest_sync, days, start_at, end_at, budgets=budgets, rules=rules)
+
+
+@router.get("/rules/templates")
+async def rules_templates() -> Dict[str, Any]:
+    return {"templates": RULE_TEMPLATES, "max_rules": RULES_MAX_RULES, "default_min_samples": RULES_DEFAULT_MIN_SAMPLES}
+
+
+@router.get("/rules")
+async def rules_route(
+    rules: str = Query("", max_length=RULES_MAX_PARAM_CHARS),
+    days: int = Query(30, ge=0, le=3650),
+    start_at: Optional[float] = Query(None, ge=0),
+    end_at: Optional[float] = Query(None, ge=0),
+    min_samples: int = Query(RULES_DEFAULT_MIN_SAMPLES, ge=1, le=200),
+    profiles: str = Query(""),
+) -> Dict[str, Any]:
+    parsed = _parse_rules_param(rules)
+    return await asyncio.to_thread(_scoped_call, profiles, _rules_evaluate_sync, parsed, days, start_at, end_at, min_samples)
 
 
 def _path_basename(path: Any) -> str:
