@@ -9,6 +9,7 @@ try:
     from ._logparse import *
     from ._classify import *
     from ._reliability import *
+    from ._adapters import *
     from ._providers import *
     from ._services import *
     from ._rules import *
@@ -17,6 +18,7 @@ except ImportError:  # pragma: no cover - direct Hermes file loading
     from _logparse import *
     from _classify import *
     from _reliability import *
+    from _adapters import *
     from _providers import *
     from _services import *
     from _rules import *
@@ -3882,16 +3884,7 @@ def _ai_usage_sync(fresh: bool = False, only_provider: Optional[str] = None) -> 
             cached["cached"] = True
             return cached
 
-    collectors = {
-        "codex": _collect_codex_usage,
-        "anthropic": _collect_anthropic_usage,
-        "nous": _collect_nous_usage,
-        "openrouter": _collect_openrouter_usage,
-        "deepseek": _collect_deepseek_usage,
-        "grok": _collect_grok_usage,
-        "kimi": _collect_kimi_usage,
-        "zai": _collect_zai_usage,
-    }
+    collectors = {provider: adapter.collect for provider, adapter in _provider_adapters().items()}
     if fresh and only_provider:
         collector = collectors.get(only_provider)
         if collector is not None:
@@ -3911,7 +3904,7 @@ def _ai_usage_sync(fresh: bool = False, only_provider: Optional[str] = None) -> 
             results[provider] = _provider_payload(
                 provider,
                 status="not_configured",
-                message=_AI_USAGE_NOT_CONFIGURED_MESSAGES.get(provider),
+                message=_provider_not_configured_message(provider),
             )
     if active:
         with ThreadPoolExecutor(max_workers=len(active), thread_name_prefix="session-lens-usage") as pool:
@@ -3927,7 +3920,7 @@ def _ai_usage_sync(fresh: bool = False, only_provider: Optional[str] = None) -> 
     recorded = _usage_recorded_7d()
     with _ai_usage_cache_lock:
         account_cards: Dict[str, List[Dict[str, Any]]] = {}
-        for provider in _AI_USAGE_PROVIDER_ORDER:
+        for provider in _provider_ids():
             result = results.get(provider) or _provider_payload(
                 provider,
                 status="unavailable",
@@ -3946,7 +3939,7 @@ def _ai_usage_sync(fresh: bool = False, only_provider: Optional[str] = None) -> 
             results[provider] = result
 
         providers = []
-        for provider in _AI_USAGE_PROVIDER_ORDER:
+        for provider in _provider_ids():
             providers.append(results[provider])
             providers.extend(account_cards.get(provider) or [])
         payload = {
@@ -3960,6 +3953,7 @@ def _ai_usage_sync(fresh: bool = False, only_provider: Optional[str] = None) -> 
                 "credentials_returned_to_desktop": False,
                 "browser_cookies_read": False,
                 "external_requests": "Direct authenticated quota requests to the configured providers only",
+                "external_hosts": sorted({host for adapter in _provider_adapters().values() for host in adapter.hosts}),
             },
         }
         _ai_usage_cache = (time.time(), copy.deepcopy(payload))
@@ -3992,17 +3986,9 @@ def _fold_usage_last_success(provider: str, result: Dict[str, Any]) -> Dict[str,
     return result
 
 
-# Registry ids (and their aliases) already covered by a usage collector.
-_USAGE_COVERED_PROVIDER_IDS = {
-    "openai-codex", "codex",
-    "anthropic", "anthropic-oauth", "claude",
-    "nous",
-    "openrouter",
-    "deepseek",
-    "xai", "xai-oauth", "grok",
-    "kimi", "kimi-coding", "kimi-coding-cn", "moonshot",
-    "zai", "zai-coding",
-}
+# Hermes registry ids (and their aliases) already covered by a provider
+# adapter, as each adapter declares them (registered at package import).
+_USAGE_COVERED_PROVIDER_IDS = _usage_covered_provider_ids()
 
 
 def _usage_unsupported_configured() -> List[Dict[str, str]]:
@@ -4029,16 +4015,8 @@ def _usage_unsupported_configured() -> List[Dict[str, str]]:
     return unique
 
 
-_USAGE_BILLING_KEYS = {
-    "codex": ("openai-codex",),
-    "anthropic": ("anthropic-oauth", "anthropic"),
-    "nous": ("nous",),
-    "openrouter": ("openrouter",),
-    "deepseek": ("deepseek",),
-    "grok": ("xai-oauth",),
-    "kimi": ("kimi-coding", "kimi-coding-cn"),
-    "zai": ("zai", "zai-coding"),
-}
+# billing_provider values that join local records to each provider adapter.
+_USAGE_BILLING_KEYS = _usage_billing_keys()
 
 
 def _usage_recorded_7d() -> Dict[str, Dict[str, Any]]:
@@ -4313,9 +4291,9 @@ def _month_bounds(now: Optional[float] = None) -> Tuple[float, float]:
 
 
 def _budget_provider_label(provider_id: str) -> str:
-    meta = _AI_USAGE_PROVIDER_META.get(provider_id) or _SERVICE_META.get(provider_id)
-    if meta:
-        return str(meta["label"])
+    label = _adapter_label(provider_id)
+    if label:
+        return label
     route = _MODEL_ROUTE_META.get(provider_id) or {}
     return str(route.get("provider") or _humanize_identifier(provider_id))
 
@@ -4579,7 +4557,7 @@ def _ai_usage_refresh_provider(provider: str, collector: Any) -> Optional[Dict[s
         result = _provider_payload(
             provider,
             status="not_configured",
-            message=_AI_USAGE_NOT_CONFIGURED_MESSAGES.get(provider),
+            message=_provider_not_configured_message(provider),
         )
     recorded = _usage_recorded_7d()
     with _ai_usage_cache_lock:
@@ -4611,6 +4589,14 @@ def _ai_usage_refresh_provider(provider: str, collector: Any) -> Optional[Dict[s
 @router.get("/ai-usage")
 async def ai_usage(fresh: bool = False, provider: Optional[str] = None) -> Dict[str, Any]:
     return await asyncio.to_thread(_ai_usage_sync, fresh, provider)
+
+
+@router.get("/adapters")
+async def adapters_route() -> Dict[str, Any]:
+    """Every provider and service adapter registered, with the hosts each contacts. No network, no credentials."""
+    payload = _adapters_catalog()
+    payload["generated_at"] = time.time()
+    return payload
 
 
 @router.get("/services")
@@ -4656,8 +4642,10 @@ def _system_sync() -> Dict[str, Any]:
                 "network_upload": False,
                 "provider_usage_requests": True,
                 "provider_credentials_returned_to_desktop": False,
+                "external_hosts": _adapter_hosts(),
                 "mutation_endpoints": 0,
                 "snippets_redacted_and_bounded": True,
+                "failure_signatures_language": "english",
                 "database_connection": "Hermes SessionDB(read_only=True)",
             },
             "capabilities": _compat_capabilities(),

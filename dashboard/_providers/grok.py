@@ -135,4 +135,26 @@ def _collect_grok_usage() -> Dict[str, Any]:
         partial=bool(errors),
     )
 
+
+def _probe_grok() -> bool:
+    try:
+        from hermes_cli.auth import AuthError, resolve_xai_oauth_runtime_credentials
+    except ImportError:
+        return True
+    try:
+        credentials = resolve_xai_oauth_runtime_credentials(refresh_if_expiring=False) or {}
+    except AuthError:
+        return False
+    return bool(str(credentials.get("api_key") or "").strip())
+
+
+register_provider(
+    "grok", "Grok", "Hermes xAI OAuth", _collect_grok_usage,
+    probe=_probe_grok,
+    not_configured_message="No Hermes xAI OAuth login was found.",
+    billing_keys=("xai-oauth",),
+    registry_ids=("xai", "xai-oauth", "grok"),
+    hosts=("cli-chat-proxy.grok.com",), order=60, module=__name__,
+)
+
 __all__ = [name for name in globals() if not name.startswith("__")]

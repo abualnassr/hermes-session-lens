@@ -5,32 +5,29 @@ from __future__ import annotations
 try:
     from .._common import *
     from .._hermes_compat import *
+    from .._adapters import *
 except ImportError:  # pragma: no cover
     from _common import *
     from _hermes_compat import *
+    from _adapters import *
 
-_AI_USAGE_PROVIDER_META = {
-    "codex": {"label": "OpenAI Codex", "auth_source": "Hermes OAuth"},
-    "anthropic": {"label": "Anthropic Claude", "auth_source": "Hermes OAuth"},
-    "nous": {"label": "Nous Research Portal", "auth_source": "Hermes OAuth"},
-    "openrouter": {"label": "OpenRouter", "auth_source": "Hermes API key"},
-    "deepseek": {"label": "DeepSeek", "auth_source": "Hermes API key"},
-    "grok": {"label": "Grok", "auth_source": "Hermes xAI OAuth"},
-    "kimi": {"label": "Kimi Code Plan", "auth_source": "Hermes API key"},
-    "zai": {"label": "Z.AI GLM Coding Plan", "auth_source": "Hermes API key"},
-}
-_AI_USAGE_PROVIDER_ORDER = tuple(_AI_USAGE_PROVIDER_META)
+def _provider_meta(provider: str) -> Dict[str, str]:
+    """Label and auth source for a registered provider id (KeyError otherwise)."""
+    adapter = _provider_adapters().get(provider)
+    if adapter is None:
+        raise KeyError(provider)
+    return {"label": adapter.label, "auth_source": adapter.auth_source}
 
-_AI_USAGE_NOT_CONFIGURED_MESSAGES = {
-    "codex": "No Hermes OpenAI Codex OAuth login was found.",
-    "anthropic": "No Hermes Anthropic OAuth login was found.",
-    "nous": "No Nous Portal login was found.",
-    "openrouter": "No Hermes OpenRouter API key was found.",
-    "deepseek": "No Hermes DeepSeek API key was found.",
-    "grok": "No Hermes xAI OAuth login was found.",
-    "kimi": "No Hermes Kimi Code Plan API key was found.",
-    "zai": "No Hermes Z.AI API key was found.",
-}
+
+def _provider_not_configured_message(provider: str) -> Optional[str]:
+    adapter = _provider_adapters().get(provider)
+    return adapter.not_configured_message if adapter else None
+
+
+def _default_key_probe(provider: str) -> bool:
+    """Probe for key-based providers: does Hermes resolve an API key for this id?"""
+    token, _base_url = _resolve_hermes_api_key(provider)
+    return bool(token)
 
 
 def _probe_usage_provider(provider: str) -> bool:
@@ -41,44 +38,15 @@ def _probe_usage_provider(provider: str) -> bool:
     request) is skipped. Conservative by design — any uncertainty (missing
     Hermes modules, probe errors) returns True so the collector still runs and
     reports its own status; a probe must never hide a configured provider.
+
+    Each adapter supplies its own probe (OAuth logins, portal accounts); the
+    default resolves a Hermes API key for the provider id.
     """
+    adapter = _provider_adapters().get(provider)
     try:
-        if provider == "codex":
-            try:
-                from hermes_cli.auth import AuthError, _read_codex_tokens
-            except ImportError:
-                return True
-            try:
-                data = _read_codex_tokens()
-            except AuthError:
-                return False
-            tokens = (data or {}).get("tokens") or {}
-            return bool(tokens.get("access_token") or tokens.get("refresh_token"))
-        if provider == "anthropic":
-            try:
-                from agent import anthropic_adapter
-            except ImportError:
-                return True
-            return bool(str(anthropic_adapter.resolve_anthropic_token() or "").strip())
-        if provider == "nous":
-            try:
-                from hermes_cli.nous_account import get_nous_portal_account_info
-            except ImportError:
-                return True
-            account = get_nous_portal_account_info(force_fresh=False)
-            return bool(getattr(account, "logged_in", False))
-        if provider == "grok":
-            try:
-                from hermes_cli.auth import AuthError, resolve_xai_oauth_runtime_credentials
-            except ImportError:
-                return True
-            try:
-                credentials = resolve_xai_oauth_runtime_credentials(refresh_if_expiring=False) or {}
-            except AuthError:
-                return False
-            return bool(str(credentials.get("api_key") or "").strip())
-        token, _base_url = _resolve_hermes_api_key(provider)
-        return bool(token)
+        if adapter is not None and adapter.probe is not None:
+            return bool(adapter.probe())
+        return _default_key_probe(provider)
     except Exception:
         return True
 
@@ -144,7 +112,7 @@ def _provider_payload(
     message: Optional[str] = None,
     partial: bool = False,
 ) -> Dict[str, Any]:
-    meta = _AI_USAGE_PROVIDER_META[provider]
+    meta = _provider_meta(provider)
     return {
         "provider": provider,
         "label": meta["label"],

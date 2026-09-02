@@ -32,6 +32,32 @@ from dashboard import _hermes_compat as hermes_compat
 from dashboard import _routes as api
 from dashboard import _services as services
 from dashboard import _rules as rules_mod
+from dashboard._providers import shared as provider_shared
+
+import contextlib
+
+
+@contextlib.contextmanager
+def _provider_collectors(mapping):
+    """Swap provider collectors on the adapter registry.
+
+    Keys may be adapter ids ("codex") or the historical collector names
+    ("_collect_codex_usage"); values are the fakes to call instead.
+    """
+    with contextlib.ExitStack() as stack:
+        for name, fake in mapping.items():
+            provider = name.removeprefix("_collect_").removesuffix("_usage")
+            stack.enter_context(patch.object(api._provider_adapters()[provider], "collect", fake))
+        yield
+
+
+@contextlib.contextmanager
+def _service_collectors(mapping):
+    """Swap service collectors on the adapter registry, by service id."""
+    with contextlib.ExitStack() as stack:
+        for service_id, fake in mapping.items():
+            stack.enter_context(patch.object(api._service_adapters()[service_id], "collect", fake))
+        yield
 
 
 def tool_rows(name: str, arguments: dict | None = None, result: str = "Done!"):
@@ -1093,7 +1119,10 @@ process.stdout.write(JSON.stringify(out))
         self.assertIn("ctx.storage.set(RULES_STORAGE_KEY, rules)", source)
         self.assertIn("jsx(RulesView, { ctx, period, onDrill: drillToSessions, rules, onRulesChange: setRules, availableProfiles })", source)
         self.assertIn("ctx.rest(apiPath('/rules', { ...period, rules: rulesParam, min_samples: minSamples }))", source)
-        self.assertIn("TRIAL SEED", source)
+        # The trial seed was removed before the public release: a fresh install opens empty.
+        self.assertNotIn("TRIAL SEED", source)
+        self.assertNotIn("RULES_TRIAL_SEED", source)
+        self.assertNotIn("rulesSeeded", source)
         # The desktop builder mirrors the backend grammar and preset compiler.
         for needle in ("function renderSentence(entry, params)", "function compilePreset(preset, params, catalog)", "function migrateRule(rule, catalog)",
                        "function ClauseRow({ catalog, side, clause, onChange, onRemove, directory })", "label: 'Preset'", "'Then the model must'"):
@@ -1815,7 +1844,7 @@ process.stdout.write(JSON.stringify(out))
             "_collect_kimi_usage": Mock(return_value=ok("kimi")),
             "_collect_zai_usage": Mock(return_value=ok("zai")),
         }
-        with patch.multiple(api, **collectors):
+        with _provider_collectors(collectors):
             payload = api._ai_usage_sync(True)
         ids = [item["provider"] for item in payload["providers"]]
         self.assertIn("anthropic:1", ids)
@@ -1845,7 +1874,7 @@ process.stdout.write(JSON.stringify(out))
             "_collect_kimi_usage": Mock(return_value=ok("kimi")),
             "_collect_zai_usage": Mock(return_value=ok("zai")),
         }
-        with patch.multiple(api, **first):
+        with _provider_collectors(first):
             fresh = api._ai_usage_sync(True)
             cached = api._ai_usage_sync(False)
         self.assertEqual(fresh["summary"]["connected"], 8)
@@ -1867,7 +1896,7 @@ process.stdout.write(JSON.stringify(out))
             "_collect_kimi_usage": Mock(return_value=ok("kimi")),
             "_collect_zai_usage": Mock(return_value=ok("zai")),
         }
-        with patch.multiple(api, **failing):
+        with _provider_collectors(failing):
             refreshed = api._ai_usage_sync(True)
         grok = next(item for item in refreshed["providers"] if item["provider"] == "grok")
         self.assertEqual(grok["status"], "stale")
@@ -1895,7 +1924,7 @@ process.stdout.write(JSON.stringify(out))
             "_collect_kimi_usage": Mock(return_value=api._provider_payload("kimi", status="not_configured")),
             "_collect_zai_usage": Mock(return_value=api._provider_payload("zai", status="not_configured")),
         }
-        with patch.multiple(api, **collectors):
+        with _provider_collectors(collectors):
             payload = api._ai_usage_sync(True)
         grok = next(item for item in payload["providers"] if item["provider"] == "grok")
         self.assertEqual(grok["status"], "expired")
@@ -1938,10 +1967,10 @@ process.stdout.write(JSON.stringify(out))
 
         collectors = {
             f"_collect_{provider}_usage": Mock(return_value=ok(provider))
-            for provider in api._AI_USAGE_PROVIDER_ORDER
+            for provider in api._provider_ids()
         }
         with patch.object(api, "_probe_usage_provider", side_effect=lambda p: p in {"codex", "openrouter"}):
-            with patch.multiple(api, **collectors):
+            with _provider_collectors(collectors):
                 payload = api._ai_usage_sync(True)
         collectors["_collect_codex_usage"].assert_called_once()
         collectors["_collect_openrouter_usage"].assert_called_once()
@@ -1957,7 +1986,7 @@ process.stdout.write(JSON.stringify(out))
     def test_ai_usage_probe_is_conservative_outside_hermes(self):
         # Without Hermes modules the probes cannot prove absence, so every
         # provider stays eligible and its collector reports the real status.
-        for provider in api._AI_USAGE_PROVIDER_ORDER:
+        for provider in api._provider_ids():
             self.assertTrue(api._probe_usage_provider(provider), provider)
 
     def test_ai_usage_ui_hides_unconfigured_providers_behind_summary_line(self):
@@ -1977,20 +2006,20 @@ process.stdout.write(JSON.stringify(out))
 
         first = {
             f"_collect_{provider}_usage": Mock(return_value=ok(provider, 25))
-            for provider in api._AI_USAGE_PROVIDER_ORDER
+            for provider in api._provider_ids()
         }
-        with patch.multiple(api, **first):
+        with _provider_collectors(first):
             api._ai_usage_sync(True)
         cached_at = api._ai_usage_cache[0]
 
         second = {
             f"_collect_{provider}_usage": Mock(return_value=ok(provider, 60))
-            for provider in api._AI_USAGE_PROVIDER_ORDER
+            for provider in api._provider_ids()
         }
-        with patch.multiple(api, **second):
+        with _provider_collectors(second):
             payload = api._ai_usage_sync(True, "grok")
         second["_collect_grok_usage"].assert_called_once()
-        for provider in api._AI_USAGE_PROVIDER_ORDER:
+        for provider in api._provider_ids():
             if provider != "grok":
                 second[f"_collect_{provider}_usage"].assert_not_called()
         by_provider = {item["provider"]: item for item in payload["providers"]}
@@ -2027,9 +2056,9 @@ process.stdout.write(JSON.stringify(out))
                 return_value=api._provider_payload(provider, status="ok",
                                                   windows=[api._usage_window("Weekly", used_percent=10)])
             )
-            for provider in api._AI_USAGE_PROVIDER_ORDER
+            for provider in api._provider_ids()
         }
-        with patch.multiple(api, **collectors):
+        with _provider_collectors(collectors):
             payload = api._ai_usage_sync(True)
         kimi = next(item for item in payload["providers"] if item["provider"] == "kimi")
         self.assertEqual(kimi["recorded_7d"]["tokens"], 1800)
@@ -2064,10 +2093,10 @@ process.stdout.write(JSON.stringify(out))
             f"_collect_{provider}_usage": Mock(
                 return_value=api._provider_payload(provider, status="not_configured")
             )
-            for provider in api._AI_USAGE_PROVIDER_ORDER
+            for provider in api._provider_ids()
         }
         with patch.object(api, "_hermes_configured_provider_ids", return_value=["nvidia"]):
-            with patch.multiple(api, **collectors):
+            with _provider_collectors(collectors):
                 payload = api._ai_usage_sync(True)
         self.assertEqual(payload["hermes_configured_unsupported"], [{"id": "nvidia", "label": "NVIDIA"}])
 
@@ -3159,7 +3188,7 @@ process.stdout.write(JSON.stringify(out))
             "brightdata": Mock(return_value=services._service_payload("brightdata", status="forbidden", message="no permission")),
             "monid": Mock(return_value=services._service_payload("monid", status="ok", windows=[])),
         }
-        with patch.dict(services._SERVICE_COLLECTORS, collectors, clear=True), \
+        with _service_collectors(collectors), \
              patch.object(services.shutil, "which", side_effect=lambda name: "monid" if name == "monid" else None):
             payload = services._services_sync(fresh=True)
         ids = [card["provider"] for card in payload["cards"]]
@@ -3216,6 +3245,84 @@ process.stdout.write(JSON.stringify(out))
         copy.write_bytes(source.read_bytes())
         completed = subprocess.run([node, "--check", str(copy)], capture_output=True, text=True, timeout=60)
         self.assertEqual(completed.returncode, 0, completed.stderr[-800:])
+
+
+class AdapterRegistryTests(unittest.TestCase):
+    """Vendors live in one module each and register themselves; dispatchers read the registry."""
+
+    def test_every_vendor_module_registers_itself(self):
+        root = MODULE_PATH.parent
+        for package, table in (("_providers", api._provider_adapters()), ("_services", api._service_adapters())):
+            modules = {path.stem for path in (root / package).glob("*.py") if not path.stem.startswith("_") and path.stem != "shared"}
+            registered = {str(adapter.module).rsplit(".", 1)[-1] for adapter in table.values()}
+            self.assertEqual(modules, registered, package)
+            for adapter in table.values():
+                self.assertEqual(adapter.kind, package.strip("_").rstrip("s"))
+
+    def test_registry_order_tables_and_declarations(self):
+        self.assertEqual(api._provider_ids(), ("codex", "anthropic", "nous", "openrouter", "deepseek", "grok", "kimi", "zai"))
+        self.assertEqual(api._service_ids(), ("firecrawl", "scrapecreators", "agentmail", "brightdata", "monid", "brave", "telegram", "herenow"))
+        self.assertEqual(api._USAGE_BILLING_KEYS["kimi"], ("kimi-coding", "kimi-coding-cn"))
+        self.assertEqual(api._BUDGET_BILLING_TO_PROVIDER["xai-oauth"], "grok")
+        self.assertTrue({"openai-codex", "claude", "moonshot", "zai-coding"} <= api._USAGE_COVERED_PROVIDER_IDS)
+        self.assertEqual(api._budget_provider_label("monid"), "Monid")
+        self.assertEqual(api._budget_provider_label("zai"), "Z.AI GLM Coding Plan")
+        self.assertEqual(api._provider_payload("grok", status="ok")["auth_source"], "Hermes xAI OAuth")
+        self.assertEqual(api._provider_not_configured_message("deepseek"), "No Hermes DeepSeek API key was found.")
+        self.assertIsNone(api._provider_not_configured_message("nope"))
+        with self.assertRaises(KeyError):
+            api._provider_payload("nope", status="ok")
+        for adapter in list(api._provider_adapters().values()) + list(api._service_adapters().values()):
+            if adapter.via == "direct":
+                self.assertTrue(adapter.hosts, adapter.id)
+            if not adapter.readable:
+                self.assertTrue(adapter.note, adapter.id)
+                self.assertEqual(adapter.via, "none")
+        self.assertEqual(services._service_for_mcp_name("scrape-creators-mcp"), "scrapecreators")
+        self.assertEqual(services._service_for_env_key("BRIGHT_DATA_API_KEY"), ("brightdata", None))
+        self.assertEqual(services._service_for_env_key("FIRECRAWL_API_KEY_N8N"), ("firecrawl", "n8n"))
+        with self.assertRaises(ValueError):
+            api.register_service("nothing", "Nothing", "Hermes .env key")
+        self.assertNotIn("nothing", api._service_ids())
+
+    def test_probe_dispatches_to_the_adapter(self):
+        codex = api._provider_adapters()["codex"]
+        with patch.object(codex, "probe", Mock(return_value=False)):
+            self.assertFalse(api._probe_usage_provider("codex"))
+        with patch.object(codex, "probe", Mock(side_effect=RuntimeError("boom"))):
+            self.assertTrue(api._probe_usage_provider("codex"))
+        with patch.object(provider_shared, "_resolve_hermes_api_key", return_value=("", None)):
+            self.assertFalse(api._probe_usage_provider("openrouter"))
+        with patch.object(provider_shared, "_resolve_hermes_api_key", return_value=("sk-x", None)):
+            self.assertTrue(api._probe_usage_provider("openrouter"))
+
+    def test_adapters_route_docs_and_readme_declare_every_host(self):
+        self.assertIn("/adapters", {getattr(route, "path", None) for route in api.router.routes})
+        payload = api._adapters_catalog()
+        json.dumps(payload)  # credential-free and serialisable
+        ids = [item["id"] for item in payload["providers"]] + [item["id"] for item in payload["services"]]
+        self.assertEqual(len(ids), len(set(ids)))
+        for item in payload["providers"] + payload["services"]:
+            self.assertNotIn("collect", item)
+            self.assertNotIn("probe", item)
+            self.assertIn(item["via"], {"direct", "hermes", "cli", "none"})
+        self.assertEqual(payload["hosts"], api._adapter_hosts())
+        self.assertIn("api.firecrawl.dev", payload["hosts"])
+        root = MODULE_PATH.parents[1]
+        readme = root.joinpath("README.md").read_text(encoding="utf-8")
+        for host in payload["hosts"]:
+            self.assertIn(host, readme, host)
+        self.assertIn("## Trust", readme)
+        self.assertIn("English", readme)
+        adapters_doc = root.joinpath("ADAPTERS.md").read_text(encoding="utf-8")
+        self.assertIn("register_provider(", adapters_doc)
+        self.assertIn("register_service(", adapters_doc)
+        routes_source = MODULE_PATH.read_text(encoding="utf-8")
+        self.assertIn('"external_hosts": _adapter_hosts(),', routes_source)
+        self.assertIn('"failure_signatures_language": "english",', routes_source)
+        plugin_source = root.joinpath("desktop", "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("['External hosts',", plugin_source)
+        self.assertIn("English error text", plugin_source)
 
 
 if __name__ == "__main__":

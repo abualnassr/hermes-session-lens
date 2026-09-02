@@ -46,6 +46,8 @@ The plugin appears in Hermes Desktop's left sidebar as **Session Lens** and open
 - AI Models treats OAuth quota as a shared provider-account limit, delays pace judgments until 10% of the billing period has elapsed, requires ten valid accepted tasks before showing per-task efficiency, distinguishes unavailable cache reporting from a recorded zero, separates bounded-log API-attempt failures from recorded tool-call failures, and does not estimate unavailable TTFT. Expanded work reliability measures main-role completed, clean, recovered, and terminally failed model/API task outcomes; ambiguous or uncovered evidence never becomes success. Comparable models require the configurable sample floor and rank by the lowest 95% Wilson upper failure bound. Acceptance is task-specific, and retry/switch excludes cross-role model routing. Rate metrics expose sample sizes, neutralize and demote samples below a configurable confidence floor, and suppress bounded-log failure/latency values on zero-request rows. Unknown routes resolve through explicit model-id globs and distinct historical model/family routes before becoming actionable unmapped states.
 - Skills must distinguish recorded invocation from merely available capabilities.
 - Local-first operation with no third-party telemetry upload. AI Usage makes direct authenticated quota requests only to the configured providers and never returns credentials to JavaScript.
+- Every vendor is one self-registering adapter module (`dashboard/_providers/`, `dashboard/_services/`) declaring its credential probe, collector, discovery keys, and the hosts it contacts; `GET /adapters` publishes the registry and the README Trust section lists every host, both checked by the test suite. An adapter is added only after its endpoint was verified against the live API.
+- Failure text signatures are English-only and documented as such; recorded Hermes error states count in any language, so non-English failure rates are a floor.
 - Operational readers load only when their view is opened and never poll faster than every 30 seconds.
 
 ## Brand Commitments
@@ -54,7 +56,7 @@ The plugin appears in Hermes Desktop's left sidebar as **Session Lens** and open
 - Sidebar label: **Session Lens**.
 - Repository name: `hermes-session-lens`.
 - Plugin id: `session-lens`.
-- Current documented release: `0.30.1`.
+- Current documented release: `0.31.0`.
 - The interface inherits Hermes Desktop's native components, typography, spacing, and theme variables.
 - Upstream inspiration is credited transparently; no upstream logo or endorsement is implied.
 

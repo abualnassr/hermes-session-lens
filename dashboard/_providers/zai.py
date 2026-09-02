@@ -125,4 +125,13 @@ def _collect_zai_usage() -> Dict[str, Any]:
         token = ""
         headers.clear()
 
+
+register_provider(
+    "zai", "Z.AI GLM Coding Plan", "Hermes API key", _collect_zai_usage,
+    not_configured_message="No Hermes Z.AI API key was found.",
+    billing_keys=("zai", "zai-coding"),
+    registry_ids=("zai", "zai-coding"),
+    hosts=("api.z.ai",), order=80, module=__name__,
+)
+
 __all__ = [name for name in globals() if not name.startswith("__")]

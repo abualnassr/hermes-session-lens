@@ -23,4 +23,23 @@ def _collect_nous_usage() -> Dict[str, Any]:
     except Exception as error:
         return _provider_payload("nous", status="unavailable", message=_provider_message(error))
 
+
+def _probe_nous() -> bool:
+    try:
+        from hermes_cli.nous_account import get_nous_portal_account_info
+    except ImportError:
+        return True
+    account = get_nous_portal_account_info(force_fresh=False)
+    return bool(getattr(account, "logged_in", False))
+
+
+register_provider(
+    "nous", "Nous Research Portal", "Hermes OAuth", _collect_nous_usage,
+    probe=_probe_nous,
+    not_configured_message="No Nous Portal login was found.",
+    billing_keys=("nous",),
+    registry_ids=("nous",),
+    hosts=("portal.nousresearch.com",), via="hermes", order=30, module=__name__,
+)
+
 __all__ = [name for name in globals() if not name.startswith("__")]

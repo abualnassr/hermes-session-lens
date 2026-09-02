@@ -104,7 +104,7 @@ components:
 
 Hermes Session Lens is an **Operate** surface inside Hermes Desktop: one native observatory connecting provider capacity and session evidence to accounting and operational health. It inherits Hermes typography, controls, codicons, focus behavior, and light/dark theme roles; it does not establish a separate brand skin.
 
-This design document describes Hermes Session Lens `0.30.1`.
+This design document describes Hermes Session Lens `0.31.0`.
 
 The interface is compact, quiet, and evidence-first. A user finds a session, verifies trace and accounting, then inspects runtime, profile, or schedule state without leaving Hermes. Progressive disclosure carries the density, while explicit provenance, bounded excerpts, and read-only language make the trust boundary visible.
 
@@ -226,7 +226,7 @@ The form language is compact and lightly softened. Native/select controls use re
 - **Monthly budgets:** A bordered list under the provider grid, one row per provider plus an "All providers" total: month-to-date spend with its source named (account / local records), the projected month-end figure, an inline cap field, and a two-layer bar (solid = spent, tinted = projected). Status pills read Over cap / On pace to exceed / Within cap / No cap in words; the projection basis is spelled out on hover.
 - **Burn attribution:** Each window ends with a collapsed "What consumed this window" line whose headline names the top two projects and their local share; expanding it reveals a Projects/Sessions/Models segmented list with share bars, token counts, and drill-through labels. Copy always says "local" and, for money windows, states the unexplained remainder rather than implying the account percentage is accounted for.
 - **Provider states:** Connected, not configured, expired or rejected, forbidden, unavailable, partial, and stale are stated in text. Stale data names the failed refresh while preserving the last successful reading.
-- **Trust boundary:** The view states that credentials stay in the Python backend, browser cookies are not read, and only normalized account usage reaches JavaScript.
+- **Trust boundary:** The view states that credentials stay in the Python backend, browser cookies are not read, and only normalized account usage reaches JavaScript. The System tab's privacy posture lists the external hosts the adapters declare (from `/system`) and states that failure signatures match English error text only; both come from the backend, never from copy alone.
 
 ### AI Models
 

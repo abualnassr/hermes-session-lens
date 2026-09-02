@@ -1131,7 +1131,7 @@ function FailureInspector({ failures, detectedTotal = 0 }) {
   if (!failures?.length) {
     return jsx(EmptyState, {
       title: 'No failures detected',
-      description: 'No recorded error state or conservative failure signature was found in the analyzed tool results.'
+      description: 'No recorded error state or conservative failure signature was found in the analyzed tool results. Signatures match English error text only; a tool that fails in another language counts only through a recorded error state.'
     })
   }
   return jsxs('div', {
@@ -2063,7 +2063,7 @@ function ToolsView({ ctx, period }) {
         }),
         jsx(SectionHeading, {
           title: 'Per-tool reliability',
-          description: 'Every individual tool, ranked failures-first. Failure signatures are conservative and inspectable per session.'
+          description: 'Every individual tool, ranked failures-first. Failure signatures are conservative, match English error text only, and are inspectable per session; recorded error states count in any language.'
         }),
         jsx(SimpleTable, {
           columns: [
@@ -3413,8 +3413,10 @@ function SystemView({ ctx }) {
                 ['Network upload', data.privacy.network_upload ? 'Enabled' : 'None'],
                 ['Provider usage checks', data.privacy.provider_usage_requests ? 'Direct to configured providers' : 'Disabled'],
                 ['Credentials in desktop UI', data.privacy.provider_credentials_returned_to_desktop ? 'Review required' : 'Never returned'],
+                ['External hosts', (data.privacy.external_hosts || []).length ? data.privacy.external_hosts.join(', ') : 'None declared'],
                 ['Mutation endpoints', String(data.privacy.mutation_endpoints)],
                 ['Snippets', data.privacy.snippets_redacted_and_bounded ? 'Redacted and bounded' : 'Review required'],
+                ['Failure signatures', data.privacy.failure_signatures_language === 'english' ? 'English error text only, plus recorded error states in any language' : 'Review required'],
                 ['Connection', data.privacy.database_connection],
                 ['Plugin version', data.plugin.version]
               ]
@@ -3532,15 +3534,6 @@ function ProfileScopePicker({ serving, available, scope, onChange }) {
 
 const RULES_STORAGE_KEY = 'rules'
 const RULES_MIN_SAMPLES_KEY = 'rulesMinSamples'
-
-// TRIAL SEED — Bandar's Kore profile rule, so the tab is not empty on first
-// open. Remove before a public release; a customer starts from the empty state.
-const RULES_TRIAL_SEED = {
-  profile: 'voice-inbox',
-  rules: [
-    { id: 'kore-voice-reply', name: 'Kore voice reply', type: 'require_tool', when: { match: 'all', conditions: [] }, then: [{ kind: 'call_tool', params: { tool: 'text_to_speech', position: 'any', must_succeed: false }, negate: false }], profile: 'voice-inbox', enabled: true }
-  ]
-}
 
 function newRuleId() {
   return `rule-${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 6)}`
@@ -4396,13 +4389,6 @@ function SessionLensPage({ ctx }) {
   const availableProfiles = (profileListQuery.data?.profiles || [])
     .map(item => item?.name)
     .filter(Boolean)
-  useEffect(() => {
-    // TRIAL SEED (see RULES_TRIAL_SEED): first open on a machine with the Kore profile.
-    if (rules.length || ctx.storage.get('rulesSeeded')) return
-    if (!availableProfiles.includes(RULES_TRIAL_SEED.profile)) return
-    ctx.storage.set('rulesSeeded', true)
-    setRules(RULES_TRIAL_SEED.rules)
-  }, [ctx, rules.length, availableProfiles])
   const scopeInitRef = useRef(false)
   useEffect(() => {
     ctx.storage.set('profileScope', profileScope)

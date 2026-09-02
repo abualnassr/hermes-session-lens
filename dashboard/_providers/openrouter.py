@@ -159,4 +159,13 @@ def _collect_openrouter_usage() -> Dict[str, Any]:
         partial_message="; ".join(errors) if errors else None,
     )
 
+
+register_provider(
+    "openrouter", "OpenRouter", "Hermes API key", _collect_openrouter_usage,
+    not_configured_message="No Hermes OpenRouter API key was found.",
+    billing_keys=("openrouter",),
+    registry_ids=("openrouter",),
+    hosts=("openrouter.ai",), order=40, module=__name__,
+)
+
 __all__ = [name for name in globals() if not name.startswith("__")]

@@ -202,4 +202,22 @@ def _collect_anthropic_primary() -> Dict[str, Any]:
         token = ""
         tried_tokens.clear()
 
+
+def _probe_anthropic() -> bool:
+    try:
+        from agent import anthropic_adapter
+    except ImportError:
+        return True
+    return bool(str(anthropic_adapter.resolve_anthropic_token() or "").strip())
+
+
+register_provider(
+    "anthropic", "Anthropic Claude", "Hermes OAuth", _collect_anthropic_usage,
+    probe=_probe_anthropic,
+    not_configured_message="No Hermes Anthropic OAuth login was found.",
+    billing_keys=("anthropic-oauth", "anthropic"),
+    registry_ids=("anthropic", "anthropic-oauth", "claude"),
+    hosts=("api.anthropic.com",), order=20, module=__name__,
+)
+
 __all__ = [name for name in globals() if not name.startswith("__")]

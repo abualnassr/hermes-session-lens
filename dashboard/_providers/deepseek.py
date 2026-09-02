@@ -94,4 +94,13 @@ def _collect_deepseek_usage() -> Dict[str, Any]:
         token = ""
         headers.clear()
 
+
+register_provider(
+    "deepseek", "DeepSeek", "Hermes API key", _collect_deepseek_usage,
+    not_configured_message="No Hermes DeepSeek API key was found.",
+    billing_keys=("deepseek",),
+    registry_ids=("deepseek",),
+    hosts=("api.deepseek.com",), order=50, module=__name__,
+)
+
 __all__ = [name for name in globals() if not name.startswith("__")]

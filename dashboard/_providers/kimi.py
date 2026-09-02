@@ -144,4 +144,13 @@ def _collect_kimi_usage() -> Dict[str, Any]:
         token = ""
         headers.clear()
 
+
+register_provider(
+    "kimi", "Kimi Code Plan", "Hermes API key", _collect_kimi_usage,
+    not_configured_message="No Hermes Kimi Code Plan API key was found.",
+    billing_keys=("kimi-coding", "kimi-coding-cn"),
+    registry_ids=("kimi", "kimi-coding", "kimi-coding-cn", "moonshot"),
+    hosts=("api.kimi.com",), order=70, module=__name__,
+)
+
 __all__ = [name for name in globals() if not name.startswith("__")]
