@@ -3857,7 +3857,7 @@ function RulesView({ ctx, period, onDrill, rules, onRulesChange, availableProfil
       children: [
         jsx(SectionHeading, {
           title: 'Instruction rules',
-          description: 'State an instruction from your SOUL.md as a checkable rule, and Session Lens grades every recorded turn in the selected period against it, per model. Verdicts come from code, not from a judge: a rule either left a trace in the record or it is not offered here.',
+          description: 'Restate an instruction you give your agent (in SOUL.md, for example) as a rule built from a template, and Session Lens grades every recorded turn in the selected period against that rule, per model. Session Lens never reads SOUL.md and never interprets it: only the rules you enter here are checked. Verdicts come from code, not from a judge, so a rule is offered only if it leaves a trace in the record.',
           action: jsxs('div', {
             style: { alignItems: 'center', display: 'flex', flexShrink: 0, gap: '0.5rem' },
             children: [
