@@ -949,11 +949,13 @@ process.stdout.write(JSON.stringify(out))
         self.assertNotIn("empty", ids)
         self.assertIn("off", ids)
         by_id = {rule["id"]: rule for rule in parsed}
-        self.assertEqual(by_id["no-paths"]["params"]["patterns"], ["D:\\", "saved to"])
-        self.assertEqual(by_id["roots"]["params"]["tools"], ["write_file", "terminal"])
-        self.assertEqual(by_id["tts"]["params"]["position"], "any")
-        self.assertFalse(by_id["tts"]["params"]["must_succeed"])
-        self.assertTrue(by_id["tts-ok"]["params"]["must_succeed"])
+        self.assertEqual(by_id["no-paths"]["then"][0]["params"]["patterns"], ["D:\\", "saved to"])
+        self.assertEqual(by_id["roots"]["then"][0]["params"]["tools"], ["write_file", "terminal"])
+        self.assertEqual(by_id["tts"]["then"][0]["params"]["position"], "any")
+        self.assertFalse(by_id["tts"]["then"][0]["params"]["must_succeed"])
+        self.assertTrue(by_id["tts-ok"]["then"][0]["params"]["must_succeed"])
+        self.assertEqual(by_id["no-browser"]["when"], {"match": "all", "conditions": [{"kind": "has_tool_calls", "params": {}, "negate": False}]})
+        self.assertEqual(by_id["search-first"]["when"]["conditions"][0]["params"], {"tool": "browser_*"})
         self.assertFalse(by_id["off"]["enabled"])
         self.assertEqual(by_id["other-profile"]["profile"], "turkey-trip")
         self.assertEqual(rules_mod._parse_rules_param(""), [])
@@ -1022,7 +1024,9 @@ process.stdout.write(JSON.stringify(out))
         self.assertIn("Wilson", payload["definition"])
         # Sentences are human-readable.
         self.assertEqual(by_id["tts-before"]["sentence"], "Every reply must call text_to_speech before the final answer")
-        self.assertEqual(by_id["roots"]["sentence"], "write_file, terminal must stay inside D:\\Projects\\AssetNerve")
+        self.assertEqual(by_id["roots"]["sentence"], "Every reply must keep “write_file”, “terminal” inside “D:\\Projects\\AssetNerve”")
+        self.assertEqual(by_id["search-first"]["sentence"], "When browser_* was called, try web_search before using browser_* (within the same turn)")
+        self.assertEqual(by_id["tts-ok"]["sentence"], "Every reply must call text_to_speech at some point, and the call must succeed")
 
     def test_rules_turn_building_and_language_detection(self):
         session = {"id": "s", "model": "m", "profile": "p"}
@@ -1071,7 +1075,17 @@ process.stdout.write(JSON.stringify(out))
         routes = {route.path for route in api.router.routes}
         self.assertIn("/rules", routes)
         self.assertIn("/rules/templates", routes)
-        self.assertEqual({item["type"] for item in rules_mod.RULE_TEMPLATES}, set(rules_mod._EVALUATORS))
+        self.assertEqual({item["kind"] for item in rules_mod.CONDITIONS}, set(rules_mod._CONDITION_FUNCTIONS))
+        self.assertEqual({item["kind"] for item in rules_mod.EXPECTATIONS}, set(rules_mod._EXPECTATION_FUNCTIONS))
+        catalog = rules_mod._rules_catalog()
+        self.assertEqual([item["type"] for item in catalog["presets"]][:3], ["require_tool", "forbid_tool", "tool_order"])
+        for preset in rules_mod.PRESETS:
+            when, then = rules_mod._preset_compile(preset, {})
+            self.assertTrue(then, preset["type"])
+            for clause in when:
+                self.assertIn(clause["kind"], rules_mod._CONDITION_FUNCTIONS)
+            for clause in then:
+                self.assertIn(clause["kind"], rules_mod._EXPECTATION_FUNCTIONS)
         source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
         self.assertIn("{ id: 'rules', label: 'Rules', codicon: 'checklist' }", source)
         self.assertIn("if (activeRulesParam && path === '/digest') merged.rules = activeRulesParam", source)
@@ -1079,6 +1093,74 @@ process.stdout.write(JSON.stringify(out))
         self.assertIn("jsx(RulesView, { ctx, period, onDrill: drillToSessions, rules, onRulesChange: setRules, availableProfiles })", source)
         self.assertIn("ctx.rest(apiPath('/rules', { ...period, rules: rulesParam, min_samples: minSamples }))", source)
         self.assertIn("TRIAL SEED", source)
+        # The desktop builder mirrors the backend grammar and preset compiler.
+        for needle in ("function renderSentence(entry, params)", "function compilePreset(preset, params, catalog)", "function migrateRule(rule, catalog)",
+                       "function ClauseRow({ catalog, side, clause, onChange, onRemove })", "label: 'Start from'", "'Then the model must'"):
+            self.assertIn(needle, source)
+
+    def test_rules_when_then_builder_grades_custom_rules(self):
+        self._seed_rules_sessions()
+        custom = [
+            {"id": "cond-tool", "name": "Dashboard opens the browser", "when": [{"kind": "user_says", "params": {"patterns": ["dashboard"]}}],
+             "then": [{"kind": "call_tool", "params": {"tool": "browser_navigate"}}]},
+            {"id": "budget", "name": "Two calls max", "when": {"match": "all", "conditions": [{"kind": "has_tool_calls"}]},
+             "then": [{"kind": "max_calls", "params": {"tool": "*", "max": 2}}]},
+            {"id": "finish", "name": "Finish with text", "then": [{"kind": "ends_with_text"}]},
+            {"id": "fast", "name": "Instant", "then": [{"kind": "reply_within", "params": {"seconds": 0}}]},
+            {"id": "english", "name": "English replies", "then": [{"kind": "reply_language_is", "params": {"language": "english"}}]},
+            {"id": "any-of", "name": "Either request", "when": {"match": "any", "conditions": [{"kind": "user_says", "params": {"patterns": ["dashboard"]}}, {"kind": "user_says", "params": {"patterns": ["the site"]}}]},
+             "then": [{"kind": "call_tool", "params": {"tool": "write_file"}}]},
+            {"id": "negated-when", "name": "Text-only turns greet once", "when": [{"kind": "has_tool_calls", "negate": True}],
+             "then": [{"kind": "reply_count", "params": {"pattern": "Abu Omar", "count": 1}}]},
+            {"id": "negated-then", "name": "Never greet", "then": [{"kind": "reply_contains", "params": {"patterns": ["Abu Omar"]}, "negate": True}]},
+            {"id": "no-terminal-rm", "name": "No rm -rf", "then": [{"kind": "args_avoid", "params": {"tool": "terminal", "patterns": ["rm -rf"]}}]},
+            {"id": "repeat", "name": "No repeats", "when": [{"kind": "has_tool_calls"}], "then": [{"kind": "no_repeat_calls"}]},
+            {"id": "broken", "name": "Unknown expectation", "then": [{"kind": "made_up"}]},
+            {"id": "empty-then", "name": "Nothing expected", "when": [{"kind": "has_tool_calls"}], "then": []},
+        ]
+        parsed = rules_mod._parse_rules_param(json.dumps(custom))
+        ids = [rule["id"] for rule in parsed]
+        self.assertNotIn("broken", ids)
+        self.assertNotIn("empty-then", ids)
+        payload = api._rules_evaluate_sync(parsed, 0, min_samples=1)
+        by_id = {rule["id"]: rule for rule in payload["rules"]}
+
+        def model_row(rule_id, model):
+            return next((item for item in by_id[rule_id]["models"] if item["model"] == model), None)
+
+        # WHEN narrows applicability: only alpha's "dashboard" turn counts, and it did open the browser.
+        self.assertEqual(by_id["cond-tool"]["applicable"], 1)
+        self.assertEqual(model_row("cond-tool", "model-alpha")["passed"], 1)
+        self.assertEqual(by_id["cond-tool"]["sentence"], "When the user message contains “dashboard”, call browser_navigate at some point")
+        # max_calls: beta's turn 2 made four calls.
+        self.assertEqual(model_row("budget", "model-beta")["failed"], 1)
+        self.assertIn("4 tool calls in one turn, limit 2", model_row("budget", "model-beta")["examples"][0]["reason"])
+        self.assertEqual(model_row("budget", "model-alpha")["failed"], 0)
+        # ends_with_text: alpha's turn 1 ended on the TTS result; beta's turns end with text.
+        self.assertEqual(model_row("finish", "model-alpha")["failed"], 1)
+        self.assertIn("ended on a text_to_speech result", model_row("finish", "model-alpha")["examples"][0]["reason"])
+        self.assertEqual(model_row("finish", "model-beta")["failed"], 0)
+        # reply_within with a zero budget fails every turn that has a first reply timestamp.
+        self.assertEqual(by_id["fast"]["failed"], by_id["fast"]["applicable"])
+        self.assertIn("first reply after 1s, limit 0s", model_row("fast", "model-alpha")["examples"][0]["reason"])
+        # reply_language_is english: alpha's Arabic reply fails; beta's English replies pass.
+        self.assertEqual(model_row("english", "model-alpha")["failed"], 1)
+        self.assertIn("reply was arabic, expected english", model_row("english", "model-alpha")["examples"][0]["reason"])
+        self.assertEqual(model_row("english", "model-beta")["failed"], 0)
+        # match=any: both "dashboard" (alpha) and "the site" (beta) turns count, both wrote a file.
+        self.assertEqual(by_id["any-of"]["applicable"], 2)
+        self.assertEqual(by_id["any-of"]["failed"], 0)
+        self.assertTrue(by_id["any-of"]["sentence"].startswith("When the user message contains “dashboard” or the user message contains “the site”, "))
+        # Negated WHEN: only beta's text-only turn 1 counts, and it greeted twice.
+        self.assertEqual(by_id["negated-when"]["applicable"], 1)
+        self.assertEqual(model_row("negated-when", "model-beta")["failed"], 1)
+        self.assertEqual(by_id["negated-when"]["sentence"], "When not (any tool was used), write Abu Omar exactly 1 time(s)")
+        # Negated THEN: every greeting turn fails.
+        self.assertEqual(by_id["negated-then"]["failed"], 3)  # alpha turn 1 greets in Arabic only
+        self.assertIn("did the opposite of the negated expectation", model_row("negated-then", "model-beta")["examples"][0]["reason"])
+        # No terminal calls in the fixture: not applicable anywhere, and never a phantom failure.
+        self.assertEqual(by_id["no-terminal-rm"]["applicable"], 0)
+        self.assertEqual(by_id["repeat"]["failed"], 0)
 
     def test_quota_exhaust_forecast_math(self):
         now = time.time()

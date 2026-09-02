@@ -39,7 +39,7 @@ The plugin appears in Hermes Desktop's left sidebar as **Session Lens** and open
 - Cross-profile accounting, gateway/platform health, and prompt-safe schedules.
 - Failure-first sorting, a dedicated failed-call inspector, Hermes FTS search with snippets, and cursor-style pagination up to 500 rows.
 - An Ask Lens workflow that produces a privacy-conscious, session-grounded prompt for analysis in Hermes.
-- Instruction rules: user-declared, template-based checks (required tool, forbidden tool, tool order, forbidden or required text, language match, forbidden mentions, path boundaries) graded per recorded turn and scored per model with sample-size-aware ranking; deterministic verdicts only, no LLM judge, no reading of SOUL.md.
+- Instruction rules: user-composed WHEN/THEN checks from a fixed catalog of conditions and expectations (tool calls, tool order and budgets, reply text, language, paths, argument values, timing), with presets for the common sentences, graded per recorded turn and scored per model with sample-size-aware ranking; deterministic verdicts only, no LLM judge, no reading of SOUL.md.
 - Export menus on every data view (CSV, JSON, Markdown digest) built in the desktop from read-only data, offered as a Save File download or a clipboard copy.
 - Read-only database access. The plugin must not mutate, archive, delete, or rewrite sessions.
 - Cost precedence: recorded actual cost, then recorded estimate, then a clearly labelled included or unpriced state.

@@ -1202,7 +1202,7 @@ async def digest(
 
 @router.get("/rules/templates")
 async def rules_templates() -> Dict[str, Any]:
-    return {"templates": RULE_TEMPLATES, "max_rules": RULES_MAX_RULES, "default_min_samples": RULES_DEFAULT_MIN_SAMPLES}
+    return _rules_catalog()
 
 
 @router.get("/rules")

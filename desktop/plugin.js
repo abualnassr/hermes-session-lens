@@ -3538,7 +3538,7 @@ const RULES_MIN_SAMPLES_KEY = 'rulesMinSamples'
 const RULES_TRIAL_SEED = {
   profile: 'voice-inbox',
   rules: [
-    { id: 'kore-voice-reply', name: 'Kore voice reply', type: 'require_tool', params: { tool: 'text_to_speech', position: 'any', must_succeed: false }, profile: 'voice-inbox', enabled: true }
+    { id: 'kore-voice-reply', name: 'Kore voice reply', type: 'require_tool', when: { match: 'all', conditions: [] }, then: [{ kind: 'call_tool', params: { tool: 'text_to_speech', position: 'any', must_succeed: false }, negate: false }], profile: 'voice-inbox', enabled: true }
   ]
 }
 
@@ -3557,41 +3557,108 @@ function ruleListText(value) {
   return Array.isArray(value) ? value.join('\n') : String(value || '')
 }
 
-function ruleSummary(rule, templates) {
-  const template = (templates || []).find(item => item.type === rule.type)
-  const params = rule.params || {}
-  const list = value => (Array.isArray(value) ? value : String(value || '').split(/[\r\n,]+/)).map(item => item.trim()).filter(Boolean)
-  switch (rule.type) {
-    case 'require_tool':
-      return `Every reply must call ${params.tool || '…'}${params.position === 'before_final' ? ' before the final answer' : ''}${params.must_succeed ? ', and the call must succeed' : ''}`
-    case 'forbid_tool':
-      return `${params.tool || '…'} must never be used`
-    case 'tool_order':
-      return `Before using ${params.tool || '…'}, ${params.before || '…'} must have been tried ${params.scope === 'session' ? 'earlier in the session' : 'in the same turn'}`
-    case 'forbid_text':
-      return `Replies must never contain ${list(params.patterns).map(item => `“${item}”`).join(', ') || '…'}`
-    case 'require_text_count':
-      return `Replies must contain “${params.pattern || '…'}” exactly ${Number(params.count ?? 1)} time${Number(params.count ?? 1) === 1 ? '' : 's'}`
-    case 'language_match':
-      return 'The reply language must match the user’s language'
-    case 'forbid_tool_mention':
-      return `Tool calls and results must never mention ${list(params.patterns).map(item => `“${item}”`).join(', ') || '…'}`
-    case 'path_boundary':
-      return `${list(params.tools).join(', ') || 'Tools'} must stay inside ${list(params.roots).join(', ') || '…'}`
-    default:
-      return template?.sentence || rule.type
-  }
+function ruleListItems(value) {
+  return (Array.isArray(value) ? value : String(value || '').split(/[\r\n,]+/)).map(item => String(item).trim()).filter(Boolean)
 }
 
-function ruleIsComplete(rule, templates) {
-  const template = (templates || []).find(item => item.type === rule.type)
-  if (!template) return false
-  return template.fields.every(field => {
+function catalogEntry(catalog, side, kind) {
+  const list = side === 'when' ? catalog?.conditions : catalog?.expectations
+  return (list || []).find(item => item.kind === kind) || null
+}
+
+function clauseDefaults(entry) {
+  const params = {}
+  for (const field of entry?.fields || []) params[field.key] = ruleFieldDefault(field)
+  return { kind: entry?.kind, params, negate: false }
+}
+
+// Mirrors the backend's sentence grammar: {field}, {field?text}, select labels, quoted lists.
+function renderSentence(entry, params) {
+  if (!entry) return ''
+  const fields = Object.fromEntries((entry.fields || []).map(field => [field.key, field]))
+  return entry.sentence.replace(/\{([a-z_]+)(\?([^}]*))?\}/g, (_match, key, conditional, text) => {
+    const value = params?.[key]
+    if (conditional !== undefined) return value ? text : ''
+    const field = fields[key] || {}
+    if (field.kind === 'list') {
+      const items = ruleListItems(value)
+      return items.length ? items.map(item => `“${item}”`).join(', ') : '…'
+    }
+    if (field.kind === 'select') {
+      const option = (field.options || []).find(([option]) => option === value)
+      return option ? option[1] : String(value || '…')
+    }
+    if (field.kind === 'bool') return value ? 'yes' : 'no'
+    const textValue = String(value ?? '').trim()
+    if (key === 'tool' && textValue === '*') return 'any tool'
+    return textValue || '…'
+  }).replace(/\s{2,}/g, ' ').trim()
+}
+
+function clauseSentence(catalog, side, clause) {
+  const entry = catalogEntry(catalog, side, clause?.kind)
+  const text = entry ? renderSentence(entry, clause.params) : String(clause?.kind || '')
+  return clause?.negate ? `not (${text})` : text
+}
+
+function ruleSentence(rule, catalog) {
+  if (!catalog) return rule?.name || ''
+  const conditions = (rule?.when?.conditions || []).filter(clause => clause.kind !== 'has_reply')
+  const thenText = (rule?.then || []).map(clause => clauseSentence(catalog, 'then', clause)).join(' and ') || '…'
+  if (!conditions.length) return `Every reply must ${thenText}`
+  const joiner = rule?.when?.match === 'any' ? ' or ' : ' and '
+  return `When ${conditions.map(clause => clauseSentence(catalog, 'when', clause)).join(joiner)}, ${thenText}`
+}
+
+// Presets compile to WHEN/THEN exactly as the backend does (see _preset_compile).
+function compilePreset(preset, params, catalog) {
+  const exposed = preset.map || {}
+  const clause = spec => {
+    const entry = catalogEntry(catalog, 'when', spec.kind) || catalogEntry(catalog, 'then', spec.kind)
+    const values = {}
+    for (const field of entry?.fields || []) {
+      const key = field.key
+      if (spec[key] !== undefined && key !== 'kind' && key !== 'from') values[key] = spec[key]
+      else if (Object.values(exposed).includes(key)) {
+        const source = Object.keys(exposed).find(src => exposed[src] === key) || key
+        if (params[source] !== undefined) values[key] = params[source]
+      }
+      if (values[key] === undefined && spec.from && key === 'tool') values[key] = params[spec.from]
+      if (values[key] === undefined) values[key] = ruleFieldDefault(field)
+    }
+    return { kind: spec.kind, params: values, negate: false }
+  }
+  return { when: { match: 'all', conditions: (preset.when || []).map(clause) }, then: (preset.then || []).map(clause) }
+}
+
+// Rules saved by the template stage carry `type` + `params` and no `then`.
+function migrateRule(rule, catalog) {
+  if (!rule || Array.isArray(rule.then) || !catalog) return rule
+  const preset = (catalog.presets || []).find(item => item.type === rule.type)
+  if (!preset) return rule
+  const compiled = compilePreset(preset, rule.params || {}, catalog)
+  return { ...rule, when: compiled.when, then: compiled.then, params: undefined }
+}
+
+function clauseIsComplete(catalog, side, clause) {
+  const entry = catalogEntry(catalog, side, clause?.kind)
+  if (!entry) return false
+  return entry.fields.every(field => {
     if (!field.required) return true
-    const value = rule.params?.[field.key]
-    if (field.kind === 'list') return (Array.isArray(value) ? value : String(value || '').split(/[\r\n,]+/)).some(item => item.trim())
+    const value = clause.params?.[field.key]
+    if (field.kind === 'list') return ruleListItems(value).length > 0
     return String(value ?? '').trim().length > 0
   })
+}
+
+function ruleIsComplete(rule, catalog) {
+  if (!catalog || !Array.isArray(rule?.then) || !rule.then.length) return false
+  return (rule.when?.conditions || []).every(clause => clauseIsComplete(catalog, 'when', clause))
+    && rule.then.every(clause => clauseIsComplete(catalog, 'then', clause))
+}
+
+function ruleSummary(rule, catalog) {
+  return ruleSentence(rule, catalog)
 }
 
 function enabledRulesParam(rules) {
@@ -3599,12 +3666,13 @@ function enabledRulesParam(rules) {
   return enabled.length ? JSON.stringify(enabled) : ''
 }
 
-function RuleField({ field, value, onChange }) {
+function RuleField({ field, value, onChange, compact }) {
   const label = jsx('span', { style: { color: color.tertiary, fontSize: '0.6875rem' }, children: field.label })
-  const hint = field.hint ? jsx('div', { style: { color: color.quaternary, fontSize: '0.625rem', marginTop: '0.2rem' }, children: field.hint }) : null
+  const hint = field.hint && !compact ? jsx('div', { style: { color: color.quaternary, fontSize: '0.625rem', marginTop: '0.2rem' }, children: field.hint }) : null
   if (field.kind === 'bool') {
     return jsxs('label', {
-      style: { alignItems: 'center', display: 'flex', gap: '0.45rem', fontSize: '0.75rem' },
+      title: field.hint,
+      style: { alignItems: 'center', display: 'flex', gap: '0.45rem', fontSize: '0.6875rem' },
       children: [
         jsx('input', { type: 'checkbox', checked: Boolean(value), onChange: event => onChange(event.target.checked) }),
         jsxs('span', { children: [field.label, hint] })
@@ -3621,16 +3689,18 @@ function RuleField({ field, value, onChange }) {
   }
   if (field.kind === 'list') {
     return jsxs('label', {
-      style: { display: 'grid', gap: '0.25rem' },
+      title: field.hint,
+      style: { display: 'grid', gap: '0.25rem', minWidth: '12rem' },
       children: [
         label,
-        jsx(Textarea, { value: ruleListText(value), placeholder: field.placeholder, rows: 3, onChange: event => onChange(event.target.value), style: { fontFamily: 'inherit', fontSize: '0.75rem' } }),
+        jsx(Textarea, { value: ruleListText(value), placeholder: field.placeholder, rows: 2, onChange: event => onChange(event.target.value), style: { fontFamily: 'inherit', fontSize: '0.75rem' } }),
         hint
       ]
     })
   }
   return jsxs('label', {
-    style: { display: 'grid', gap: '0.25rem' },
+    title: field.hint,
+    style: { display: 'grid', gap: '0.25rem', minWidth: field.kind === 'number' ? '5rem' : '10rem' },
     children: [
       label,
       jsx(Input, {
@@ -3645,42 +3715,94 @@ function RuleField({ field, value, onChange }) {
   })
 }
 
-function RuleEditor({ templates, availableProfiles, initial, onSave, onCancel }) {
-  const [draft, setDraft] = useState(() => {
-    const base = initial || { id: newRuleId(), name: '', type: templates[0]?.type || 'require_tool', params: {}, profile: null, enabled: true }
-    const template = templates.find(item => item.type === base.type) || templates[0]
-    const params = { ...base.params }
-    for (const field of template?.fields || []) if (params[field.key] === undefined) params[field.key] = ruleFieldDefault(field)
-    return { ...base, type: template?.type || base.type, params }
+function ClauseRow({ catalog, side, clause, onChange, onRemove }) {
+  const list = side === 'when' ? catalog.conditions : catalog.expectations
+  const entry = catalogEntry(catalog, side, clause.kind)
+  return jsxs('div', {
+    style: { alignItems: 'flex-start', background: color.surface, border, borderRadius: '5px', display: 'flex', flexWrap: 'wrap', gap: '0.6rem', padding: '0.5rem 0.6rem' },
+    children: [
+      jsx(NativeSelect, {
+        label: side === 'when' ? 'If' : 'Must',
+        value: clause.kind,
+        onChange: kind => onChange(clauseDefaults(catalogEntry(catalog, side, kind))),
+        children: list.map(item => jsx('option', { value: item.kind, children: item.label }, item.kind))
+      }),
+      ...(entry?.fields || []).map(field => jsx(RuleField, {
+        field,
+        compact: true,
+        value: clause.params?.[field.key],
+        onChange: value => onChange({ ...clause, params: { ...clause.params, [field.key]: value } })
+      }, field.key)),
+      jsxs('label', {
+        title: side === 'when' ? 'Count the turn only when this condition does NOT hold' : 'The model must NOT do this',
+        style: { alignItems: 'center', color: color.tertiary, display: 'flex', fontSize: '0.6875rem', gap: '0.3rem', marginLeft: 'auto', paddingTop: '1.1rem' },
+        children: [jsx('input', { type: 'checkbox', checked: Boolean(clause.negate), onChange: event => onChange({ ...clause, negate: event.target.checked }) }), 'not']
+      }),
+      jsx(Button, { variant: 'outline', size: 'xs', onClick: onRemove, title: 'Remove this clause', style: { marginTop: '0.9rem' }, children: jsx(Codicon, { name: 'close' }) })
+    ]
   })
-  const template = templates.find(item => item.type === draft.type) || templates[0]
-  const complete = ruleIsComplete(draft, templates)
-  const changeType = type => {
-    const next = templates.find(item => item.type === type)
-    if (!next) return
-    const params = {}
-    for (const field of next.fields) params[field.key] = ruleFieldDefault(field)
-    setDraft(current => ({ ...current, type, params }))
+}
+
+function RuleEditor({ catalog, availableProfiles, initial, onSave, onCancel }) {
+  const [draft, setDraft] = useState(() => {
+    const migrated = migrateRule(initial, catalog)
+    if (migrated && Array.isArray(migrated.then)) return { ...migrated, when: migrated.when || { match: 'all', conditions: [] } }
+    return { id: newRuleId(), name: '', type: 'custom', when: { match: 'all', conditions: [] }, then: [], profile: null, enabled: true }
+  })
+  const [presetType, setPresetType] = useState(initial?.type && initial.type !== 'custom' ? initial.type : '')
+  const complete = ruleIsComplete(draft, catalog)
+  const applyPreset = type => {
+    setPresetType(type)
+    const preset = (catalog.presets || []).find(item => item.type === type)
+    if (!preset) {
+      setDraft(current => ({ ...current, type: 'custom' }))
+      return
+    }
+    const compiled = compilePreset(preset, {}, catalog)
+    setDraft(current => ({ ...current, type, name: current.name || preset.label, when: compiled.when, then: compiled.then }))
   }
+  const setConditions = conditions => setDraft(current => ({ ...current, when: { ...current.when, conditions } }))
+  const setThen = then => setDraft(current => ({ ...current, then }))
+  const conditions = draft.when?.conditions || []
   const save = () => {
     if (!complete) return
-    const params = { ...draft.params }
-    for (const field of template.fields) {
-      if (field.kind === 'list') params[field.key] = String(params[field.key] || '').split(/[\r\n,]+/).map(item => item.trim()).filter(Boolean)
+    const normaliseClause = (side, clause) => {
+      const entry = catalogEntry(catalog, side, clause.kind)
+      const params = { ...clause.params }
+      for (const field of entry?.fields || []) if (field.kind === 'list') params[field.key] = ruleListItems(params[field.key])
+      return { kind: clause.kind, params, negate: Boolean(clause.negate) }
     }
-    onSave({ ...draft, params, name: draft.name.trim() || template.label, profile: draft.profile || null })
+    onSave({
+      id: draft.id,
+      name: draft.name.trim() || ruleSentence(draft, catalog).slice(0, 80),
+      type: draft.type || 'custom',
+      when: { match: draft.when?.match === 'any' ? 'any' : 'all', conditions: conditions.map(clause => normaliseClause('when', clause)) },
+      then: draft.then.map(clause => normaliseClause('then', clause)),
+      profile: draft.profile || null,
+      enabled: draft.enabled !== false
+    })
   }
+  const sectionTitle = (text, hint) => jsxs('div', {
+    style: { alignItems: 'baseline', display: 'flex', gap: '0.5rem' },
+    children: [
+      jsx('span', { style: { color: color.primary, fontSize: '0.75rem', fontWeight: 650 }, children: text }),
+      hint ? jsx('span', { style: { color: color.quaternary, fontSize: '0.625rem' }, children: hint }) : null
+    ]
+  })
   return jsxs('div', {
-    style: { background: color.surfaceRaised, border, borderRadius: '6px', display: 'grid', gap: '0.7rem', padding: '0.85rem 0.95rem' },
+    style: { background: color.surfaceRaised, border, borderRadius: '6px', display: 'grid', gap: '0.8rem', padding: '0.85rem 0.95rem' },
     children: [
       jsxs('div', {
-        style: { display: 'grid', gap: '0.7rem', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)' },
+        style: { display: 'grid', gap: '0.7rem', gridTemplateColumns: 'repeat(auto-fit, minmax(14rem, 1fr))' },
         children: [
           jsx(NativeSelect, {
-            label: 'Rule type',
-            value: draft.type,
-            onChange: changeType,
-            children: templates.map(item => jsx('option', { value: item.type, children: item.label }, item.type))
+            label: 'Start from',
+            value: presetType,
+            onChange: applyPreset,
+            children: [
+              jsx('option', { value: '', children: 'Blank rule' }, 'blank'),
+              ...(catalog.presets || []).map(item => jsx('option', { value: item.type, children: item.label }, item.type))
+            ]
           }),
           jsx(NativeSelect, {
             label: 'Profile',
@@ -3690,32 +3812,77 @@ function RuleEditor({ templates, availableProfiles, initial, onSave, onCancel })
               jsx('option', { value: '', children: 'Any profile in scope' }, 'any'),
               ...availableProfiles.map(name => jsx('option', { value: name, children: name }, name))
             ]
+          }),
+          jsxs('label', {
+            style: { display: 'grid', gap: '0.25rem' },
+            children: [
+              jsx('span', { style: { color: color.tertiary, fontSize: '0.6875rem' }, children: 'Name' }),
+              jsx(Input, { value: draft.name, placeholder: 'Short name for the scoreboard', onChange: event => setDraft(current => ({ ...current, name: event.target.value })) })
+            ]
           })
         ]
       }),
-      jsx('div', { style: { color: color.tertiary, fontSize: '0.6875rem' }, children: `${template.sentence} — applies to ${template.applies_to}.` }),
-      jsxs('label', {
-        style: { display: 'grid', gap: '0.25rem' },
-        children: [
-          jsx('span', { style: { color: color.tertiary, fontSize: '0.6875rem' }, children: 'Name' }),
-          jsx(Input, { value: draft.name, placeholder: template.label, onChange: event => setDraft(current => ({ ...current, name: event.target.value })) })
-        ]
-      }),
-      template.fields.length
-        ? jsx('div', {
-            style: { display: 'grid', gap: '0.6rem', gridTemplateColumns: 'repeat(auto-fit, minmax(16rem, 1fr))' },
-            children: template.fields.map(field => jsx(RuleField, {
-              field,
-              value: draft.params[field.key],
-              onChange: value => setDraft(current => ({ ...current, params: { ...current.params, [field.key]: value } }))
-            }, field.key))
-          })
-        : null,
       jsxs('div', {
-        style: { display: 'flex', gap: '0.5rem', justifyContent: 'flex-end' },
+        style: { display: 'grid', gap: '0.45rem' },
         children: [
+          jsxs('div', {
+            style: { alignItems: 'center', display: 'flex', gap: '0.6rem' },
+            children: [
+              sectionTitle('When', conditions.length ? null : 'no conditions — every reply counts'),
+              conditions.length > 1
+                ? jsx(NativeSelect, {
+                    label: 'Match',
+                    value: draft.when?.match === 'any' ? 'any' : 'all',
+                    onChange: match => setDraft(current => ({ ...current, when: { ...current.when, match } })),
+                    children: [jsx('option', { value: 'all', children: 'all conditions' }, 'all'), jsx('option', { value: 'any', children: 'any condition' }, 'any')]
+                  })
+                : null
+            ]
+          }),
+          ...conditions.map((clause, index) => jsx(ClauseRow, {
+            catalog,
+            side: 'when',
+            clause,
+            onChange: next => setConditions(conditions.map((item, position) => (position === index ? next : item))),
+            onRemove: () => setConditions(conditions.filter((_item, position) => position !== index))
+          }, `when-${index}`)),
+          jsx('div', {
+            children: jsx(Button, {
+              variant: 'outline', size: 'xs',
+              disabled: conditions.length >= (catalog.max_clauses || 12),
+              onClick: () => setConditions([...conditions, clauseDefaults(catalog.conditions[1] || catalog.conditions[0])]),
+              children: jsxs(Fragment, { children: [jsx(Codicon, { name: 'add' }), 'Add condition'] })
+            })
+          })
+        ]
+      }),
+      jsxs('div', {
+        style: { display: 'grid', gap: '0.45rem' },
+        children: [
+          sectionTitle('Then the model must', draft.then.length ? null : 'add at least one expectation'),
+          ...draft.then.map((clause, index) => jsx(ClauseRow, {
+            catalog,
+            side: 'then',
+            clause,
+            onChange: next => setThen(draft.then.map((item, position) => (position === index ? next : item))),
+            onRemove: () => setThen(draft.then.filter((_item, position) => position !== index))
+          }, `then-${index}`)),
+          jsx('div', {
+            children: jsx(Button, {
+              variant: 'outline', size: 'xs',
+              disabled: draft.then.length >= (catalog.max_clauses || 12),
+              onClick: () => setThen([...draft.then, clauseDefaults(catalog.expectations[0])]),
+              children: jsxs(Fragment, { children: [jsx(Codicon, { name: 'add' }), 'Add expectation'] })
+            })
+          })
+        ]
+      }),
+      jsxs('div', {
+        style: { alignItems: 'center', borderTop: border, display: 'flex', gap: '0.75rem', paddingTop: '0.7rem' },
+        children: [
+          jsx('div', { style: { color: complete ? color.secondary : color.quaternary, flex: 1, fontSize: '0.75rem', fontStyle: 'italic', minWidth: 0 }, children: ruleSentence(draft, catalog) }),
           jsx(Button, { variant: 'outline', size: 'xs', onClick: onCancel, children: 'Cancel' }),
-          jsx(Button, { variant: 'secondary', size: 'xs', disabled: !complete, onClick: save, title: complete ? 'Save this rule' : 'Fill in the required fields first', children: initial ? 'Save rule' : 'Add rule' })
+          jsx(Button, { variant: 'secondary', size: 'xs', disabled: !complete, onClick: save, title: complete ? 'Save this rule' : 'Fill in the required fields and add at least one expectation', children: initial ? 'Save rule' : 'Add rule' })
         ]
       })
     ]
@@ -3793,7 +3960,12 @@ function RulesView({ ctx, period, onDrill, rules, onRulesChange, availableProfil
     queryFn: () => ctx.rest('/rules/templates'),
     staleTime: Infinity
   })
-  const templates = templatesQuery.data?.templates || []
+  const catalog = templatesQuery.data?.conditions ? templatesQuery.data : null
+  useEffect(() => {
+    // Rules saved by the template stage migrate to WHEN/THEN once the catalog is known.
+    if (!catalog || !rules.some(rule => !Array.isArray(rule.then))) return
+    onRulesChange(rules.map(rule => migrateRule(rule, catalog)))
+  }, [catalog, rules, onRulesChange])
   const rulesParam = enabledRulesParam(rules)
   const evalQuery = useQuery({
     queryKey: [PLUGIN_ID, 'rules', period.days, period.start_at, period.end_at, rulesParam, minSamples],
@@ -3857,23 +4029,23 @@ function RulesView({ ctx, period, onDrill, rules, onRulesChange, availableProfil
       children: [
         jsx(SectionHeading, {
           title: 'Instruction rules',
-          description: 'Restate an instruction you give your agent (in SOUL.md, for example) as a rule built from a template, and Session Lens grades every recorded turn in the selected period against that rule, per model. Session Lens never reads SOUL.md and never interprets it: only the rules you enter here are checked. Verdicts come from code, not from a judge, so a rule is offered only if it leaves a trace in the record.',
+          description: 'Restate an instruction you give your agent (in SOUL.md, for example) as WHEN conditions and THEN expectations, and Session Lens grades every recorded turn in the selected period against it, per model. Start from a preset or build the rule clause by clause. Session Lens never reads SOUL.md and never interprets it: only the rules you enter here are checked. Verdicts come from code, not from a judge, so a check is offered only if it leaves a trace in the record.',
           action: jsxs('div', {
             style: { alignItems: 'center', display: 'flex', flexShrink: 0, gap: '0.5rem' },
             children: [
               jsx('input', { ref: fileInput, type: 'file', accept: 'application/json,.json', hidden: true, onChange: importRules }),
               jsx(Button, { variant: 'outline', size: 'xs', onClick: () => fileInput.current?.click(), title: 'Import rules from a JSON file exported here', children: jsxs(Fragment, { children: [jsx(Codicon, { name: 'cloud-upload' }), 'Import'] }) }),
               jsx(ExportMenu, { title: 'Export your rules or the scoreboard', items: exportItems }),
-              jsx(Button, { variant: 'secondary', size: 'xs', disabled: !templates.length || Boolean(editing), onClick: () => setEditing({ mode: 'new' }), children: jsxs(Fragment, { children: [jsx(Codicon, { name: 'add' }), 'Add rule'] }) })
+              jsx(Button, { variant: 'secondary', size: 'xs', disabled: !catalog || Boolean(editing), onClick: () => setEditing({ mode: 'new' }), children: jsxs(Fragment, { children: [jsx(Codicon, { name: 'add' }), 'Add rule'] }) })
             ]
           })
         }),
         templatesQuery.isError
-          ? jsx(ErrorBlock, { error: templatesQuery.error, onRetry: templatesQuery.refetch, title: 'Rule templates unavailable' })
+          ? jsx(ErrorBlock, { error: templatesQuery.error, onRetry: templatesQuery.refetch, title: 'Rule catalog unavailable' })
           : null,
-        editing
+        editing && catalog
           ? jsx(RuleEditor, {
-              templates,
+              catalog,
               availableProfiles,
               initial: editing.mode === 'edit' ? editing.rule : null,
               onSave: saveRule,
@@ -3903,10 +4075,10 @@ function RulesView({ ctx, period, onDrill, rules, onRulesChange, availableProfil
                         children: [
                           jsx('span', { style: { color: color.primary, fontSize: '0.75rem', fontWeight: 600 }, children: rule.name || rule.type }),
                           rule.profile ? jsx(Pill, { tone: 'accent', title: 'Only turns from this profile are graded', children: rule.profile }) : null,
-                          !ruleIsComplete(rule, templates) && templates.length ? jsx(Pill, { tone: 'danger', children: 'incomplete' }) : null
+                          catalog && !ruleIsComplete(rule, catalog) ? jsx(Pill, { tone: 'danger', children: 'incomplete' }) : null
                         ]
                       }),
-                      jsx('div', { style: { color: color.tertiary, fontSize: '0.6875rem' }, children: ruleSummary(rule, templates) })
+                      jsx('div', { style: { color: color.tertiary, fontSize: '0.6875rem' }, children: ruleSummary(rule, catalog) })
                     ]
                   }),
                   jsx(Button, { variant: 'outline', size: 'xs', disabled: Boolean(editing), onClick: () => setEditing({ mode: 'edit', rule }), children: 'Edit' }),
@@ -3916,7 +4088,7 @@ function RulesView({ ctx, period, onDrill, rules, onRulesChange, availableProfil
             })
           : jsx(EmptyState, {
               title: 'No rules yet',
-              description: 'Session Lens can check whether models followed your instructions. Add a rule to start — for example “Every reply must call text_to_speech” or “Replies must never contain D:\\”.'
+              description: 'Session Lens can check whether models followed your instructions. Add a rule to start — pick a preset such as “Every reply must call a tool”, or build one: when the user says “important”, the model must call memory.'
             }),
         rulesParam
           ? jsxs('section', {
@@ -3974,7 +4146,7 @@ function RulesView({ ctx, period, onDrill, rules, onRulesChange, availableProfil
                                       jsx('span', { style: { color: color.quaternary, fontSize: '0.625rem' }, children: rule.pass_rate == null ? 'no applicable turns' : `${formatCount(rule.applicable - rule.failed)} of ${formatCount(rule.applicable)} turns passed` })
                                     ]
                                   }),
-                                  jsx('div', { style: { color: color.tertiary, fontSize: '0.6875rem' }, children: `${rule.sentence}. Applies to ${rule.applies_to}.` })
+                                  jsx('div', { style: { color: color.tertiary, fontSize: '0.6875rem' }, children: rule.sentence })
                                 ]
                               }),
                               jsx(RuleModelsTable, { models: rule.models, minSamples, onDrill }),
