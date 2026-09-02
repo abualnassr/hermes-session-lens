@@ -584,6 +584,285 @@ function tableRowKey(row, index, columns) {
   return `${signature}\u001e${index}`
 }
 
+// ── Export helpers ────────────────────────────────────────────────────────
+// Exports are built in the desktop from data the page already holds (or the
+// same read-only routes it already calls); the backend gains no export route
+// and writes nothing. Downloads go through Electron's Save File dialog.
+function csvCell(value) {
+  if (value === null || value === undefined) return ''
+  if (typeof value === 'number') return Number.isFinite(value) ? String(value) : ''
+  if (typeof value === 'boolean') return value ? 'true' : 'false'
+  const text = typeof value === 'object' ? JSON.stringify(value) : String(value)
+  return /[",\r\n]/.test(text) || /^\s|\s$/.test(text) ? `"${text.replace(/"/g, '""')}"` : text
+}
+
+function toCsv(columns, rows) {
+  const header = columns.map(column => csvCell(column.label || column.key)).join(',')
+  const lines = (rows || []).map(row =>
+    columns.map(column => csvCell(column.value ? column.value(row) : row[column.key])).join(',')
+  )
+  return '\ufeff' + [header, ...lines].join('\r\n') + '\r\n'
+}
+
+function isoStamp(seconds) {
+  const number = Number(seconds)
+  return Number.isFinite(number) && number > 0 ? new Date(number * 1000).toISOString() : ''
+}
+
+function exportFilename(name, period, extension) {
+  const now = new Date()
+  const pad = value => String(value).padStart(2, '0')
+  const stamp = `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}-${pad(now.getHours())}${pad(now.getMinutes())}`
+  let scope = ''
+  if (period) {
+    if (period.start_at) scope = 'custom'
+    else scope = Number(period.days) > 0 ? `${period.days}d` : 'all'
+  }
+  return ['session-lens', name, scope, stamp].filter(Boolean).join('-') + '.' + extension
+}
+// ── End export helpers ────────────────────────────────────────────────────
+
+function downloadText(filename, text, mime) {
+  const blob = new Blob([text], { type: mime || 'text/plain;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = filename
+  anchor.rel = 'noopener'
+  anchor.style.display = 'none'
+  document.body.appendChild(anchor)
+  anchor.click()
+  anchor.remove()
+  setTimeout(() => URL.revokeObjectURL(url), 10_000)
+}
+
+async function copyText(text) {
+  if (navigator.clipboard?.writeText) {
+    await navigator.clipboard.writeText(text)
+    return
+  }
+  const area = document.createElement('textarea')
+  area.value = text
+  area.setAttribute('readonly', '')
+  area.style.position = 'fixed'
+  area.style.opacity = '0'
+  document.body.appendChild(area)
+  area.select()
+  try {
+    if (!document.execCommand('copy')) throw new Error('clipboard unavailable')
+  } finally {
+    area.remove()
+  }
+}
+
+function notifyHost(kind, message) {
+  try {
+    if (typeof host?.notify === 'function') host.notify({ kind, message })
+  } catch {
+    // The toast is a courtesy; the export already happened.
+  }
+}
+
+// Items: { id, label, hint?, filename, mime?, build: () => string | Promise<string> }.
+// Every item offers Download (Save File dialog) and Copy (clipboard).
+function ExportMenu({ items, label = 'Export', title = 'Export this view as CSV, JSON, or Markdown' }) {
+  const [open, setOpen] = useState(false)
+  const [busy, setBusy] = useState('')
+  const run = async (item, mode) => {
+    const key = `${item.id}:${mode}`
+    setBusy(key)
+    try {
+      const text = await item.build()
+      if (typeof text !== 'string' || !text.length) throw new Error('nothing to export')
+      if (mode === 'copy') {
+        await copyText(text)
+        notifyHost('success', `Copied ${item.label} to the clipboard.`)
+      } else {
+        downloadText(item.filename, text, item.mime)
+      }
+      setOpen(false)
+    } catch (error) {
+      notifyHost('error', `Export failed: ${error?.message || error}`)
+    } finally {
+      setBusy('')
+    }
+  }
+  const miniButton = (item, mode, icon, text) => jsxs('button', {
+    type: 'button',
+    role: 'menuitem',
+    disabled: Boolean(busy),
+    onClick: () => run(item, mode),
+    'aria-label': `${text} ${item.label}`,
+    title: mode === 'copy' ? `Copy ${item.label} to the clipboard` : `Save ${item.filename}`,
+    style: {
+      alignItems: 'center', background: color.surfaceRaised, border, borderRadius: '4px',
+      color: color.secondary, cursor: busy ? 'progress' : 'pointer', display: 'inline-flex',
+      font: 'inherit', fontSize: '0.625rem', gap: '0.25rem', padding: '0.2rem 0.45rem', whiteSpace: 'nowrap'
+    },
+    children: [
+      busy === `${item.id}:${mode}` ? jsx(SpinIcon, { size: '0.7rem' }) : jsx(Codicon, { name: icon, size: '0.7rem' }),
+      text
+    ]
+  })
+  if (!items?.length) return null
+  return jsxs('div', {
+    style: { flexShrink: 0, position: 'relative' },
+    children: [
+      jsx(Button, {
+        variant: 'outline',
+        size: 'xs',
+        'aria-haspopup': 'menu',
+        'aria-expanded': open,
+        title,
+        onClick: () => setOpen(value => !value),
+        children: jsxs(Fragment, { children: [jsx(Codicon, { name: 'export' }), label, jsx(Codicon, { name: 'chevron-down', size: '0.6rem' })] })
+      }),
+      open ? jsx('div', { onClick: () => setOpen(false), style: { inset: 0, position: 'fixed', zIndex: 29 } }) : null,
+      open
+        ? jsx('div', {
+            role: 'menu',
+            'aria-label': 'Export options',
+            style: { background: 'var(--popover, var(--background, Canvas))', border, borderRadius: '6px', boxShadow: '0 8px 24px rgba(0,0,0,0.28)', minWidth: '19rem', padding: '0.35rem', position: 'absolute', right: 0, top: 'calc(100% + 0.35rem)', zIndex: 30 },
+            children: items.map(item => jsxs('div', {
+              style: { alignItems: 'center', display: 'flex', gap: '0.5rem', justifyContent: 'space-between', padding: '0.35rem 0.45rem' },
+              children: [
+                jsxs('div', {
+                  style: { minWidth: 0 },
+                  children: [
+                    jsx('div', { style: { color: color.primary, fontSize: '0.6875rem', fontWeight: 600 }, children: item.label }),
+                    item.hint ? jsx('div', { style: { color: color.tertiary, fontSize: '0.625rem', lineHeight: 1.4 }, children: item.hint }) : null
+                  ]
+                }),
+                jsxs('div', {
+                  style: { display: 'flex', flexShrink: 0, gap: '0.3rem' },
+                  children: [miniButton(item, 'download', 'desktop-download', 'Download'), miniButton(item, 'copy', 'copy', 'Copy')]
+                })
+              ]
+            }, item.id))
+          })
+        : null
+    ]
+  })
+}
+
+const SESSION_EXPORT_COLUMNS = [
+  { key: 'id', label: 'Session ID' },
+  { key: 'title', label: 'Title' },
+  { key: 'profile', label: 'Profile' },
+  { key: 'source', label: 'Source' },
+  { key: 'model', label: 'Model' },
+  { key: 'billing_provider', label: 'Billing provider' },
+  { key: 'cwd', label: 'Working directory' },
+  { key: 'git_branch', label: 'Branch' },
+  { key: 'started_at', label: 'Started (UTC)', value: row => isoStamp(row.started_at) },
+  { key: 'ended_at', label: 'Ended (UTC)', value: row => isoStamp(row.ended_at) },
+  { key: 'duration_seconds', label: 'Duration (s)', value: row => row.duration_seconds == null ? '' : Math.round(Number(row.duration_seconds)) },
+  { key: 'outcome_label', label: 'Outcome' },
+  { key: 'end_reason', label: 'End reason' },
+  { key: 'message_count', label: 'Messages' },
+  { key: 'tool_call_count', label: 'Tool calls' },
+  { key: 'api_call_count', label: 'API calls' },
+  { key: 'failure_count', label: 'Failures' },
+  { key: 'input_tokens', label: 'Input tokens' },
+  { key: 'output_tokens', label: 'Output tokens' },
+  { key: 'cache_read_tokens', label: 'Cache read tokens' },
+  { key: 'cache_write_tokens', label: 'Cache write tokens' },
+  { key: 'reasoning_tokens', label: 'Reasoning tokens' },
+  { key: 'total_tokens', label: 'Total tokens' },
+  { key: 'display_cost_usd', label: 'Cost (USD)' },
+  { key: 'cost_kind', label: 'Cost kind' },
+  { key: 'cost_status', label: 'Cost status' }
+]
+
+const TOOL_EXPORT_COLUMNS = [
+  { key: 'name', label: 'Tool' },
+  { key: 'group', label: 'Source' },
+  { key: 'kind', label: 'Kind' },
+  { key: 'calls', label: 'Calls' },
+  { key: 'sessions', label: 'Sessions' },
+  { key: 'failures', label: 'Failures' },
+  { key: 'failure_rate', label: 'Failure rate' },
+  { key: 'log_calls', label: 'Logged calls' },
+  { key: 'latency_p50_seconds', label: 'Latency p50 (s)' },
+  { key: 'latency_p95_seconds', label: 'Latency p95 (s)' },
+  { key: 'context_tokens_estimate', label: 'Context tokens (est.)' },
+  { key: 'context_cost_usd', label: 'Context cost (USD)' },
+  { key: 'carried_tokens_estimate', label: 'Carried tokens (est., upper bound)' },
+  { key: 'carried_cost_usd', label: 'Carried cost (USD, upper bound)' },
+  { key: 'context_pricing', label: 'Context pricing' },
+  { key: 'last_used_at', label: 'Last used (UTC)', value: row => isoStamp(row.last_used_at) }
+]
+
+const TOOL_GROUP_EXPORT_COLUMNS = [
+  { key: 'name', label: 'Source' },
+  { key: 'kind', label: 'Kind' },
+  { key: 'tool_count', label: 'Tools' },
+  { key: 'calls', label: 'Calls' },
+  { key: 'sessions', label: 'Sessions' },
+  { key: 'failures', label: 'Failures' },
+  { key: 'failure_rate', label: 'Failure rate' },
+  { key: 'log_calls', label: 'Logged calls' },
+  { key: 'latency_p50_seconds', label: 'Latency p50 (s)' },
+  { key: 'latency_p95_seconds', label: 'Latency p95 (s)' },
+  { key: 'context_tokens_estimate', label: 'Context tokens (est.)' },
+  { key: 'context_cost_usd', label: 'Context cost (USD)' },
+  { key: 'carried_cost_usd', label: 'Carried cost (USD, upper bound)' },
+  { key: 'context_pricing', label: 'Context pricing' },
+  { key: 'last_used_at', label: 'Last used (UTC)', value: row => isoStamp(row.last_used_at) }
+]
+
+const MODEL_EXPORT_COLUMNS = [
+  { key: 'display_name', label: 'Model' },
+  { key: 'model_id', label: 'Model ID' },
+  { key: 'route_label', label: 'Route' },
+  { key: 'requests', label: 'Requests' },
+  { key: 'total_tokens', label: 'Total tokens' },
+  { key: 'input_tokens', label: 'Input tokens' },
+  { key: 'output_tokens', label: 'Output tokens' },
+  { key: 'cache_read_tokens', label: 'Cached tokens' },
+  { key: 'cost_usd', label: 'Cost (USD)' },
+  { key: 'cost_kind', label: 'Cost kind' },
+  { key: 'failure_rate', label: 'API fail rate', value: row => row.failures?.rate ?? '' },
+  { key: 'failure_samples', label: 'API fail samples', value: row => row.failures?.samples ?? '' },
+  { key: 'retry_switch_rate', label: 'Retry/switch rate' },
+  { key: 'retry_switch_samples', label: 'Retry/switch samples' },
+  { key: 'eligible_tasks', label: 'Eligible tasks', value: row => row.work_reliability?.eligible_tasks ?? '' },
+  { key: 'failure_rate_upper_bound_95', label: 'Work failure bound (95%)', value: row => row.work_reliability?.failure_rate_upper_bound_95 ?? '' },
+  { key: 'rank', label: 'Reliability rank', value: row => row.work_reliability?.rank ?? '' },
+  { key: 'latency_total_p50_seconds', label: 'Total latency p50 (s)', value: row => row.latency?.total_p50_seconds ?? '' },
+  { key: 'latency_total_p95_seconds', label: 'Total latency p95 (s)', value: row => row.latency?.total_p95_seconds ?? '' }
+]
+
+const OVERVIEW_MODEL_EXPORT_COLUMNS = [
+  { key: 'model', label: 'Model' },
+  { key: 'billing_provider', label: 'Provider' },
+  { key: 'sessions', label: 'Sessions' },
+  { key: 'total_tokens', label: 'Tokens' },
+  { key: 'cost_usd', label: 'Recorded cost (USD)' }
+]
+
+function digestExportItem(ctx, period) {
+  return {
+    id: 'digest-md',
+    label: 'Digest (Markdown)',
+    hint: 'Totals, attention, models, monthly spend, quota windows, service balances — the same text GET /digest returns for this period',
+    filename: exportFilename('digest', period, 'md'),
+    mime: 'text/markdown;charset=utf-8',
+    build: async () => String((await ctx.rest(apiPath('/digest', period)))?.markdown || '')
+  }
+}
+
+function jsonExportItem(id, label, hint, name, period, data) {
+  return {
+    id,
+    label,
+    hint,
+    filename: exportFilename(name, period, 'json'),
+    mime: 'application/json',
+    build: () => JSON.stringify(data ?? null, null, 2)
+  }
+}
+
 function SimpleTable({ columns, rows, emptyTitle = 'Nothing recorded', emptyDescription }) {
   const [sortState, setSortState] = useState(null)
   const sortedRows = useMemo(() => {
@@ -1309,6 +1588,32 @@ function SessionsView({ ctx, period, narrow, drill }) {
             'aria-pressed': failuresOnly,
             onClick: () => setFailuresOnly(value => !value),
             children: jsxs(Fragment, { children: [jsx(Codicon, { name: 'error' }), 'Failures only'] })
+          }),
+          jsx(ExportMenu, {
+            title: 'Export the sessions matching the current search, sort, and period',
+            items: (() => {
+              const params = { ...period, q: debouncedSearch, sort, failures_only: failuresOnly, limit: 500, offset: 0 }
+              const fetchPage = () => ctx.rest(apiPath('/sessions', params))
+              const hint = `Current filters and sort, up to 500 sessions${pagination?.total > 500 ? ` (${formatCount(pagination.total)} match)` : ''}`
+              return [
+                {
+                  id: 'sessions-csv',
+                  label: 'Sessions (CSV)',
+                  hint,
+                  filename: exportFilename('sessions', period, 'csv'),
+                  mime: 'text/csv;charset=utf-8',
+                  build: async () => toCsv(SESSION_EXPORT_COLUMNS, (await fetchPage())?.sessions || [])
+                },
+                {
+                  id: 'sessions-json',
+                  label: 'Sessions (JSON)',
+                  hint: 'Same rows with every recorded field, plus the filters used',
+                  filename: exportFilename('sessions', period, 'json'),
+                  mime: 'application/json',
+                  build: async () => JSON.stringify(await fetchPage(), null, 2)
+                }
+              ]
+            })()
           })
         ]
       }),
@@ -1529,7 +1834,25 @@ function OverviewView({ query, ctx, period }) {
       children: [
         jsxs('section', {
           children: [
-            jsx(SectionHeading, { title: 'Usage over time', description: 'Total recorded input, output, and cache tokens by local calendar day.' }),
+            jsx(SectionHeading, {
+              title: 'Usage over time',
+              description: 'Total recorded input, output, and cache tokens by local calendar day.',
+              action: jsx(ExportMenu, {
+                title: 'Export the digest or the overview tables for the selected period',
+                items: [
+                  digestExportItem(ctx, period),
+                  {
+                    id: 'overview-models-csv',
+                    label: 'Models (CSV)',
+                    hint: 'Per-model sessions, tokens, and recorded cost for this period',
+                    filename: exportFilename('overview-models', period, 'csv'),
+                    mime: 'text/csv;charset=utf-8',
+                    build: () => toCsv(OVERVIEW_MODEL_EXPORT_COLUMNS, data.models || [])
+                  },
+                  jsonExportItem('overview-json', 'Overview payload (JSON)', 'Daily bars, models, sources, and outcomes', 'overview', period, data)
+                ]
+              })
+            }),
             jsx(DailyBars, { rows: data.daily })
           ]
         }),
@@ -1653,7 +1976,29 @@ function ToolsView({ ctx, period }) {
       children: [
         jsx(SectionHeading, {
           title: 'Tools & MCP servers',
-          description: `${formatCount(data.totals.calls)} recorded calls across ${formatCount(data.totals.distinct_tools)} tools${data.totals.mcp_servers ? ` · ${formatCount(data.totals.mcp_servers)} MCP server${data.totals.mcp_servers === 1 ? '' : 's'}` : ''}. Latency comes from bounded local agent logs. Context weight estimates the tokens tool results push into model context (recorded result length ÷ 4) and prices them at each session's billing route via Hermes' pricing tables — hover a value for the direct and carried figures.`
+          description: `${formatCount(data.totals.calls)} recorded calls across ${formatCount(data.totals.distinct_tools)} tools${data.totals.mcp_servers ? ` · ${formatCount(data.totals.mcp_servers)} MCP server${data.totals.mcp_servers === 1 ? '' : 's'}` : ''}. Latency comes from bounded local agent logs. Context weight estimates the tokens tool results push into model context (recorded result length ÷ 4) and prices them at each session's billing route via Hermes' pricing tables — hover a value for the direct and carried figures.`,
+          action: jsx(ExportMenu, {
+            title: 'Export tool and MCP-server analytics for the selected period',
+            items: [
+              {
+                id: 'tools-csv',
+                label: 'Tools (CSV)',
+                hint: 'One row per tool: calls, failures, latency, context weight and cost',
+                filename: exportFilename('tools', period, 'csv'),
+                mime: 'text/csv;charset=utf-8',
+                build: () => toCsv(TOOL_EXPORT_COLUMNS, data.tools || [])
+              },
+              {
+                id: 'tool-groups-csv',
+                label: 'MCP servers & sources (CSV)',
+                hint: 'One row per MCP server or tool source',
+                filename: exportFilename('tool-sources', period, 'csv'),
+                mime: 'text/csv;charset=utf-8',
+                build: () => toCsv(TOOL_GROUP_EXPORT_COLUMNS, data.groups || [])
+              },
+              jsonExportItem('tools-json', 'Tools payload (JSON)', 'Everything this tab renders, including 7-day trends', 'tools', period, data)
+            ]
+          })
         }),
         jsx(SimpleTable, {
           columns: [
@@ -2890,7 +3235,7 @@ function ServicesSection({ query, narrow, history, onRefresh }) {
   })
 }
 
-function AIUsageView({ ctx, query, servicesQuery, narrow, refreshError, history, onRefreshProvider, onRefreshService, onDrill, budgets, onBudgetsChange }) {
+function AIUsageView({ ctx, query, servicesQuery, narrow, refreshError, history, onRefreshProvider, onRefreshService, onDrill, budgets, onBudgetsChange, period }) {
   if (query.isLoading) return jsx(LoadingBlock, { rows: 8 })
   if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'AI usage is unavailable' })
   const data = query.data
@@ -2905,7 +3250,15 @@ function AIUsageView({ ctx, query, servicesQuery, narrow, refreshError, history,
       children: [
         jsx(SectionHeading, {
           title: 'Provider allowances and balances',
-          description: 'Current account-level usage from the credentials already configured in Hermes. These limits are separate from Session Lens token and cost history.'
+          description: 'Current account-level usage from the credentials already configured in Hermes. These limits are separate from Session Lens token and cost history.',
+          action: jsx(ExportMenu, {
+            title: 'Export the digest or the current provider and service readings',
+            items: [
+              digestExportItem(ctx, period),
+              jsonExportItem('usage-json', 'Provider usage (JSON)', 'The readings shown on this tab, with attribution and recorded 7-day usage', 'ai-usage', null, query.data),
+              jsonExportItem('services-json', 'Services (JSON)', 'Non-model service balances and the "Everything configured" inventory', 'services', null, servicesQuery?.data)
+            ]
+          })
         }),
         refreshError
           ? jsx('div', {
@@ -3425,6 +3778,7 @@ function SessionLensPage({ ctx }) {
     }
   }
   if (tab === 'ai-usage') content = jsx(AIUsageView, {
+    period,
     ctx,
     budgets,
     onBudgetsChange: updateBudget,
@@ -3438,6 +3792,7 @@ function SessionLensPage({ ctx }) {
     onDrill: drillToSessions
   })
   if (tab === 'ai-models') content = jsx(AIModelsView, {
+    period,
     onDrill: drillToSessions,
     query: aiModelsQuery,
     quotaQuery: aiUsageQuery,
@@ -4489,7 +4844,7 @@ function AIModelsStatStrip({ data }) {
   })
 }
 
-function AIModelsView({ query, quotaQuery, narrow, refreshError, onDrill }) {
+function AIModelsView({ query, quotaQuery, narrow, refreshError, onDrill, period }) {
   if (query.isLoading) return jsx(LoadingBlock, { rows: 9 })
   if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'AI model analytics are unavailable' })
   const data = query.data
@@ -4503,13 +4858,32 @@ function AIModelsView({ query, quotaQuery, narrow, refreshError, onDrill }) {
         jsx(SectionHeading, {
           title: 'Model performance and efficiency',
           description: 'Each row states a verdict from two separated evidence layers: the API layer (logged calls) and the work ledger (eligible finished tasks). Click a row for the full evidence card.',
-          action: window
-            ? jsx('span', {
-                title: 'Fail rate and latency come from bounded local Hermes agent logs covering this window; samples can exceed the period’s recorded requests when the log window is wider.',
-                style: { ...tabular, background: color.surfaceRaised, border, borderRadius: '999px', color: color.tertiary, flexShrink: 0, fontSize: '0.625rem', padding: '0.22rem 0.6rem', whiteSpace: 'nowrap' },
-                children: `logs ${window}`
+          action: jsxs('div', {
+            style: { alignItems: 'center', display: 'flex', flexShrink: 0, gap: '0.5rem' },
+            children: [
+              window
+                ? jsx('span', {
+                    title: 'Fail rate and latency come from bounded local Hermes agent logs covering this window; samples can exceed the period’s recorded requests when the log window is wider.',
+                    style: { ...tabular, background: color.surfaceRaised, border, borderRadius: '999px', color: color.tertiary, flexShrink: 0, fontSize: '0.625rem', padding: '0.22rem 0.6rem', whiteSpace: 'nowrap' },
+                    children: `logs ${window}`
+                  })
+                : null,
+              jsx(ExportMenu, {
+                title: 'Export the model table for the selected period',
+                items: [
+                  {
+                    id: 'models-csv',
+                    label: 'Models (CSV)',
+                    hint: 'One row per model: requests, tokens, cost, API and work reliability, latency',
+                    filename: exportFilename('models', period, 'csv'),
+                    mime: 'text/csv;charset=utf-8',
+                    build: () => toCsv(MODEL_EXPORT_COLUMNS, data.models || [])
+                  },
+                  jsonExportItem('models-json', 'Models payload (JSON)', 'Every evidence field behind the cards, plus coverage', 'models', period, data)
+                ]
               })
-            : null
+            ]
+          })
         }),
         refreshError
           ? jsx('div', { role: 'alert', style: { background: color.dangerSoft, borderRadius: '5px', color: color.danger, fontSize: '0.6875rem', padding: '0.5rem 0.6rem' }, children: `Manual refresh failed: ${refreshError}` })

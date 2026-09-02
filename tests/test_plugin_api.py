@@ -783,6 +783,91 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertIsNone(payload["services"])
         self.assertEqual(payload["spend_windows"], [])
 
+    def test_export_menus_are_wired_into_every_data_view(self):
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        # One shared menu, every item offering both a download and a clipboard copy.
+        self.assertIn("function ExportMenu({ items, label = 'Export'", source)
+        self.assertIn("miniButton(item, 'download', 'desktop-download', 'Download'), miniButton(item, 'copy', 'copy', 'Copy')", source)
+        self.assertIn("anchor.download = filename", source)
+        self.assertIn("navigator.clipboard?.writeText", source)
+        # Sessions export re-reads the list route with the live filters, capped at the API page limit.
+        self.assertIn("const params = { ...period, q: debouncedSearch, sort, failures_only: failuresOnly, limit: 500, offset: 0 }", source)
+        self.assertIn("toCsv(SESSION_EXPORT_COLUMNS, (await fetchPage())?.sessions || [])", source)
+        # Tools, AI Models, AI Usage, and Overview each mount the menu on their own data.
+        for needle in (
+            "toCsv(TOOL_EXPORT_COLUMNS, data.tools || [])",
+            "toCsv(TOOL_GROUP_EXPORT_COLUMNS, data.groups || [])",
+            "toCsv(MODEL_EXPORT_COLUMNS, data.models || [])",
+            "toCsv(OVERVIEW_MODEL_EXPORT_COLUMNS, data.models || [])",
+            "digestExportItem(ctx, period)",
+            "jsonExportItem('usage-json', 'Provider usage (JSON)'",
+            "jsonExportItem('services-json', 'Services (JSON)'",
+        ):
+            self.assertIn(needle, source)
+        # The definition plus the Overview and AI Usage call sites.
+        self.assertEqual(source.count("digestExportItem(ctx, period)"), 3)
+        # The views that gained a period-stamped filename receive the period from the page.
+        self.assertIn("function AIUsageView({ ctx, query, servicesQuery, narrow, refreshError, history, onRefreshProvider, onRefreshService, onDrill, budgets, onBudgetsChange, period })", source)
+        self.assertIn("function AIModelsView({ query, quotaQuery, narrow, refreshError, onDrill, period })", source)
+        self.assertEqual(source.count("jsx(AIUsageView, {\n    period,"), 1)
+        self.assertEqual(source.count("jsx(AIModelsView, {\n    period,"), 1)
+
+    def test_export_csv_helpers_escape_and_stamp(self):
+        """Run the pure export helpers under node: CSV escaping, BOM, filenames."""
+        import shutil
+        import subprocess
+
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not installed")
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        start = source.index("// ── Export helpers")
+        end = source.index("// ── End export helpers")
+        helpers = source[start:end]
+        script = helpers + r"""
+const rows = [
+  { id: 'a', title: 'plain', n: 3, flag: true, when: 1_800_000_000, obj: { k: 1 } },
+  { id: 'b', title: 'has "quotes", commas\nand lines', n: NaN, flag: false, when: null, obj: null },
+  { id: 'c', title: ' padded ', n: 0.5, flag: null, when: 0, obj: undefined }
+]
+const columns = [
+  { key: 'id', label: 'ID' },
+  { key: 'title', label: 'Title, quoted' },
+  { key: 'n', label: 'N' },
+  { key: 'flag', label: 'Flag' },
+  { key: 'when', label: 'When', value: row => isoStamp(row.when) },
+  { key: 'obj', label: 'Obj' }
+]
+const csv = toCsv(columns, rows)
+const out = {
+  bom: csv.charCodeAt(0) === 0xfeff,
+  lines: csv.slice(1).split('\r\n'),
+  name7: exportFilename('sessions', { days: 7 }, 'csv'),
+  nameAll: exportFilename('tools', { days: 0 }, 'json'),
+  nameCustom: exportFilename('digest', { days: 0, start_at: 1, end_at: 2 }, 'md'),
+  nameNone: exportFilename('models', null, 'csv')
+}
+process.stdout.write(JSON.stringify(out))
+"""
+        copy = Path(self.temp.name) / "export_helpers.mjs"
+        copy.write_text(script, encoding="utf-8")
+        completed = subprocess.run([node, str(copy)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertTrue(result["bom"])
+        lines = result["lines"]
+        self.assertEqual(lines[0], 'ID,"Title, quoted",N,Flag,When,Obj')
+        self.assertEqual(lines[1], 'a,plain,3,true,2027-01-15T08:00:00.000Z,"{""k"":1}"')
+        # Embedded quotes double, the field is quoted, and the newline survives inside the quotes.
+        # The bare newline inside the quoted field is not a row break: the row stays one CRLF-delimited line.
+        self.assertEqual(lines[2], 'b,"has ""quotes"", commas\nand lines",,false,,')
+        self.assertEqual(lines[3], 'c," padded ",0.5,,,')
+        self.assertEqual(lines[4], "")
+        self.assertRegex(result["name7"], r"^session-lens-sessions-7d-\d{8}-\d{4}\.csv$")
+        self.assertRegex(result["nameAll"], r"^session-lens-tools-all-\d{8}-\d{4}\.json$")
+        self.assertRegex(result["nameCustom"], r"^session-lens-digest-custom-\d{8}-\d{4}\.md$")
+        self.assertRegex(result["nameNone"], r"^session-lens-models-\d{8}-\d{4}\.csv$")
+
     def test_quota_exhaust_forecast_math(self):
         now = time.time()
         reset_at = now + 0.83 * 7 * 86400
