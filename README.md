@@ -48,12 +48,14 @@ This documentation describes Hermes Session Lens `0.31.0`.
 
 ## Compatibility
 
-The initial release is verified with:
+Verified on 2026-09-03 with:
 
-- Hermes Agent `0.20.5`
-- Hermes state schema `26`
+- Hermes Agent `0.21.0` (Hermes Desktop `0.21.0`, commit `0cbc6e3`)
+- Hermes state schema `28`
 - Hermes Desktop Plugin SDK from the 2026-08-19 release
 - Windows 11
+
+The first release was verified on Hermes Agent `0.20.5` with state schema `26`, and every release since has been checked against the Hermes build installed at the time.
 
 The plugin uses Hermes' public Desktop SDK and `SessionDB(read_only=True)`. The System view shows the active schema and data source so compatibility is visible after an update.
 

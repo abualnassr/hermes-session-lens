@@ -62,7 +62,7 @@ The plugin appears in Hermes Desktop's left sidebar as **Session Lens** and open
 
 ## Evidence on Hand
 
-- Hermes Agent v0.20.5 database schema v26, verified on Windows on 2026-08-23.
+- Hermes Agent v0.21.0 (Desktop v0.21.0) database schema v28, verified on Windows on 2026-09-03; first verified on v0.20.5 / schema v26 on 2026-08-23.
 - Installed Hermes Desktop Plugin SDK and bundled `hermes-desktop-plugins` instructions.
 - Hermes `sessions`, `messages`, `session_model_usage`, FTS, and `async_delegations` tables.
 - TokenTelemetry and Hermes Session Analyzer are product-behavior references; Hermes LLM Quota Monitor informs the Grok OAuth adapter. Compatibility claims remain bounded to verified Hermes versions and provider responses.
