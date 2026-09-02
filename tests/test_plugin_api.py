@@ -631,6 +631,158 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertEqual(week["previous_totals"]["sessions"], 0)
         self.assertIn("(vs prior period)", week["markdown"])
 
+    def test_digest_folds_budgets_attribution_and_services(self):
+        now = time.time()
+        reset_iso = datetime.fromtimestamp(now + 3 * 86400, tz=timezone.utc).isoformat()
+        usage = {
+            "providers": [
+                {
+                    "provider": "openrouter",
+                    "label": "OpenRouter",
+                    "status": "ok",
+                    "windows": [
+                        {
+                            "kind": "quota",
+                            "label": "Weekly quota",
+                            "percentage_used": 40,
+                            "reset_at": reset_iso,
+                            "attribution": {
+                                "basis": "window",
+                                "tokens": 1000,
+                                "sessions": 2,
+                                "cost_usd": 1.5,
+                                "by_project": [
+                                    {"label": "demo", "share_percent": 69.8, "tokens": 698},
+                                    {"label": "noise", "share_percent": 0.2, "tokens": 2},
+                                    {"label": "2 other", "other": True, "share_percent": 30.0, "tokens": 300},
+                                ],
+                                "by_model": [{"label": "gpt-x", "share_percent": 100.0, "tokens": 1000}],
+                                "by_session": [],
+                            },
+                        },
+                        {
+                            "kind": "balance",
+                            "label": "Monthly usage",
+                            "used": 126.44,
+                            "limit": 250,
+                            "unit": "USD",
+                            "attribution": {
+                                "basis": "trailing_7d",
+                                "tokens": 500,
+                                "sessions": 1,
+                                "cost_usd": 18.92,
+                                "by_project": [],
+                                "by_model": [],
+                                "by_session": [],
+                                "explained": {"account_used": 126.44, "unit": "USD", "local_cost_usd": 18.92, "percent": 15.0},
+                            },
+                        },
+                        {"kind": "balance", "label": "Credits", "remaining": 12.5, "unit": "USD"},
+                    ],
+                },
+                {"provider": "zai", "label": "Z.AI", "status": "not_configured", "windows": []},
+            ]
+        }
+        services_payload = {
+            "cards": [
+                services._service_payload(
+                    "firecrawl",
+                    status="ok",
+                    plan="Standard",
+                    windows=[services._usage_window("Credits", kind="balance", remaining=4512, limit=5000, unit="credits")],
+                ),
+                services._service_payload("brightdata", status="forbidden", message="Token lacks the balance permission."),
+                services._service_payload(
+                    "firecrawl",
+                    status="ok",
+                    account="topped",
+                    windows=[services._usage_window("Credits", kind="balance", remaining=10752, limit=1000, unit="credits",
+                                                     detail="Plan 1,000 credits per period · balance includes top-ups beyond the plan")],
+                ),
+                services._service_payload("monid", status="ok", details=["Month to date: 2.50 USD across 2 runs"]),
+                services._service_payload("scrapecreators", status="not_configured", message="No key."),
+            ],
+            "inventory": [],
+            "summary": {"configured": 5, "monitored": 2, "attention": 1, "unreadable": 2},
+        }
+        budgets_payload = {
+            "month": {"start": now - 5 * 86400, "end": now + 20 * 86400, "days_remaining": 20.0},
+            "entries": [
+                {
+                    "id": "openrouter", "label": "OpenRouter", "cap_usd": 150.0, "spend_usd": 126.44,
+                    "spend_source": "account", "projected_usd": 180.0, "percent_of_cap": 84.3,
+                    "status": "at_risk", "cross_at": now + 4 * 86400, "account_stale": False,
+                },
+                {
+                    "id": "nous", "label": "Nous Portal", "cap_usd": None, "spend_usd": 3.1,
+                    "spend_source": "local", "projected_usd": 6.0, "percent_of_cap": None,
+                    "status": "no_cap", "cross_at": None, "account_stale": False,
+                },
+            ],
+            "total": {
+                "id": "all", "label": "All providers", "cap_usd": 300.0, "spend_usd": 129.54,
+                "spend_source": "mixed", "projected_usd": 186.0, "percent_of_cap": 43.2,
+                "status": "ok", "cross_at": None, "account_stale": False,
+            },
+            "notes": [{"id": "budget:openrouter:2026-09"}],
+        }
+        with patch.object(api, "_ai_usage_sync", return_value=usage), \
+             patch.object(api, "_services_sync", return_value=services_payload) as services_sync, \
+             patch.object(api, "_budgets_sync", return_value=budgets_payload) as budgets_sync:
+            payload = api._digest_sync(7, budgets="openrouter:150, all:300")
+        services_sync.assert_called_once_with()
+        budgets_sync.assert_called_once_with({"openrouter": 150.0, "all": 300.0})
+        markdown = payload["markdown"]
+
+        # Budgets: one line per entry plus the total, cap status in words, before quota windows.
+        self.assertIn("## Monthly spend", markdown)
+        self.assertIn("(20 days left)", markdown)
+        self.assertIn("- OpenRouter: $126.44 month to date (account figure), projected $180.00 by month end — cap $150.00: on pace to exceed ~", markdown)
+        self.assertIn("- Nous Portal: $3.10 month to date (local records), projected $6.00 by month end — no cap set", markdown)
+        self.assertIn("- All providers: $129.54 month to date (account figures plus local records), projected $186.00 by month end — cap $300.00: within cap (43% used)", markdown)
+        self.assertLess(markdown.index("## Monthly spend"), markdown.index("## Quota windows"))
+        self.assertEqual(payload["budgets"]["notes"], [{"id": "budget:openrouter:2026-09"}])
+        self.assertNotIn("definition", payload["budgets"])
+
+        # Quota window carries its attribution as a nested bullet; the "other" bucket is not named.
+        self.assertIn("- OpenRouter Weekly quota: 40% used", markdown)
+        self.assertIn("  - local share: demo 70% · top model gpt-x", markdown)
+        self.assertNotIn("2 other", markdown)
+        self.assertNotIn("noise", markdown)
+        self.assertEqual(payload["quota_windows"][0]["attribution"]["top_projects"][0]["label"], "demo")
+
+        # Money window becomes a spend window with the explained share; a pure balance does not.
+        self.assertIn("## Spend windows", markdown)
+        self.assertIn("- OpenRouter Monthly usage: $126.44 used of $250.00", markdown)
+        self.assertIn("  - local sessions explain $18.92 of $126.44 (15%); the rest came from other machines, tools, or profiles (trailing 7 days — window span not readable)", markdown)
+        self.assertEqual([item["label"] for item in payload["spend_windows"]], ["Monthly usage"])
+
+        # Services: readings for ok cards, the reason for cards needing attention, the tally, no not_configured rows.
+        self.assertIn("## Service balances", markdown)
+        self.assertIn("- Firecrawl: 4,512 credits remaining of 5,000 · plan Standard", markdown)
+        self.assertIn("- Firecrawl · topped: 10,752 credits remaining (Plan 1,000 credits per period · balance includes top-ups beyond the plan)", markdown)
+        self.assertIn("- Bright Data: needs attention — Token lacks the balance permission.", markdown)
+        self.assertIn("- Monid: Month to date: 2.50 USD across 2 runs", markdown)
+        self.assertNotIn("ScrapeCreators", markdown)
+        self.assertIn("- 5 configured · 2 monitored · 1 need attention · 2 without a readable usage API", markdown)
+        self.assertEqual(payload["services"]["summary"]["monitored"], 2)
+        self.assertEqual([row["provider"] for row in payload["services"]["rows"]], ["firecrawl", "brightdata", "firecrawl:topped", "monid"])
+
+    def test_digest_stays_quiet_without_budgets_services_or_attribution(self):
+        usage = {"providers": [{"provider": "codex", "label": "Codex", "status": "ok", "windows": [
+            {"kind": "quota", "label": "Weekly quota", "percentage_used": 10, "reset_at": None}]}]}
+        empty_budgets = {"month": {"start": None, "days_remaining": 0}, "entries": [], "total": {"id": "all", "spend_usd": 0, "cap_usd": None}, "notes": []}
+        with patch.object(api, "_ai_usage_sync", return_value=usage), \
+             patch.object(api, "_services_sync", side_effect=RuntimeError("no services")), \
+             patch.object(api, "_budgets_sync", return_value=empty_budgets):
+            payload = api._digest_sync(0)
+        markdown = payload["markdown"]
+        self.assertIn("- Codex Weekly quota: 10% used", markdown)
+        for heading in ("## Monthly spend", "## Spend windows", "## Service balances"):
+            self.assertNotIn(heading, markdown)
+        self.assertIsNone(payload["services"])
+        self.assertEqual(payload["spend_windows"], [])
+
     def test_quota_exhaust_forecast_math(self):
         now = time.time()
         reset_at = now + 0.83 * 7 * 86400

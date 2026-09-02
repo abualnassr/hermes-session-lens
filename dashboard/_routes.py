@@ -699,10 +699,231 @@ def _digest_delta_label(current: Any, previous: Any, formatter) -> str:
     return f"{formatter(current)} ({sign}{formatter(abs(delta))} vs prior period)"
 
 
+def _digest_money(value: Any) -> str:
+    return f"${_number(value):,.2f}"
+
+
+def _digest_count(value: Any, unit: Any, *, with_unit: bool = True) -> str:
+    """Format a window figure in its own unit: money as dollars, otherwise a count."""
+    number = _number(value)
+    unit_text = str(unit or "").strip()
+    if unit_text.lower() in {"usd", "$"}:
+        return _digest_money(number)
+    text = f"{number:,.0f}" if float(number).is_integer() else f"{number:,.2f}"
+    return f"{text} {unit_text}".strip() if with_unit else text
+
+
+def _digest_attribution_summary(attribution: Any) -> Optional[Dict[str, Any]]:
+    """Compact form of a window's attribution block for the digest payload."""
+    if not isinstance(attribution, Mapping) or _integer(attribution.get("tokens")) <= 0:
+        return None
+
+    def top(items: Any, limit: int) -> List[Dict[str, Any]]:
+        output: List[Dict[str, Any]] = []
+        for item in list(items or [])[:limit]:
+            if not isinstance(item, Mapping):
+                continue
+            output.append(
+                {
+                    "label": _clean_text(item.get("label"), 120),
+                    "share_percent": _number(item.get("share_percent")),
+                    "other": bool(item.get("other")),
+                }
+            )
+        return output
+
+    summary: Dict[str, Any] = {
+        "basis": attribution.get("basis"),
+        "sessions": _integer(attribution.get("sessions")),
+        "tokens": _integer(attribution.get("tokens")),
+        "local_cost_usd": round(_number(attribution.get("cost_usd")), 4),
+        "top_projects": top(attribution.get("by_project"), 4),
+        "top_models": top(attribution.get("by_model"), 2),
+    }
+    explained = attribution.get("explained")
+    if isinstance(explained, Mapping):
+        summary["explained"] = {
+            "account_used": _number(explained.get("account_used")),
+            "unit": explained.get("unit"),
+            "local_cost_usd": _number(explained.get("local_cost_usd")),
+            "percent": _number(explained.get("percent")),
+        }
+    return summary
+
+
+def _digest_attribution_line(summary: Optional[Mapping[str, Any]]) -> Optional[str]:
+    """One markdown sub-line naming what local records say consumed a window."""
+    if not summary:
+        return None
+    parts: List[str] = []
+    projects = [
+        item
+        for item in summary.get("top_projects", [])
+        if not item.get("other") and _number(item.get("share_percent")) >= 0.5
+    ]
+    if projects:
+        parts.append(
+            "local share: "
+            + ", ".join(f"{item['label']} {_number(item['share_percent']):.0f}%" for item in projects)
+        )
+    models = [item for item in summary.get("top_models", []) if not item.get("other")]
+    if models:
+        parts.append(f"top model {models[0]['label']}")
+    explained = summary.get("explained")
+    if isinstance(explained, Mapping):
+        parts.append(
+            f"local sessions explain {_digest_money(explained.get('local_cost_usd'))} of "
+            f"{_digest_count(explained.get('account_used'), explained.get('unit'))} "
+            f"({_number(explained.get('percent')):.0f}%); the rest came from other machines, tools, or profiles"
+        )
+    if not parts:
+        return None
+    line = " · ".join(parts)
+    if summary.get("basis") == "trailing_7d":
+        line += " (trailing 7 days — window span not readable)"
+    return line
+
+
+def _digest_budget_entry_label(entry: Mapping[str, Any]) -> str:
+    source = {
+        "account": "account figure",
+        "mixed": "account figures plus local records",
+    }.get(str(entry.get("spend_source") or ""), "local records")
+    text = f"{entry.get('label')}: {_digest_money(entry.get('spend_usd'))} month to date ({source}"
+    text += ", stale)" if entry.get("account_stale") else ")"
+    text += f", projected {_digest_money(entry.get('projected_usd'))} by month end"
+    cap = entry.get("cap_usd")
+    status = entry.get("status")
+    if cap:
+        text += f" — cap {_digest_money(cap)}: "
+        if status == "over":
+            text += f"over cap ({_number(entry.get('percent_of_cap')):.0f}% used)"
+        elif status == "at_risk":
+            when = entry.get("cross_at")
+            text += "on pace to exceed"
+            if when:
+                text += f" ~{dt.datetime.fromtimestamp(_number(when)).strftime('%b %d')}"
+        else:
+            text += f"within cap ({_number(entry.get('percent_of_cap')):.0f}% used)"
+    else:
+        text += " — no cap set"
+    return text
+
+
+def _digest_budget_lines(payload: Optional[Mapping[str, Any]]) -> List[str]:
+    if not payload:
+        return []
+    entries = [item for item in (payload.get("entries") or []) if isinstance(item, Mapping)]
+    total = payload.get("total") if isinstance(payload.get("total"), Mapping) else None
+    if not entries and not (total and (_number(total.get("spend_usd")) > 0 or total.get("cap_usd"))):
+        return []
+    month = payload.get("month") if isinstance(payload.get("month"), Mapping) else {}
+    header = "## Monthly spend"
+    if month.get("start"):
+        header += f" — {dt.datetime.fromtimestamp(_number(month.get('start'))).strftime('%B %Y')}"
+        header += f" ({_number(month.get('days_remaining')):.0f} days left)"
+    lines = [header]
+    for entry in entries:
+        lines.append("- " + _digest_budget_entry_label(entry))
+    if total:
+        lines.append("- " + _digest_budget_entry_label(total))
+    return lines
+
+
+def _digest_window_reading(window: Mapping[str, Any]) -> Optional[str]:
+    """A service window as one phrase: '4,512 credits remaining of 5,000, resets Sep 30'."""
+    unit = window.get("unit")
+    remaining = window.get("remaining")
+    used = window.get("used")
+    limit = window.get("limit")
+    percent = window.get("percentage_used")
+    detail = _clean_text(window.get("detail"), 240)
+    if remaining is not None:
+        text = f"{_digest_count(remaining, unit)} remaining"
+        if limit is not None and _number(remaining) <= _number(limit):
+            text += f" of {_digest_count(limit, unit, with_unit=False)}"
+        elif detail:
+            # A balance above the plan figure (top-ups): let the adapter's
+            # own wording explain it rather than printing "10,752 of 1,000".
+            text += f" ({detail})"
+    elif used is not None:
+        text = f"{_digest_count(used, unit)} used"
+        if limit is not None:
+            text += f" of {_digest_count(limit, unit, with_unit=False)}"
+    elif percent is not None:
+        text = f"{_number(percent):.0f}% used"
+    else:
+        return None
+    label = str(window.get("label") or "").strip()
+    if label and label.lower() != str(unit or "").strip().lower():
+        text = f"{label}: {text}"
+    reset_epoch = _usage_reset_epoch(window.get("reset_at"))
+    if reset_epoch:
+        text += f", resets {dt.datetime.fromtimestamp(reset_epoch).strftime('%b %d')}"
+    return text
+
+
+def _digest_service_rows(payload: Optional[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    rows: List[Dict[str, Any]] = []
+    for card in (payload or {}).get("cards") or []:
+        if not isinstance(card, Mapping):
+            continue
+        status = str(card.get("status") or "")
+        if status == "not_configured":
+            continue
+        readings = [
+            reading
+            for reading in (_digest_window_reading(window) for window in card.get("windows") or [] if isinstance(window, Mapping))
+            if reading
+        ]
+        if not readings and status in {"ok", "stale"}:
+            details = [str(item) for item in (card.get("details") or []) if str(item or "").strip()]
+            if details:
+                readings.append(details[0])
+        rows.append(
+            {
+                "provider": card.get("provider"),
+                "label": card.get("label") or card.get("provider"),
+                "status": status,
+                "stale": bool(card.get("stale")),
+                "plan": card.get("plan"),
+                "message": card.get("message"),
+                "readings": readings,
+            }
+        )
+    return rows
+
+
+def _digest_service_lines(rows: List[Mapping[str, Any]], summary: Optional[Mapping[str, Any]]) -> List[str]:
+    if not rows and not summary:
+        return []
+    lines = ["## Service balances"]
+    for row in rows:
+        status = str(row.get("status") or "")
+        if status in {"ok", "stale"}:
+            text = " · ".join(row.get("readings") or []) or "connected, no balance reported"
+            if row.get("plan"):
+                text += f" · plan {row['plan']}"
+            if status == "stale" or row.get("stale"):
+                text += " (stale reading)"
+        else:
+            reason = row.get("message") or status.replace("_", " ")
+            text = f"needs attention — {reason}"
+        lines.append(f"- {row.get('label')}: {text}")
+    if summary:
+        lines.append(
+            f"- {_integer(summary.get('configured'))} configured · {_integer(summary.get('monitored'))} monitored · "
+            f"{_integer(summary.get('attention'))} need attention · "
+            f"{_integer(summary.get('unreadable'))} without a readable usage API"
+        )
+    return lines
+
+
 def _digest_sync(
     days: int = 7,
     start_at: Optional[float] = None,
     end_at: Optional[float] = None,
+    budgets: str = "",
 ) -> Dict[str, Any]:
     period_start, period_end = _period_bounds(days, start_at, end_at)
     now = time.time()
@@ -761,10 +982,13 @@ def _digest_sync(
     model_rows.sort(key=lambda item: item["requests"], reverse=True)
     model_rows = model_rows[:8]
 
+    # Budgets are computed once below; attention runs without them so the
+    # local spend scan is not repeated for the same notes.
     attention = _attention_sync(days, start_at, end_at)
     attention_rows = attention.get("sessions", [])[:8]
 
     quota_rows: List[Dict[str, Any]] = []
+    spend_windows: List[Dict[str, Any]] = []
     try:
         usage_payload = _ai_usage_sync()
     except Exception:
@@ -772,33 +996,62 @@ def _digest_sync(
     for provider in usage_payload.get("providers", []):
         if provider.get("status") not in {"ok", "stale"}:
             continue
+        provider_label = provider.get("label") or provider.get("provider")
         for window in provider.get("windows", []):
-            if window.get("kind") != "quota":
-                continue
+            attribution = _digest_attribution_summary(window.get("attribution"))
             used = window.get("percentage_used")
-            if used is None:
-                continue
-            duration = _quota_window_duration_seconds(window.get("label"))
-            reset_epoch = _usage_reset_epoch(window.get("reset_at"))
-            elapsed_percent = None
-            if duration and reset_epoch:
-                elapsed_percent = max(0.0, min(100.0, ((now - (reset_epoch - duration)) / duration) * 100))
-            exhaust_at = _quota_exhaust_at(window.get("label"), window.get("reset_at"), used)
-            quota_rows.append(
-                {
-                    "provider": provider.get("provider"),
-                    "label": window.get("label"),
-                    "percentage_used": _number(used),
-                    "elapsed_percent": elapsed_percent,
-                    "over_pace": bool(
-                        elapsed_percent is not None
-                        and elapsed_percent >= 10
-                        and _number(used) > elapsed_percent
-                    ),
-                    "reset_at": window.get("reset_at"),
-                    "exhaust_at": exhaust_at,
-                }
-            )
+            unit = str(window.get("unit") or "").strip().lower()
+            money_used = _number(window.get("used")) if unit in _USAGE_MONEY_UNITS else 0.0
+            if window.get("kind") == "quota" and used is not None:
+                duration = _quota_window_duration_seconds(window.get("label"))
+                reset_epoch = _usage_reset_epoch(window.get("reset_at"))
+                elapsed_percent = None
+                if duration and reset_epoch:
+                    elapsed_percent = max(0.0, min(100.0, ((now - (reset_epoch - duration)) / duration) * 100))
+                exhaust_at = _quota_exhaust_at(window.get("label"), window.get("reset_at"), used)
+                quota_rows.append(
+                    {
+                        "provider": provider.get("provider"),
+                        "provider_label": provider_label,
+                        "label": window.get("label"),
+                        "percentage_used": _number(used),
+                        "elapsed_percent": elapsed_percent,
+                        "over_pace": bool(
+                            elapsed_percent is not None
+                            and elapsed_percent >= 10
+                            and _number(used) > elapsed_percent
+                        ),
+                        "reset_at": window.get("reset_at"),
+                        "exhaust_at": exhaust_at,
+                        "attribution": attribution,
+                    }
+                )
+            elif money_used > 0:
+                spend_windows.append(
+                    {
+                        "provider": provider.get("provider"),
+                        "provider_label": provider_label,
+                        "label": window.get("label"),
+                        "used": money_used,
+                        "limit": window.get("limit"),
+                        "unit": window.get("unit"),
+                        "reset_at": window.get("reset_at"),
+                        "attribution": attribution,
+                    }
+                )
+
+    # Services before budgets: the budgets reader takes service account spend
+    # (Monid's ledger) from the services cache, which this call warms.
+    try:
+        services_payload = _services_sync()
+    except Exception:
+        services_payload = None
+    service_rows = _digest_service_rows(services_payload)
+    services_summary = (services_payload or {}).get("summary") if isinstance(services_payload, Mapping) else None
+    try:
+        budgets_payload: Optional[Dict[str, Any]] = _budgets_sync(_parse_budgets_param(budgets))
+    except Exception:
+        budgets_payload = None
 
     def cost_label(value: Any) -> str:
         return f"${_number(value):.2f}"
@@ -855,6 +1108,10 @@ def _digest_sync(
                 )
             lines.append(f"- {item['display_name']}: " + " · ".join(parts))
         lines.append("")
+    budget_lines = _digest_budget_lines(budgets_payload)
+    if budget_lines:
+        lines.extend(budget_lines)
+        lines.append("")
     if quota_rows:
         lines.append("## Quota windows")
         for item in quota_rows:
@@ -862,10 +1119,31 @@ def _digest_sync(
             if item["elapsed_percent"] is not None:
                 pace = f" at {item['elapsed_percent']:.0f}% elapsed"
                 pace += " — over pace" if item["over_pace"] else " — on pace"
-            line = f"- {item['provider']} {item['label']}: {item['percentage_used']:.0f}% used{pace}"
+            line = f"- {item['provider_label']} {item['label']}: {item['percentage_used']:.0f}% used{pace}"
             if item.get("exhaust_at"):
                 line += f"; at this pace empty ~{dt.datetime.fromtimestamp(item['exhaust_at']).strftime('%a %b %d, %H:%M')}"
             lines.append(line)
+            attribution_line = _digest_attribution_line(item.get("attribution"))
+            if attribution_line:
+                lines.append(f"  - {attribution_line}")
+        lines.append("")
+    if spend_windows:
+        lines.append("## Spend windows")
+        for item in spend_windows:
+            line = f"- {item['provider_label']} {item['label']}: {_digest_count(item['used'], item.get('unit'))} used"
+            if item.get("limit") is not None:
+                line += f" of {_digest_count(item['limit'], item.get('unit'))}"
+            reset_epoch = _usage_reset_epoch(item.get("reset_at"))
+            if reset_epoch:
+                line += f", resets {dt.datetime.fromtimestamp(reset_epoch).strftime('%b %d')}"
+            lines.append(line)
+            attribution_line = _digest_attribution_line(item.get("attribution"))
+            if attribution_line:
+                lines.append(f"  - {attribution_line}")
+        lines.append("")
+    service_lines = _digest_service_lines(service_rows, services_summary)
+    if service_lines:
+        lines.extend(service_lines)
         lines.append("")
 
     return {
@@ -879,6 +1157,13 @@ def _digest_sync(
         "attention": {"sessions": attention_rows, "totals": attention.get("totals")},
         "models": model_rows,
         "quota_windows": quota_rows,
+        "spend_windows": spend_windows,
+        "budgets": (
+            {key: budgets_payload.get(key) for key in ("month", "entries", "total", "notes")}
+            if budgets_payload
+            else None
+        ),
+        "services": {"summary": services_summary, "rows": service_rows} if services_payload is not None else None,
         "markdown": "\n".join(lines).rstrip() + "\n",
         "generated_at": now,
     }
@@ -890,8 +1175,9 @@ async def digest(
     start_at: Optional[float] = Query(None, ge=0),
     end_at: Optional[float] = Query(None, ge=0),
     profiles: str = Query(""),
+    budgets: str = Query(""),
 ) -> Dict[str, Any]:
-    return await asyncio.to_thread(_scoped_call, profiles, _digest_sync, days, start_at, end_at)
+    return await asyncio.to_thread(_scoped_call, profiles, _digest_sync, days, start_at, end_at, budgets=budgets)
 
 
 def _path_basename(path: Any) -> str:
