@@ -3618,12 +3618,12 @@ function compilePreset(preset, params, catalog) {
     const values = {}
     for (const field of entry?.fields || []) {
       const key = field.key
-      if (spec[key] !== undefined && key !== 'kind' && key !== 'from') values[key] = spec[key]
+      if (spec[key] !== undefined && key !== 'kind' && key !== 'copy') values[key] = spec[key]
       else if (Object.values(exposed).includes(key)) {
         const source = Object.keys(exposed).find(src => exposed[src] === key) || key
         if (params[source] !== undefined) values[key] = params[source]
       }
-      if (values[key] === undefined && spec.from && key === 'tool') values[key] = params[spec.from]
+      if (values[key] === undefined && spec.copy && key === 'tool') values[key] = params[spec.copy]
       if (values[key] === undefined) values[key] = ruleFieldDefault(field)
     }
     return { kind: spec.kind, params: values, negate: false }
@@ -3796,7 +3796,7 @@ function RuleEditor({ catalog, availableProfiles, initial, onSave, onCancel }) {
         style: { display: 'grid', gap: '0.7rem', gridTemplateColumns: 'repeat(auto-fit, minmax(14rem, 1fr))' },
         children: [
           jsx(NativeSelect, {
-            label: 'Start from',
+            label: 'Preset',
             value: presetType,
             onChange: applyPreset,
             children: [

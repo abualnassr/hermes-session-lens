@@ -1095,7 +1095,7 @@ process.stdout.write(JSON.stringify(out))
         self.assertIn("TRIAL SEED", source)
         # The desktop builder mirrors the backend grammar and preset compiler.
         for needle in ("function renderSentence(entry, params)", "function compilePreset(preset, params, catalog)", "function migrateRule(rule, catalog)",
-                       "function ClauseRow({ catalog, side, clause, onChange, onRemove })", "label: 'Start from'", "'Then the model must'"):
+                       "function ClauseRow({ catalog, side, clause, onChange, onRemove })", "label: 'Preset'", "'Then the model must'"):
             self.assertIn(needle, source)
 
     def test_rules_when_then_builder_grades_custom_rules(self):
@@ -1161,6 +1161,14 @@ process.stdout.write(JSON.stringify(out))
         # No terminal calls in the fixture: not applicable anywhere, and never a phantom failure.
         self.assertEqual(by_id["no-terminal-rm"]["applicable"], 0)
         self.assertEqual(by_id["repeat"]["failed"], 0)
+
+    def test_plugin_source_has_no_stray_from_tokens(self):
+        """Hermes' desktop loader scans for `from '...'`; a label like 'Start from' unloads the plugin."""
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        body = source.split("from 'react/jsx-runtime'", 1)[1]
+        stray = [line.strip() for line in body.splitlines() if re.search(r"from\s*['\"]", line)]
+        self.assertEqual(stray, [])
+        self.assertNotRegex(body, r"\.from(?!\()")
 
     def test_quota_exhaust_forecast_math(self):
         now = time.time()

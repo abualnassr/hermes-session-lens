@@ -119,7 +119,7 @@ _EXPECTATION_BY_KIND = {item["kind"]: item for item in EXPECTATIONS}
 PRESETS: List[Dict[str, Any]] = [
     {"type": "require_tool", "label": "Every reply must call a tool", "when": [], "then": [{"kind": "call_tool"}], "map": {"tool": "tool", "position": "position", "must_succeed": "must_succeed"}},
     {"type": "forbid_tool", "label": "A tool must never be used", "when": [{"kind": "has_tool_calls"}], "then": [{"kind": "avoid_tool"}], "map": {"tool": "tool"}},
-    {"type": "tool_order", "label": "Try one tool before another", "when": [{"kind": "tool_called", "from": "tool"}], "then": [{"kind": "try_first"}], "map": {"tool": "tool", "before": "before", "scope": "scope"}},
+    {"type": "tool_order", "label": "Try one tool before another", "when": [{"kind": "tool_called", "copy": "tool"}], "then": [{"kind": "try_first"}], "map": {"tool": "tool", "before": "before", "scope": "scope"}},
     {"type": "forbid_text", "label": "Replies must never contain", "when": [], "then": [{"kind": "reply_avoids"}], "map": {"patterns": "patterns", "regex": "regex"}},
     {"type": "require_text_count", "label": "Replies must contain something exactly N times", "when": [], "then": [{"kind": "reply_count"}], "map": {"pattern": "pattern", "count": "count"}},
     {"type": "language_match", "label": "Reply in the user's language", "when": [], "then": [{"kind": "reply_language_matches"}], "map": {}},
@@ -159,8 +159,8 @@ def _preset_compile(preset: Mapping[str, Any], params: Mapping[str, Any]) -> Tup
                 source = next((src for src, dst in exposed.items() if dst == key), key)
                 if source in params:
                     values[key] = params[source]
-            if key not in values and "from" in spec and key == "tool":
-                values[key] = params.get(spec["from"])
+            if key not in values and "copy" in spec and key == "tool":
+                values[key] = params.get(spec["copy"])
         return {"kind": spec["kind"], "params": values, "negate": False}
 
     return [clause(spec) for spec in preset.get("when") or []], [clause(spec) for spec in preset.get("then") or []]
