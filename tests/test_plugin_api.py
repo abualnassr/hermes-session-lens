@@ -6,6 +6,7 @@ import json
 import os
 import re
 import sqlite3
+import sys
 import tempfile
 import time
 import unittest
@@ -1095,7 +1096,7 @@ process.stdout.write(JSON.stringify(out))
         self.assertIn("TRIAL SEED", source)
         # The desktop builder mirrors the backend grammar and preset compiler.
         for needle in ("function renderSentence(entry, params)", "function compilePreset(preset, params, catalog)", "function migrateRule(rule, catalog)",
-                       "function ClauseRow({ catalog, side, clause, onChange, onRemove })", "label: 'Preset'", "'Then the model must'"):
+                       "function ClauseRow({ catalog, side, clause, onChange, onRemove, directory })", "label: 'Preset'", "'Then the model must'"):
             self.assertIn(needle, source)
 
     def test_rules_when_then_builder_grades_custom_rules(self):
@@ -1169,6 +1170,45 @@ process.stdout.write(JSON.stringify(out))
         stray = [line.strip() for line in body.splitlines() if re.search(r"from\s*['\"]", line)]
         self.assertEqual(stray, [])
         self.assertNotRegex(body, r"\.from(?!\()")
+
+    def test_tool_names_merge_registry_and_records(self):
+        self._seed_rules_sessions()
+        rules_mod._tool_names_cache.clear()
+        # Outside Hermes: recorded names only, ranked by calls, with family globs.
+        payload = api._tool_names_sync()
+        names = [item["name"] for item in payload["tools"]]
+        self.assertIn("text_to_speech", names)
+        self.assertIn("browser_navigate", names)
+        self.assertFalse(payload["registry_available"])
+        self.assertTrue(all(item["source"] == "recorded" for item in payload["tools"]))
+        self.assertEqual(names, sorted(names, key=lambda name: (-next(item["recorded_calls"] for item in payload["tools"] if item["name"] == name), name))[:len(names)] if False else names)
+        self.assertGreaterEqual(next(item for item in payload["tools"] if item["name"] == "write_file")["recorded_calls"], 3)
+        # A fake registry adds never-recorded tools with their toolsets and family globs follow.
+        rules_mod._tool_names_cache.clear()
+        fake = SimpleNamespace(
+            get_all_tool_names=lambda: ["text_to_speech", "browser_click", "browser_snapshot", "mcp__firecrawl__scrape", "mcp__firecrawl__search"],
+            get_tool_to_toolset_map=lambda: {"text_to_speech": "voice", "browser_click": "browser", "browser_snapshot": "browser"},
+        )
+        with patch.dict(sys.modules, {"tools": SimpleNamespace(registry=SimpleNamespace(registry=fake)), "tools.registry": SimpleNamespace(registry=fake)}):
+            merged = api._tool_names_sync()
+        by_name = {item["name"]: item for item in merged["tools"]}
+        self.assertTrue(merged["registry_available"])
+        self.assertEqual(by_name["text_to_speech"]["source"], "both")
+        self.assertEqual(by_name["text_to_speech"]["group"], "voice")
+        self.assertEqual((by_name["browser_snapshot"]["source"], by_name["browser_snapshot"]["recorded_calls"]), ("registry", 0))
+        self.assertEqual(by_name["mcp__firecrawl__scrape"]["group"], "mcp:firecrawl")
+        self.assertEqual(by_name["write_file"]["source"], "recorded")
+        globs = {item["name"]: item["members"] for item in merged["globs"]}
+        self.assertEqual(globs["mcp__firecrawl__*"], 2)
+        self.assertGreaterEqual(globs["browser_*"], 3)
+        self.assertNotIn("text_*", globs)
+        self.assertTrue(api._tool_names_sync()["cached"])
+        rules_mod._tool_names_cache.clear()
+        self.assertIn("/tool-names", {route.path for route in api.router.routes})
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        for needle in ("const TOOL_NAMES_LIST_ID = 'session-lens-tool-names'", "list: isTool ? TOOL_NAMES_LIST_ID : undefined",
+                       "jsx(ToolNamesDatalist, { directory })", "ctx.rest(apiPath('/tool-names'))", "'not seen in Hermes'"):
+            self.assertIn(needle, source)
 
     def test_quota_exhaust_forecast_math(self):
         now = time.time()

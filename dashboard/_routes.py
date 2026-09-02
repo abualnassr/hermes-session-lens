@@ -1205,6 +1205,11 @@ async def rules_templates() -> Dict[str, Any]:
     return _rules_catalog()
 
 
+@router.get("/tool-names")
+async def tool_names(profiles: str = Query("")) -> Dict[str, Any]:
+    return await asyncio.to_thread(_scoped_call, profiles, _tool_names_sync)
+
+
 @router.get("/rules")
 async def rules_route(
     rules: str = Query("", max_length=RULES_MAX_PARAM_CHARS),

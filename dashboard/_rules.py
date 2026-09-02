@@ -1180,6 +1180,101 @@ def _digest_rules_lines(payload: Optional[Mapping[str, Any]]) -> List[str]:
     return lines
 
 
+
+# ── Tool-name directory ───────────────────────────────────────────────────
+# The builder's tool fields offer every name Hermes can call (its live tool
+# registry, populated only inside Hermes) merged with every name the records
+# have seen (with call counts), plus ready-made globs for the families.
+
+TOOL_NAMES_CACHE_TTL_SECONDS = 300.0
+_tool_names_cache: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+
+
+def _registry_tool_names() -> Tuple[List[str], Dict[str, str]]:
+    """Names and toolsets from Hermes' ToolRegistry; empty outside Hermes."""
+    try:
+        from tools.registry import registry  # type: ignore
+
+        names = [str(name) for name in (registry.get_all_tool_names() or [])]
+        toolsets = {str(key): str(value) for key, value in (registry.get_tool_to_toolset_map() or {}).items()}
+        return names, toolsets
+    except Exception:
+        return [], {}
+
+
+def _tool_group(name: str, toolsets: Mapping[str, str]) -> str:
+    if name in toolsets:
+        return toolsets[name]
+    match = re.match(r"mcp__([^_]+(?:_[^_]+)*?)__", name)
+    if match:
+        return f"mcp:{match.group(1)}"
+    head = name.split("_", 1)[0]
+    return head if "_" in name else "other"
+
+
+def _tool_globs(names: Iterable[str]) -> List[Dict[str, Any]]:
+    """Family globs worth offering: mcp__<server>__* and <prefix>_* with two or more members."""
+    families: Dict[str, int] = defaultdict(int)
+    for name in names:
+        match = re.match(r"(mcp__[^_]+(?:_[^_]+)*?__)", name)
+        if match:
+            families[match.group(1) + "*"] += 1
+        elif "_" in name:
+            families[name.split("_", 1)[0] + "_*"] += 1
+    return [{"name": glob, "members": count} for glob, count in sorted(families.items(), key=lambda item: (-item[1], item[0])) if count >= 2]
+
+
+def _tool_names_sync() -> Dict[str, Any]:
+    scope = _get_profile_scope()
+    cache_key = ",".join(scope) if scope else ""
+    now = time.time()
+    cached = _tool_names_cache.get(cache_key)
+    if cached and now - cached[0] < TOOL_NAMES_CACHE_TTL_SECONDS:
+        return dict(cached[1], cached=True)
+    registry_names, toolsets = _registry_tool_names()
+    recorded: Dict[str, Dict[str, Any]] = {}
+    with _database() as db:
+        connection = _db_connection(db)
+        for row in connection.execute(
+            """
+            SELECT tool_name, COUNT(*) AS calls, MAX(timestamp) AS last_used_at
+            FROM messages
+            WHERE role='tool' AND tool_name IS NOT NULL AND tool_name != '' AND coalesce(active,1)=1
+            GROUP BY tool_name
+            """
+        ).fetchall():
+            material = _row_dict(row)
+            name = str(material.get("tool_name") or "").strip()
+            if name:
+                recorded[name] = {"calls": _integer(material.get("calls")), "last_used_at": material.get("last_used_at")}
+    entries: List[Dict[str, Any]] = []
+    for name in sorted(set(registry_names) | set(recorded)):
+        record = recorded.get(name)
+        entries.append(
+            {
+                "name": name,
+                "group": _tool_group(name, toolsets),
+                "recorded_calls": _integer(record["calls"]) if record else 0,
+                "last_used_at": record.get("last_used_at") if record else None,
+                "source": "both" if record and name in registry_names else ("registry" if name in registry_names else "recorded"),
+            }
+        )
+    entries.sort(key=lambda item: (-item["recorded_calls"], item["group"], item["name"]))
+    payload = {
+        "tools": entries,
+        "globs": _tool_globs(item["name"] for item in entries),
+        "registry_available": bool(registry_names),
+        "generated_at": now,
+        "cached": False,
+        "definition": (
+            "Every tool Hermes can call right now (its live tool registry, including connected MCP servers) merged with "
+            "every tool name the records have seen, ranked by recorded calls. Outside Hermes only recorded names are known."
+        ),
+    }
+    _tool_names_cache[cache_key] = (now, dict(payload))
+    return payload
+
+
 # Kept for callers that address the presets by their old name.
 RULE_TEMPLATES = PRESETS
 

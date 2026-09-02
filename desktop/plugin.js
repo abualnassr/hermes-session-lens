@@ -3666,9 +3666,39 @@ function enabledRulesParam(rules) {
   return enabled.length ? JSON.stringify(enabled) : ''
 }
 
-function RuleField({ field, value, onChange, compact }) {
+const TOOL_NAMES_LIST_ID = 'session-lens-tool-names'
+const TOOL_FIELD_KEYS = new Set(['tool', 'before'])
+
+// The datalist behind every tool field: family globs first, then every known
+// tool, most used first, each labelled with its toolset and recorded calls.
+function ToolNamesDatalist({ directory }) {
+  const globs = directory?.globs || []
+  const tools = directory?.tools || []
+  return jsx('datalist', {
+    id: TOOL_NAMES_LIST_ID,
+    children: [
+      ...globs.map(item => jsx('option', { value: item.name, label: `${item.name} · ${item.members} tools` }, `glob-${item.name}`)),
+      ...tools.map(item => jsx('option', {
+        value: item.name,
+        label: `${item.name} · ${item.group}${item.recorded_calls ? ` · ${formatCount(item.recorded_calls)} calls` : ' · never recorded'}`
+      }, item.name))
+    ]
+  })
+}
+
+function toolNameKnown(directory, value) {
+  const text = String(value || '').trim()
+  if (!text || /[*?[]/.test(text) || !directory) return true
+  return (directory.tools || []).some(item => item.name === text)
+}
+
+function RuleField({ field, value, onChange, compact, directory }) {
   const label = jsx('span', { style: { color: color.tertiary, fontSize: '0.6875rem' }, children: field.label })
-  const hint = field.hint && !compact ? jsx('div', { style: { color: color.quaternary, fontSize: '0.625rem', marginTop: '0.2rem' }, children: field.hint }) : null
+  const isTool = TOOL_FIELD_KEYS.has(field.key) && (field.kind || 'text') === 'text'
+  const unknown = isTool && directory && !toolNameKnown(directory, value)
+  const hint = unknown
+    ? jsx('div', { style: { color: color.warning, fontSize: '0.625rem', marginTop: '0.2rem' }, title: 'Not in Hermes’ tool registry and never recorded in this scope — fine for a tool you have not installed yet', children: 'not seen in Hermes' })
+    : field.hint && !compact ? jsx('div', { style: { color: color.quaternary, fontSize: '0.625rem', marginTop: '0.2rem' }, children: field.hint }) : null
   if (field.kind === 'bool') {
     return jsxs('label', {
       title: field.hint,
@@ -3708,6 +3738,9 @@ function RuleField({ field, value, onChange, compact }) {
         value: value ?? '',
         placeholder: field.placeholder,
         min: field.kind === 'number' ? 0 : undefined,
+        list: isTool ? TOOL_NAMES_LIST_ID : undefined,
+        autoComplete: isTool ? 'off' : undefined,
+        title: isTool ? 'Pick a tool Hermes knows, or type a glob such as browser_*' : undefined,
         onChange: event => onChange(field.kind === 'number' ? Number(event.target.value) : event.target.value)
       }),
       hint
@@ -3715,7 +3748,7 @@ function RuleField({ field, value, onChange, compact }) {
   })
 }
 
-function ClauseRow({ catalog, side, clause, onChange, onRemove }) {
+function ClauseRow({ catalog, side, clause, onChange, onRemove, directory }) {
   const list = side === 'when' ? catalog.conditions : catalog.expectations
   const entry = catalogEntry(catalog, side, clause.kind)
   return jsxs('div', {
@@ -3730,6 +3763,7 @@ function ClauseRow({ catalog, side, clause, onChange, onRemove }) {
       ...(entry?.fields || []).map(field => jsx(RuleField, {
         field,
         compact: true,
+        directory,
         value: clause.params?.[field.key],
         onChange: value => onChange({ ...clause, params: { ...clause.params, [field.key]: value } })
       }, field.key)),
@@ -3743,7 +3777,7 @@ function ClauseRow({ catalog, side, clause, onChange, onRemove }) {
   })
 }
 
-function RuleEditor({ catalog, availableProfiles, initial, onSave, onCancel }) {
+function RuleEditor({ catalog, availableProfiles, initial, onSave, onCancel, directory }) {
   const [draft, setDraft] = useState(() => {
     const migrated = migrateRule(initial, catalog)
     if (migrated && Array.isArray(migrated.then)) return { ...migrated, when: migrated.when || { match: 'all', conditions: [] } }
@@ -3842,6 +3876,7 @@ function RuleEditor({ catalog, availableProfiles, initial, onSave, onCancel }) {
           ...conditions.map((clause, index) => jsx(ClauseRow, {
             catalog,
             side: 'when',
+            directory,
             clause,
             onChange: next => setConditions(conditions.map((item, position) => (position === index ? next : item))),
             onRemove: () => setConditions(conditions.filter((_item, position) => position !== index))
@@ -3863,6 +3898,7 @@ function RuleEditor({ catalog, availableProfiles, initial, onSave, onCancel }) {
           ...draft.then.map((clause, index) => jsx(ClauseRow, {
             catalog,
             side: 'then',
+            directory,
             clause,
             onChange: next => setThen(draft.then.map((item, position) => (position === index ? next : item))),
             onRemove: () => setThen(draft.then.filter((_item, position) => position !== index))
@@ -3961,6 +3997,12 @@ function RulesView({ ctx, period, onDrill, rules, onRulesChange, availableProfil
     staleTime: Infinity
   })
   const catalog = templatesQuery.data?.conditions ? templatesQuery.data : null
+  const toolNamesQuery = useQuery({
+    queryKey: [PLUGIN_ID, 'tool-names', activeProfilesParam],
+    queryFn: () => ctx.rest(apiPath('/tool-names')),
+    staleTime: 300_000
+  })
+  const directory = toolNamesQuery.data?.tools ? toolNamesQuery.data : null
   useEffect(() => {
     // Rules saved by the template stage migrate to WHEN/THEN once the catalog is known.
     if (!catalog || !rules.some(rule => !Array.isArray(rule.then))) return
@@ -4043,9 +4085,11 @@ function RulesView({ ctx, period, onDrill, rules, onRulesChange, availableProfil
         templatesQuery.isError
           ? jsx(ErrorBlock, { error: templatesQuery.error, onRetry: templatesQuery.refetch, title: 'Rule catalog unavailable' })
           : null,
+        jsx(ToolNamesDatalist, { directory }),
         editing && catalog
           ? jsx(RuleEditor, {
               catalog,
+              directory,
               availableProfiles,
               initial: editing.mode === 'edit' ? editing.rule : null,
               onSave: saveRule,
