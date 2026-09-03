@@ -31,7 +31,7 @@ The plugin appears in Hermes Desktop's left sidebar as **Session Lens** and open
 - Native route `/session-lens` and `SIDEBAR_NAV_AREA` contribution; no iframe or standalone web server.
 - Session list and detail views for tokens, cost, model, provider, tools, skills, failures, files, and delegations.
 - Overview, Operations, Tools, Skills, System, AI Usage, and AI Models views.
-- An all-time model inventory discovered dynamically from distinct session accounting records, with selected-period requests, token mix, cost, quota burn, reliability, retry/switch, latency, and seven-day trend evidence plus expandable task-type diagnostics. Ten columns are sortable and default to total tokens descending.
+- An all-time model inventory discovered dynamically from distinct session accounting records, with selected-period requests, token mix, cost, quota burn, reliability, retry/switch, latency, and seven-day trend evidence plus expandable task-type diagnostics. Ten columns are sortable and default to reliability rank, unranked models last.
 - Current Codex, Anthropic Claude, Nous Portal, OpenRouter, DeepSeek, Grok, Kimi Code Plan, and Z.AI GLM Coding Plan account allowances or balances through Hermes-resolved credentials. Anthropic renders one card per product: the Claude subscription (5-hour and 7-day windows) and the Console API key (per-minute rate limits), read from message response headers when no usage endpoint accepts the credential.
 - Chronological, paginated session trace for active user, assistant, reasoning, tool-call, and tool-result rows; system prompts excluded.
 - Conservative session outcomes that preserve Hermes' recorded end reason.
@@ -56,7 +56,7 @@ The plugin appears in Hermes Desktop's left sidebar as **Session Lens** and open
 - Sidebar label: **Session Lens**.
 - Repository name: `hermes-session-lens`.
 - Plugin id: `session-lens`.
-- Current documented release: `0.33.0`.
+- Current documented release: `0.33.1`.
 - The interface inherits Hermes Desktop's native components, typography, spacing, and theme variables.
 - Upstream inspiration is credited transparently; no upstream logo or endorsement is implied.
 

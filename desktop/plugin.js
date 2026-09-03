@@ -4905,7 +4905,7 @@ function modelVerdict(model, sampleThreshold) {
   const bound = reliability.failure_rate_upper_bound_95
   const boundText = bound === null || bound === undefined ? null : formatPercent(bound)
   if (Number(reliability.rank) > 0 && Number(reliability.ranked_models) > 0) {
-    parts.push(`Ranked #${formatCount(reliability.rank)} of ${formatCount(reliability.ranked_models)} — failure rate at most ${boundText || '—'} (95% confidence).`)
+    parts.push(`Ranked #${formatCount(reliability.rank)} of ${formatCount(reliability.ranked_models)} — task failure rate at most ${boundText || '—'} (95% confidence).`)
   } else if (eligible > 0) {
     parts.push(`Too little finished work to rank — ${formatCount(eligible)} of the ${formatCount(gate)} tasks needed.`)
   } else {
@@ -4923,13 +4923,13 @@ function WorkEvidenceCell({ model }) {
   const progress = Math.max(0, Math.min(100, (eligible / gate) * 100))
   const headline = ranked ? `#${formatCount(reliability.rank)} of ${formatCount(reliability.ranked_models)}` : `${formatCount(eligible)} of ${formatCount(gate)} tasks`
   const riskText = ranked && bound !== null && bound !== undefined
-    ? `${formatCount(eligible)} tasks · failure ≤ ${formatPercent(bound)}`
+    ? `${formatCount(eligible)} tasks · task failure ≤ ${formatPercent(bound)}`
     : eligible > 0
       ? `toward the ${formatCount(gate)}-task floor`
       : 'no scored work'
   return jsxs('div', {
     title: ranked
-      ? `Ranked by the lowest 95%-confidence upper bound on the failure rate (Wilson score) across ${formatCount(reliability.ranked_models)} comparable models; ${formatCount(eligible)} eligible main-role tasks, failure rate at most ${formatPercent(bound)}. The bar shows eligible tasks against the ${formatCount(gate)}-task floor.`
+      ? `Ranked by the lowest 95%-confidence upper bound on the failure rate (Wilson score) across ${formatCount(reliability.ranked_models)} comparable models; ${formatCount(eligible)} eligible main-role tasks, task failure rate at most ${formatPercent(bound)}. This is a ceiling on task failures, separate from the observed API fail rate. The bar shows eligible tasks against the ${formatCount(gate)}-task floor.`
       : `${formatCount(eligible)} eligible main-role tasks of the ${formatCount(gate)} required before ranking. The bar shows progress toward that floor; a failure bound is shown once the floor is reached.`,
     style: { display: 'grid', gap: '0.28rem', minWidth: '7.5rem' },
     children: [
@@ -5187,9 +5187,9 @@ function WorkLedgerPane({ model, quota, onDrill }) {
             children: [
               jsx('span', { style: { color: color.primary, fontSize: '0.6875rem', fontWeight: 650 }, children: `Reliability rank #${formatCount(reliability.rank)} of ${formatCount(reliability.ranked_models)} comparable models` }),
               jsx('span', {
-                title: `${formatCount(unrecovered)} unrecovered failures in ${formatCount(eligible)} eligible tasks. With 95% confidence the real failure rate is no higher than ${formatPercent(bound)} (Wilson score upper bound); models rank by this bound.`,
+                title: `${formatCount(unrecovered)} unrecovered failures in ${formatCount(eligible)} eligible tasks. With 95% confidence the real task failure rate is no higher than ${formatPercent(bound)} (Wilson score upper bound); models rank by this bound. It is a ceiling from the sample size, not an observed rate, and it is separate from the API fail rate in the row above.`,
                 style: { ...tabular, color: toneColor(metricTone(bound)), fontSize: '0.6875rem', fontWeight: 650 },
-                children: `failure rate at most ${formatPercent(bound)} (95% confidence)`
+                children: `task failure rate at most ${formatPercent(bound)} (95% confidence)`
               })
             ]
           })
@@ -5288,7 +5288,7 @@ function ModelExpanded({ model, quota, coverage, narrow, onDrill }) {
     : null
   const provenance = distinctValues([
     `Routes: ${routeLabels.join(' · ') || 'Unknown'}${routeMappingNote ? ` (${routeMappingNote})` : ''}.`,
-    `Log window: ${window || 'unavailable'}. Fail rate counts API errors, timeouts, and rate limits from bounded local Hermes logs; time-to-first-token is not recorded, so latency is total response time.`,
+    `Log window: ${window || 'unavailable'}. API fail rate counts API errors, timeouts, and rate limits from bounded local Hermes logs, per call; the ledger's task failure rate is a 95%-confidence ceiling per finished task, so the two are different units. Time-to-first-token is not recorded, so latency is total response time.`,
     `Work ledger: scores finished main-role tasks — completed, or closed by a Desktop reset or reap with no failure end reason — and terminal model/API failures. A closed session whose last logged API event is a failure counts as unrecovered. Open, cancelled, orchestration, auxiliary, ambiguous, and uncovered runs are excluded with the reason shown per task type; missing evidence is never treated as success. Ranking needs ${formatCount(gate)} eligible tasks and orders by the lowest 95%-confidence upper bound on the failure rate (Wilson score).`,
     'Classification assigns one primary type per session in this order: Orchestration, Coding, Writing, Analysis, General. Acceptance: General/Analysis use the eligible-closed-session proxy; Coding requires a resolved code save or commit; Writing a resolved non-code artifact write. Retry/switch counts rewinds, near-identical resends to the same model within five minutes, and same-role model changes.'
   ])
@@ -5429,7 +5429,7 @@ function RoutingSummary({ models, coverage, onDrill }) {
               ]
             }, taskType)
           }
-          const evidence = `${formatCount(completed)}/${formatCount(eligible)} completed${bound !== null && bound !== undefined ? ` · failure at most ${formatPercent(bound)}` : ''}`
+          const evidence = `${formatCount(completed)}/${formatCount(eligible)} completed${bound !== null && bound !== undefined ? ` · task failure at most ${formatPercent(bound)}` : ''}`
           return jsxs('div', {
             style: { display: 'grid', gap: '0.15rem', minWidth: 0 },
             children: [
@@ -5468,7 +5468,7 @@ function AIModelsTable({ models, quotaData, coverage, narrow, onDrill, period })
     { key: 'requests', label: 'Requests', align: 'right', value: item => item.model.requests },
     { key: 'total_tokens', label: 'Tokens in / out / cache', align: 'right', value: item => item.model.total_tokens },
     { key: 'cost', label: 'Cost · quota', value: item => ['actual', 'estimated', 'free', 'mixed'].includes(item.model.cost_kind) ? item.model.cost_usd : null },
-    { key: 'failure', label: 'Fail rate', align: 'right', value: item => Number(item.model.requests) > 0 ? item.model.failures?.rate : null, sample: item => item.model.failures?.samples },
+    { key: 'failure', label: 'API fail rate', align: 'right', value: item => Number(item.model.requests) > 0 ? item.model.failures?.rate : null, sample: item => item.model.failures?.samples },
     { key: 'retry', label: 'Retry / switch', align: 'right', value: item => item.model.retry_switch_rate, sample: item => item.model.retry_switch_samples },
     { key: 'work', label: 'Work evidence', value: item => item.model.work_reliability?.failure_rate_upper_bound_95 ?? null, sample: item => item.model.work_reliability?.eligible_tasks },
     { key: 'latency', label: 'Total latency', align: 'right', value: item => Number(item.model.requests) > 0 ? item.model.latency?.total_p50_seconds : null },

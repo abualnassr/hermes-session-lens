@@ -6,7 +6,7 @@
 
 It installs as one Hermes plugin: a native Desktop page plus its namespaced Python API. No iframe, no separate server, no telemetry service, and no write path — the backend defines zero mutation routes and never touches a credential store.
 
-This documentation describes Hermes Session Lens `0.33.0`, verified on Hermes Agent and Desktop `0.21.0`. MIT licensed. A community plugin, not affiliated with or endorsed by Nous Research.
+This documentation describes Hermes Session Lens `0.33.1`, verified on Hermes Agent and Desktop `0.21.0`. MIT licensed. A community plugin, not affiliated with or endorsed by Nous Research.
 
 ![How Session Lens works: what it reads, what it answers, and what it never does](docs/how-it-works.svg)
 
