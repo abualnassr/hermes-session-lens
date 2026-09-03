@@ -40,7 +40,16 @@ def _work_reliability_counts(
     eligible = completed + unrecovered
     recovery_samples = recovered + unrecovered
     threshold = max(1, _integer(sample_threshold, DEFAULT_RATE_SAMPLE_THRESHOLD))
+    ineligible_reasons = Counter(
+        str(run.get("reason_key") or run.get("status") or "unknown")
+        for run in material
+        if str(run.get("status") or "unknown") not in _WORK_RELIABILITY_ELIGIBLE_STATUSES
+    )
     return {
+        "ineligible_reasons": [
+            {"label": label, "count": count}
+            for label, count in sorted(ineligible_reasons.items(), key=lambda item: (-item[1], item[0]))
+        ],
         "eligible_tasks": eligible,
         "completed_tasks": completed,
         "clean_completions": clean,

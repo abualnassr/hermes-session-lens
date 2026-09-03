@@ -5,3 +5,6 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
+
+# design-tool config, not part of the plugin
+.impeccable/

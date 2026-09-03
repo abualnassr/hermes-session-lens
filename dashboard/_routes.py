@@ -2167,6 +2167,67 @@ def _auxiliary_task_label(task: str) -> str:
     label = labels.get(normalised, _humanize_identifier(normalised))
     return f"{label} job" if label in _SESSION_TASK_TYPE_SET else label
 
+# Session outcomes the work ledger treats as finished work. "closed" covers Hermes Desktop's
+# normal end reasons (session_reset when a new chat starts, *_orphan_reap after a restart),
+# which carry no failure signal; the ledger then reads the bounded logs for the real ending.
+_WORK_LEDGER_FINISHED_OUTCOMES = frozenset({"completed", "closed", "failed"})
+_WORK_LEDGER_OUTCOME_REASONS = {
+    "open": "still open",
+    "running": "still running",
+    "cancelled": "cancelled",
+}
+
+
+def _merge_routes_by_label(routes: Iterable[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    """Fold route rows that resolve to the same label (same provider, different host or
+    billing mode) into one row so the table's route count matches the provenance line."""
+    merged: Dict[str, Dict[str, Any]] = {}
+    for route in routes:
+        label = str(route.get("label") or "")
+        existing = merged.get(label)
+        if existing is None:
+            merged[label] = dict(route)
+            continue
+        for field in ("requests", "input_tokens", "output_tokens", "cache_tokens"):
+            existing[field] = _integer(existing.get(field)) + _integer(route.get(field))
+        existing["cost_usd"] = _number(existing.get("cost_usd")) + _number(route.get("cost_usd"))
+        existing["last_used_at"] = max(
+            _number(existing.get("last_used_at"), 0), _number(route.get("last_used_at"), 0)
+        ) or None
+        existing["oauth"] = bool(existing.get("oauth") or route.get("oauth"))
+        existing["subscription"] = bool(existing.get("subscription") or route.get("subscription"))
+        if not existing.get("host") and route.get("host"):
+            existing["host"] = route.get("host")
+    return sorted(merged.values(), key=lambda item: _number(item.get("last_used_at")), reverse=True)
+
+
+def _latency_comparison_insight(model: Mapping[str, Any], peers: Iterable[Mapping[str, Any]]) -> Optional[str]:
+    """Say how a slow model compares with the other models that have logged latency, or nothing.
+
+    A bare "median latency is 10.3s" restates the card; the insight earns its place only
+    when the model is markedly slower than its peers in the same period."""
+    own = _number((model.get("latency") or {}).get("total_p50_seconds"), 0)
+    if own <= 0:
+        return None
+    peer_medians = [
+        _number((peer.get("latency") or {}).get("total_p50_seconds"), 0)
+        for peer in peers
+        if peer is not model
+        and _integer((peer.get("latency") or {}).get("samples")) > 0
+        and _number((peer.get("latency") or {}).get("total_p50_seconds"), 0) > 0
+    ]
+    if not peer_medians:
+        return None
+    peer_median = _percentile(peer_medians, 0.5)
+    if not peer_median or own < peer_median * 1.5:
+        return None
+    ratio = own / peer_median
+    return (
+        f"Median response latency of {own:.1f}s is {ratio:.1f}× the {peer_median:.1f}s median of the "
+        f"{len(peer_medians)} other model{'s' if len(peer_medians) != 1 else ''} with logged calls this period."
+    )
+
+
 def _ai_models_payload_sync(
     days: int,
     start_at: Optional[float] = None,
@@ -2715,23 +2776,43 @@ def _ai_models_payload_sync(
                 ),
                 key=lambda event: _number(event.get("timestamp")),
             )
+            last_failure = max(
+                (_number(event.get("timestamp")) for event in events if event.get("status") == "failure"),
+                default=0,
+            )
+            last_success = max(
+                (_number(event.get("timestamp")) for event in events if event.get("status") == "success"),
+                default=0,
+            )
+            reason_key = None
             if task_type == "Orchestration":
                 status = "excluded"
                 reason = "orchestration ownership is not scored"
+                reason_key = "orchestration, not scored"
             elif final_model is None:
                 status = "unknown"
                 reason = "final main-role model is ambiguous"
+                reason_key = "final model ambiguous"
             elif model_id != final_model:
                 status = "switched_away"
                 reason = "same task role finished on another model"
-            elif outcome not in {"completed", "failed"}:
+                reason_key = "finished on another model"
+            elif outcome not in _WORK_LEDGER_FINISHED_OUTCOMES:
                 status = "excluded"
                 reason = f"session outcome {outcome} is not eligible"
+                reason_key = _WORK_LEDGER_OUTCOME_REASONS.get(outcome, f"outcome {outcome}")
             elif not events:
                 status = "unknown"
                 reason = "no attributable API event is available in bounded logs"
-            elif outcome == "completed":
-                if any(event.get("status") == "failure" for event in events):
+                reason_key = "outside log coverage"
+            elif outcome in {"completed", "closed"}:
+                # A session that ended normally (explicit completion, or a Desktop reset/reap
+                # with no failure end reason) is finished work. A closed session whose last
+                # attributable API event is a failure was abandoned on that failure.
+                if outcome == "closed" and last_failure and last_failure >= last_success:
+                    status = "unrecovered"
+                    reason = "session closed with no successful API event after its last failure on the final model-role"
+                elif last_failure:
                     status = "recovered"
                     reason = "task completed after an observed API failure on the same final model-role"
                 elif model_id in retry_switch_models_by_session.get(session_id, set()):
@@ -2741,20 +2822,13 @@ def _ai_models_payload_sync(
                     status = "clean"
                     reason = "task completed without an observed API failure, retry, or same-role switch"
             else:
-                last_failure = max(
-                    (_number(event.get("timestamp")) for event in events if event.get("status") == "failure"),
-                    default=0,
-                )
-                last_success = max(
-                    (_number(event.get("timestamp")) for event in events if event.get("status") == "success"),
-                    default=0,
-                )
                 if last_failure and last_failure >= last_success:
                     status = "unrecovered"
                     reason = "session failed with no later successful API event on the final model-role"
                 else:
                     status = "unknown"
                     reason = "failed session is not attributable to an unrecovered model/API event"
+                    reason_key = "failure not attributable"
 
             work_runs_by_model[model_id].append(
                 {
@@ -2763,29 +2837,27 @@ def _ai_models_payload_sync(
                     "route_key": route["key"],
                     "status": status,
                     "reason": reason,
+                    "reason_key": reason_key,
                 }
             )
 
     final_models: List[Dict[str, Any]] = []
     for model_id, model in models.items():
-        routes = sorted(
-            (
-                _apply_route_mapping(
-                    model_id,
-                    route,
-                    configured_route_mappings,
-                    historical_route_mappings,
-                )
-                for route in model.pop("routes_map").values()
-            ),
-            key=lambda item: _number(item.get("last_used_at")),
-            reverse=True,
-        )
-        primary_route = routes[0] if routes else _route_descriptor("unknown", "", "")
+        mapped_routes = [
+            _apply_route_mapping(
+                model_id,
+                route,
+                configured_route_mappings,
+                historical_route_mappings,
+            )
+            for route in model.pop("routes_map").values()
+        ]
         route_labels = {
             str(route.get("key") or ""): str(route.get("label") or "Unmapped (edit in config)")
-            for route in routes
+            for route in mapped_routes
         }
+        routes = _merge_routes_by_label(mapped_routes)
+        primary_route = routes[0] if routes else _route_descriptor("unknown", "", "")
         work_reliability = _work_reliability_payload(
             work_runs_by_model.get(model_id, []),
             route_labels,
@@ -2892,10 +2964,8 @@ def _ai_models_payload_sync(
                 f"{retry_switch_rate * 100:.1f}% of recorded sessions used a rewind, resent a near-identical prompt "
                 "within five minutes, or switched models within the same task role."
             )
-        elif has_in_period_requests and latency_p50 is not None and latency_p50 > 10:
-            insight = f"Median recorded response latency is {latency_p50:.1f}s."
         else:
-            insight = None
+            insight = None  # a latency comparison may fill this once every model is known
 
         model.update(
             {
@@ -2962,6 +3032,8 @@ def _ai_models_payload_sync(
         item["work_reliability"]["rank"] = rank
     for item in final_models:
         item["work_reliability"]["ranked_models"] = len(comparable_models)
+        if item.get("insight") is None and _integer(item.get("requests")) > 0:
+            item["insight"] = _latency_comparison_insight(item, final_models)
 
     final_models.sort(key=lambda item: item["total_tokens"], reverse=True)
     active_models = sum(1 for item in final_models if _integer(item.get("sessions")) > 0)
@@ -3011,9 +3083,10 @@ def _ai_models_payload_sync(
                 "tool-call failures are counted separately from session records"
             ),
             "work_reliability": (
-                "main-role completed tasks are clean, recovered, or completed with intervention; a failed task is unrecovered only when its last "
-                "attributable bounded-log model event remains an API failure; orchestration, auxiliary, open, cancelled, ambiguous, and uncovered "
-                "runs are excluded from rates, and comparable models rank by the 95% Wilson upper bound after the sample floor"
+                "main-role finished tasks (completed, or closed by a Desktop reset or reap with no failure end reason) are clean, recovered, or "
+                "completed with intervention; a task is unrecovered when it ended failed, or closed, with its last attributable bounded-log model "
+                "event still an API failure; orchestration, auxiliary, open, cancelled, ambiguous, and uncovered runs are excluded from rates with "
+                "the reason counted per task type, and comparable models rank by the 95% Wilson upper bound after the sample floor"
             ),
             "ttft_available": False,
             "cache": "a zero is shown only when the route has demonstrated cache reporting in the selected period; otherwise unavailable is returned",

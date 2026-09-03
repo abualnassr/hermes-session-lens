@@ -6,7 +6,7 @@
 
 It installs as one Hermes plugin: a native Desktop page plus its namespaced Python API. No iframe, no separate server, no telemetry service, and no write path — the backend defines zero mutation routes and never touches a credential store.
 
-This documentation describes Hermes Session Lens `0.32.2`, verified on Hermes Agent and Desktop `0.21.0`. MIT licensed. A community plugin, not affiliated with or endorsed by Nous Research.
+This documentation describes Hermes Session Lens `0.33.0`, verified on Hermes Agent and Desktop `0.21.0`. MIT licensed. A community plugin, not affiliated with or endorsed by Nous Research.
 
 ![How Session Lens works: what it reads, what it answers, and what it never does](docs/how-it-works.svg)
 
@@ -75,7 +75,7 @@ Anthropic gets one card per product Hermes holds a credential for: the Claude su
 
 ![AI Models: best evidence by task type and the model table](docs/screenshots/ai-models1.png)
 
-An automatic inventory of every model Hermes has ever recorded, with the selected period's requests, token mix, cost or quota burn, fail rate, retry/switch sessions, work evidence, latency, and trend. Each row leads with a one-sentence verdict that fuses two separate layers: the **API layer** (what the bounded local logs say about errors, rate limits, timeouts, and latency) and the **work ledger** (what recorded sessions say about tasks actually completed). Models rank by the lowest 95% Wilson upper failure bound once they clear a configurable sample floor; below it they show plain fractions and a "not rankable yet" banner rather than a headline percentage.
+An automatic inventory of every model Hermes has ever recorded, with the selected period's requests, token mix, cost or quota burn, fail rate, retry/switch sessions, work evidence, latency, and trend. Each row leads with a one-sentence verdict that fuses two separate layers: the **API layer** (what the bounded local logs say about errors, rate limits, timeouts, and latency) and the **work ledger** (what recorded sessions say about tasks actually completed). A task counts as finished when its session completed or was closed by a Desktop reset or restart with no failure end reason; the bounded logs then decide whether it was clean, recovered, or abandoned on an API failure. Models rank by the lowest 95%-confidence upper bound on their failure rate (a Wilson score) once they clear a configurable sample floor; below it they show plain fractions and a "not rankable yet" banner rather than any percentage, and every excluded task states why.
 
 ![An expanded model row: API layer pane and work ledger pane](docs/screenshots/ai-models2.png)
 

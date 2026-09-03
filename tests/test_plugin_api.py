@@ -2924,7 +2924,7 @@ process.stdout.write(JSON.stringify(out))
         source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
         self.assertIn("elapsed !== null && elapsed < 10", source)
         self.assertIn("early in period", source)
-        self.assertIn("Number(model.accepted_tasks) >= 10", source)
+        self.assertIn("completedTasks >= 10", source)
         self.assertIn("insufficient data", source)
         self.assertIn("Tool failures", source)
 
@@ -2977,11 +2977,153 @@ process.stdout.write(JSON.stringify(out))
         self.assertIn("Unmapped (edit in config)", source)
         self.assertIn("Reliability rank #${formatCount(reliability.rank)}", source)
         self.assertIn("Not rankable yet", source)
-        self.assertIn("risk ≤ ${formatPercent(bound)}", source)
+        self.assertIn("failure rate at most ${formatPercent(bound)} (95% confidence)", source)
         self.assertIn("of ${formatCount(toolCalls)} tool calls", source)
-        self.assertIn("Work ledger: scores completed main-role tasks", source)
+        self.assertIn("Work ledger: scores finished main-role tasks", source)
         self.assertIn("at this pace, empty ~${formatShortDate(quota.exhaustAt)}", source)
         self.assertIn("API attempt failure rate", source)
+
+    def test_work_ledger_scores_closed_sessions_and_counts_exclusion_reasons(self):
+        connection = sqlite3.connect(self.db_path)
+        try:
+            sessions = [
+                ("closed-clean", "provider/model-cc", "session_reset", "2027-02-01 09:00:00,000"),
+                ("closed-abandoned", "provider/model-ca", "startup_orphan_reap", "2027-02-01 09:10:00,000"),
+                ("closed-recovered", "provider/model-cr", "ws_orphan_reap", "2027-02-01 09:20:00,000"),
+                ("still-open", "provider/model-op", None, "2027-02-01 09:30:00,000"),
+            ]
+            for session_id, model, reason, stamp in sessions:
+                started_at = api._timestamp_from_log(stamp)
+                ended_at = None if reason is None else started_at + 60
+                connection.execute(
+                    """
+                    INSERT INTO sessions (
+                        id,source,model,started_at,ended_at,end_reason,billing_provider,
+                        billing_mode,last_activity_at,api_call_count
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    (session_id, "desktop", model, started_at, ended_at, reason, "provider", "metered", started_at + 60, 2),
+                )
+                connection.execute(
+                    SESSION_MODEL_USAGE_INSERT_SQL,
+                    (session_id, model, "provider", "metered", "", 2, 100, 20, 0, 0, 0, 0.001, 0, "estimated", "test", started_at + 2, started_at + 50),
+                )
+            connection.commit()
+        finally:
+            connection.close()
+        log_specs = [
+            "2027-02-01 09:00:10,000 INFO [closed-clean] agent.conversation_loop: API call #1: model=provider/model-cc provider=provider in=100 out=20 total=120 latency=1.0s\n",
+            "2027-02-01 09:10:10,000 INFO [closed-abandoned] agent.conversation_loop: API call #1: model=provider/model-ca provider=provider in=100 out=20 total=120 latency=1.0s\n",
+            "2027-02-01 09:10:20,000 WARNING [closed-abandoned] agent.conversation_loop: API call failed (attempt 1/1) error_type=APITimeout provider=provider base_url=https://example.test model=provider/model-ca summary=timeout\n",
+            "2027-02-01 09:20:10,000 WARNING [closed-recovered] agent.conversation_loop: API call failed (attempt 1/2) error_type=APITimeout provider=provider base_url=https://example.test model=provider/model-cr summary=timeout\n",
+            "2027-02-01 09:20:20,000 INFO [closed-recovered] agent.conversation_loop: API call #2: model=provider/model-cr provider=provider in=100 out=20 total=120 latency=1.0s\n",
+            "2027-02-01 09:30:10,000 INFO [still-open] agent.conversation_loop: API call #1: model=provider/model-op provider=provider in=100 out=20 total=120 latency=1.0s\n",
+        ]
+        log_path = self.home / "logs" / "agent.log"
+        log_path.write_text(log_path.read_text(encoding="utf-8") + "".join(log_specs), encoding="utf-8")
+        api._log_file_cache.clear()
+        with patch.object(api, "_plugin_settings", return_value={"rate_sample_threshold": 1}):
+            payload = api._ai_models_sync(0)
+        models = {item["model_id"]: item for item in payload["models"]}
+
+        # A Desktop reset with a clean log trail is finished work.
+        clean = models["provider/model-cc"]["work_reliability"]
+        self.assertEqual(clean["eligible_tasks"], 1)
+        self.assertEqual(clean["clean_completions"], 1)
+
+        # A reaped session whose last logged API event is a failure was abandoned on it.
+        abandoned = models["provider/model-ca"]["work_reliability"]
+        self.assertEqual(abandoned["eligible_tasks"], 1)
+        self.assertEqual(abandoned["unrecovered_failures"], 1)
+
+        # A reaped session that succeeded after a failure recovered.
+        recovered = models["provider/model-cr"]["work_reliability"]
+        self.assertEqual(recovered["eligible_tasks"], 1)
+        self.assertEqual(recovered["recovered_tasks"], 1)
+
+        # Sessions that never ended are excluded, and the reason is counted per task type.
+        open_task = models["provider/model-op"]["work_reliability"]
+        self.assertEqual(open_task["eligible_tasks"], 0)
+        reasons = open_task["by_task_type"][0]["ineligible_reasons"]
+        self.assertEqual(len(reasons), 1)
+        self.assertIn(reasons[0]["label"], {"still open", "still running"})
+        self.assertEqual(reasons[0]["count"], 1)
+        self.assertIn("closed by a Desktop reset or reap", payload["coverage"]["work_reliability"])
+
+    def test_model_routes_merge_when_labels_match(self):
+        connection = sqlite3.connect(self.db_path)
+        try:
+            for host, calls in (("https://a.example.test", 3), ("https://b.example.test", 2)):
+                connection.execute(
+                    """
+                    INSERT INTO session_model_usage (
+                        session_id,model,billing_provider,billing_base_url,billing_mode,task,api_call_count,
+                        input_tokens,output_tokens,cache_read_tokens,cache_write_tokens,reasoning_tokens,
+                        estimated_cost_usd,actual_cost_usd,cost_status,cost_source,first_seen,last_seen
+                    ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    """,
+                    ("session-1", "provider/model-merge", "provider", host, "metered", "", calls, 100, 20, 0, 0, 0, 0.001, 0, "estimated", "test", 1_800_000_010, 1_800_000_050),
+                )
+            connection.commit()
+        finally:
+            connection.close()
+        models = {item["model_id"]: item for item in api._ai_models_sync(0)["models"]}
+        model = models["provider/model-merge"]
+        self.assertEqual(model["route_count"], 1)
+        self.assertEqual(model["routes"][0]["requests"], 5)
+        self.assertEqual(model["routes"][0]["label"], "Provider API")
+
+    def test_latency_insight_compares_with_peer_models_or_stays_silent(self):
+        connection = sqlite3.connect(self.db_path)
+        try:
+            started_at = 1_800_000_300
+            connection.execute(
+                """
+                INSERT INTO sessions (
+                    id,source,model,started_at,ended_at,end_reason,billing_provider,
+                    billing_mode,last_activity_at,api_call_count
+                ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                """,
+                ("slow-session", "desktop", "provider/model-slow", started_at, started_at + 60, "completed", "provider", "metered", started_at + 60, 1),
+            )
+            connection.execute(
+                SESSION_MODEL_USAGE_INSERT_SQL,
+                ("slow-session", "provider/model-slow", "provider", "metered", "", 1, 100, 20, 0, 0, 0, 0.001, 0, "estimated", "test", started_at + 2, started_at + 50),
+            )
+            connection.commit()
+        finally:
+            connection.close()
+        log_path = self.home / "logs" / "agent.log"
+        log_path.write_text(
+            log_path.read_text(encoding="utf-8")
+            + f"{_stamp(started_at + 10)} INFO [slow-session] agent.conversation_loop: API call #1: model=provider/model-slow provider=provider in=100 out=20 total=120 latency=30.0s\n",
+            encoding="utf-8",
+        )
+        api._log_file_cache.clear()
+        models = {item["model_id"]: item for item in api._ai_models_sync(0)["models"]}
+        self.assertIn("× the", models["provider/model-slow"]["insight"])
+        self.assertIn("other model", models["provider/model-slow"]["insight"])
+        self.assertNotIn("latency", str(models["provider/model-a"]["insight"]).lower())
+
+    def test_ai_models_ui_states_scope_reasons_and_confidence_plainly(self):
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("two separate evidence layers", source)
+        self.assertNotIn("two separated", source)
+        self.assertIn("label: 'Cost · quota'", source)
+        self.assertIn("periodScopeLabel(period)", source)
+        self.assertIn("Metered routes only; excludes", source)
+        self.assertIn("logs cover ${formatCount(logSamples)} of ${formatCount(requests)} calls", source)
+        self.assertIn("not eligible${reasonText ? `: ${reasonText}` : ''}", source)
+        self.assertIn("No task failed and no API failure occurred", source)
+        self.assertIn("How these numbers are computed", source)
+        self.assertIn("no rankable evidence yet", source)
+        self.assertIn("useState({ key: 'work', direction: 'asc' })", source)
+        self.assertIn("Requests per day, last 7 days", source)
+        self.assertIn("Cost per completed task", source)
+        self.assertIn("${formatCount(shownCount)} of ${formatCount(samples)} ${sampleNoun}", source)
+        self.assertNotIn("true failure could reach", source)
+        self.assertNotIn("work-failure risk", source)
+        self.assertNotIn("risk ≤", source)
 
     def test_custom_period_is_inclusive_by_start_and_exclusive_by_end(self):
         start = 1_799_999_999
