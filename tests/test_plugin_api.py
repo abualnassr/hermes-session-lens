@@ -768,6 +768,7 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertNotIn("'session.create'", source)
         self.assertIn("**Ask Hermes.**", readme)
         self.assertIn("never submits the prompt", readme)
+        self.assertIn("clipboard copies you ask for", readme)
 
     def test_digest_summarizes_periods_and_builds_markdown(self):
         payload = api._digest_sync(0)
