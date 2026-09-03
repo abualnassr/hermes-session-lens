@@ -1200,6 +1200,31 @@ process.stdout.write(JSON.stringify(out))
         self.assertEqual(stray, [])
         self.assertNotRegex(body, r"\.from\b(?!\()")
 
+    def test_plugin_settings_reads_hermes_config_block(self):
+        """The Hermes-only branch: hermes_cli.config importable and returning the nested config.
+        (0.32.1 shipped a NameError here that no outside-Hermes test could reach.)"""
+        import types
+
+        fake_config = types.ModuleType("hermes_cli.config")
+        fake_config.load_config_readonly = lambda: {
+            "plugins": {"entries": {"session-lens": {"settings": {"rate_sample_threshold": 7, "anthropic_usage_probe": False}}}}
+        }
+        fake_pkg = types.ModuleType("hermes_cli")
+        fake_pkg.config = fake_config
+        with patch.dict(sys.modules, {"hermes_cli": fake_pkg, "hermes_cli.config": fake_config}):
+            self.assertEqual(hermes_compat._plugin_settings(), {"rate_sample_threshold": 7, "anthropic_usage_probe": False})
+            self.assertEqual(api._rate_sample_threshold(), 7)
+            from dashboard._providers import anthropic as anthropic_provider
+
+            self.assertFalse(anthropic_provider._anthropic_probe_enabled())
+        # Legacy "config" block and a missing entry both stay quiet.
+        fake_config.load_config_readonly = lambda: {"plugins": {"entries": {"session-lens": {"config": {"rate_sample_threshold": 3}}}}}
+        with patch.dict(sys.modules, {"hermes_cli": fake_pkg, "hermes_cli.config": fake_config}):
+            self.assertEqual(hermes_compat._plugin_settings(), {"rate_sample_threshold": 3})
+        fake_config.load_config_readonly = lambda: {}
+        with patch.dict(sys.modules, {"hermes_cli": fake_pkg, "hermes_cli.config": fake_config}):
+            self.assertEqual(hermes_compat._plugin_settings(), {})
+
     def test_native_select_popup_gets_its_own_scheme_and_plain_colors(self):
         """Hermes' root keeps color-scheme: light and its tokens are color-mix() over transparent,
         which Chromium's native <select> popup cannot resolve - dark themes showed unreadable options."""

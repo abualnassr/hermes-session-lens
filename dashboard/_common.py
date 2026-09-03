@@ -63,7 +63,7 @@ def _plugin_version() -> str:
             return match.group(1)
     except OSError:
         pass
-    return "0.32.1"
+    return "0.32.2"
 
 
 PLUGIN_VERSION = _plugin_version()
