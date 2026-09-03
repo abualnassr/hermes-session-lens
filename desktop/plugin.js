@@ -395,13 +395,35 @@ function SectionHeading({ title, description, action }) {
   })
 }
 
+// Hermes' text and surface tokens are color-mix() values over transparent and
+// its root keeps `color-scheme: light` in every mode. Chromium paints a native
+// <select> popup in a separate page popup that follows the element's
+// color-scheme and cannot resolve those mixed colors, so in a dark theme the
+// option list came out as dark default text on a dark translucent surface —
+// unreadable until hovered. The popup therefore gets its own scheme (from the
+// root's `dark` class) and plain colors built on Hermes' hex theme seeds.
+const nativeSelectCss = [
+  '.session-lens-select option { background: #ffffff; color: var(--theme-foreground, #17171a); }',
+  ':root.dark .session-lens-select option { background: var(--theme-neutral-card, #161618); color: #f2f2f3; }'
+].join(' ')
+
+function nativeSelectScheme() {
+  try {
+    return document.documentElement.classList.contains('dark') ? 'dark' : 'light'
+  } catch {
+    return 'light'
+  }
+}
+
 function NativeSelect({ value, onChange, label, children }) {
   return jsx('label', {
     style: { alignItems: 'center', color: color.tertiary, display: 'inline-flex', fontSize: '0.6875rem', gap: '0.4rem' },
     children: jsxs(Fragment, {
       children: [
+        jsx('style', { children: nativeSelectCss }),
         jsx('span', { children: label }),
         jsx('select', {
+          className: 'session-lens-select',
           value,
           onChange: event => onChange(event.target.value),
           style: {
@@ -409,6 +431,7 @@ function NativeSelect({ value, onChange, label, children }) {
             border,
             borderRadius: '4px',
             color: color.primary,
+            colorScheme: nativeSelectScheme(),
             font: 'inherit',
             outlineColor: color.accent,
             padding: '0.28rem 1.7rem 0.28rem 0.45rem'

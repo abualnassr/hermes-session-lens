@@ -1198,7 +1198,19 @@ process.stdout.write(JSON.stringify(out))
         body = source.split("from 'react/jsx-runtime'", 1)[1]
         stray = [line.strip() for line in body.splitlines() if re.search(r"from\s*['\"]", line)]
         self.assertEqual(stray, [])
-        self.assertNotRegex(body, r"\.from(?!\()")
+        self.assertNotRegex(body, r"\.from\b(?!\()")
+
+    def test_native_select_popup_gets_its_own_scheme_and_plain_colors(self):
+        """Hermes' root keeps color-scheme: light and its tokens are color-mix() over transparent,
+        which Chromium's native <select> popup cannot resolve - dark themes showed unreadable options."""
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("className: 'session-lens-select'", source)
+        self.assertIn("colorScheme: nativeSelectScheme()", source)
+        self.assertIn("classList.contains('dark')", source)
+        self.assertIn(":root.dark .session-lens-select option", source)
+        self.assertRegex(source, r"\.session-lens-select option \{ background: #ffffff; color: var\(--theme-foreground")
+        # Every dropdown in the plugin goes through the shared component.
+        self.assertEqual(source.count("jsx('select'"), 1)
 
     def test_tool_names_merge_registry_and_records(self):
         self._seed_rules_sessions()
