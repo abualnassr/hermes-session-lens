@@ -104,7 +104,7 @@ components:
 
 Hermes Session Lens is an **Operate** surface inside Hermes Desktop: one native observatory connecting provider capacity and session evidence to accounting and operational health. It inherits Hermes typography, controls, codicons, focus behavior, and light/dark theme roles; it does not establish a separate brand skin.
 
-This design document describes Hermes Session Lens `0.33.1`.
+This design document describes Hermes Session Lens `0.34.0`.
 
 The interface is compact, quiet, and evidence-first. A user finds a session, verifies trace and accounting, then inspects runtime, profile, or schedule state without leaving Hermes. Progressive disclosure carries the density, while explicit provenance, bounded excerpts, and read-only language make the trust boundary visible.
 
@@ -247,6 +247,7 @@ The form language is compact and lightly softened. Native/select controls use re
 - **Tables:** Secondary-surface headers, one-pixel row separators, right-aligned numeric columns, and horizontal overflow preserve dense comparisons. Every header is a keyboard-accessible sort control with a Codicon direction indicator and `aria-sort` state; sorting is local and stable.
 - **Trace:** Chronological user, assistant, reasoning, tool-call, and tool-result rows. Reasoning is collapsed by default; tool results use bounded, scrollable monospace blocks.
 - **Failure inspector:** Begins with a destructive-wash notice distinguishing failures shown in the bounded event scan from the confirmed full-session total. SQL only prefilters candidate content; the shared Python signature confirms it before any count, while recorded Hermes finish/effect states remain authoritative.
+- **Ask Hermes:** An outline `xs` button beside **Open session**, shown only when the bounded scan holds at least one failure. It follows a prepare-and-hand-over pattern: the backend renders the prompt, the desktop copies it and opens a new chat, and a toast states the size and the next step. The plugin never submits a prompt or creates a session; the button spins while the prompt is fetched and is disabled meanwhile.
 - **Trust note:** Trace copy explicitly excludes system and scheduled-job scaffold prompts and states that content is secret-redacted and bounded to 6,000 characters per event.
 
 ### States

@@ -6,7 +6,7 @@
 
 It installs as one Hermes plugin: a native Desktop page plus its namespaced Python API. No iframe, no separate server, no telemetry service, and no write path — the backend defines zero mutation routes and never touches a credential store.
 
-This documentation describes Hermes Session Lens `0.33.1`, verified on Hermes Agent and Desktop `0.21.0`. MIT licensed. A community plugin, not affiliated with or endorsed by Nous Research.
+This documentation describes Hermes Session Lens `0.34.0`, verified on Hermes Agent and Desktop `0.21.0`. MIT licensed. A community plugin, not affiliated with or endorsed by Nous Research.
 
 ![How Session Lens works: what it reads, what it answers, and what it never does](docs/how-it-works.svg)
 
@@ -48,6 +48,8 @@ Every recorded session, sorted failures-first by default. The search box takes f
 ![Session trace: chronological user, assistant, reasoning, tool-call, and tool-result rows](docs/screenshots/session-trace.png)
 
 The **Trace** tab replays the session in order — user, assistant, reasoning, tool call, tool result — with system prompts excluded and content redacted and bounded. Latency, cache-hit ratio, and tool durations come from Hermes' local agent logs. An attention banner above the list flags runaway work (sessions open past 24 hours that are still active or idle on five million tokens, and reaped or timed-out sessions at the same size); each note can be dismissed and restored.
+
+**Ask Hermes.** A session with failures gets an **Ask Hermes** button beside **Open session**. It builds a failure-analysis prompt from the evidence the Failures tab already shows — failures grouped by tool and error signature with counts, timestamps, and bounded, secret-redacted result snippets, plus the session's model usage and outcome — copies it to the clipboard, and opens a fresh Hermes chat in the session's profile for you to paste it into. Session Lens never submits the prompt or creates a session itself: you see exactly what the model will read, and no tokens are spent until you press send. The prompt stays under 12,000 characters; user and assistant message text is deliberately left out. The same text is available as `GET /api/plugins/session-lens/sessions/{id}/analysis-prompt`.
 
 ### Overview — where the spend goes
 

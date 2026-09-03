@@ -38,7 +38,7 @@ The plugin appears in Hermes Desktop's left sidebar as **Session Lens** and open
 - Cached local-log telemetry for latency, cache efficiency, request-failure observations, and tool duration; time-to-first-token remains explicitly unavailable because Hermes does not record it.
 - Cross-profile accounting, gateway/platform health, and prompt-safe schedules.
 - Failure-first sorting, a dedicated failed-call inspector, Hermes FTS search with snippets, and cursor-style pagination up to 500 rows.
-- An Ask Lens workflow that produces a privacy-conscious, session-grounded prompt for analysis in Hermes.
+- An Ask Hermes workflow: a bounded, secret-redacted, session-grounded failure-analysis prompt (failures grouped by tool and error signature, no user or assistant message text, under 12,000 characters) copied to the clipboard with a fresh Hermes chat opened for it. Session Lens never submits the prompt or creates a session itself.
 - Instruction rules: user-composed WHEN/THEN checks from a fixed catalog of conditions and expectations (tool calls, tool order and budgets, reply text, language, paths, argument values, timing), with presets for the common sentences, graded per recorded turn and scored per model with sample-size-aware ranking; deterministic verdicts only, no LLM judge, no reading of SOUL.md.
 - Export menus on every data view (CSV, JSON, Markdown digest) built in the desktop from read-only data, offered as a Save File download or a clipboard copy.
 - Read-only database access. The plugin must not mutate, archive, delete, or rewrite sessions.
@@ -56,7 +56,7 @@ The plugin appears in Hermes Desktop's left sidebar as **Session Lens** and open
 - Sidebar label: **Session Lens**.
 - Repository name: `hermes-session-lens`.
 - Plugin id: `session-lens`.
-- Current documented release: `0.33.1`.
+- Current documented release: `0.34.0`.
 - The interface inherits Hermes Desktop's native components, typography, spacing, and theme variables.
 - Upstream inspiration is credited transparently; no upstream logo or endorsement is implied.
 

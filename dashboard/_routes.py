@@ -497,6 +497,283 @@ async def session_detail(session_id: str, profiles: str = Query("")) -> Dict[str
     return await asyncio.to_thread(_scoped_call, profiles, _session_detail_sync, session_id)
 
 
+# ── Ask Hermes: a session-grounded failure-analysis prompt ──────────────────
+# Builds the text a user pastes into a new Hermes chat. It reuses the detail
+# payload (bounded, secret-redacted snippets) and adds nothing the Failures
+# tab does not already show: no user or assistant message content, no file
+# contents. The plugin never sends it anywhere; the desktop copies it to the
+# clipboard and opens a fresh chat.
+_ANALYSIS_PROMPT_MAX_CHARS = 12_000
+_ANALYSIS_PROMPT_MAX_GROUPS = 12
+_ANALYSIS_PROMPT_SIGNATURE_CHARS = 96
+_ANALYSIS_PROMPT_HEADLINE_CHARS = 120
+_ANALYSIS_PROMPT_ARGUMENT_CHARS = 240
+# (examples per group, characters per example snippet), tried in order until
+# the rendered prompt fits the budget.
+_ANALYSIS_PROMPT_BUDGET_STEPS = ((3, 400), (2, 400), (1, 400), (1, 200), (1, 120), (0, 0))
+_ANALYSIS_PROMPT_DIGITS_RE = re.compile(r"\d+")
+_ANALYSIS_PROMPT_SPACE_RE = re.compile(r"\s+")
+
+
+_ANALYSIS_PROMPT_JSON_ERROR_RE = re.compile(r'"(?:error|message|detail)"\s*:\s*"((?:[^"\\]|\\.)*)')
+_ANALYSIS_PROMPT_WRAPPER_RE = re.compile(r"^<untrusted_tool_result\b[^>]*>$")
+_ANALYSIS_PROMPT_WORD_RE = re.compile(r"[A-Za-z0-9]")
+_ANALYSIS_PROMPT_BOILERPLATE_PREFIXES = ("The following content was retrieved from an external source",)
+
+
+def _analysis_unescape_json(fragment: str) -> str:
+    """Decode a JSON string body that may have been cut mid-escape by snippet bounding."""
+    try:
+        return json.loads('"' + fragment + '"', strict=False)
+    except ValueError:
+        trimmed = fragment.rstrip(chr(92))
+        return trimmed.replace(chr(92) + "n", " ").replace(chr(92) + "t", " ").replace(chr(92) + '"', '"')
+
+
+def _analysis_first_line(text: Any, depth: int = 0) -> str:
+    """The line that best names a failure: a JSON error string when the result
+    is JSON (one level of nesting unwrapped), otherwise the first meaningful line
+    after Hermes' untrusted-content wrapper."""
+    body_lines: List[str] = []
+    for line in str(text or "").splitlines():
+        stripped = _ANALYSIS_PROMPT_SPACE_RE.sub(" ", line).strip()
+        if not stripped or _ANALYSIS_PROMPT_WRAPPER_RE.match(stripped):
+            continue
+        if stripped.startswith(_ANALYSIS_PROMPT_BOILERPLATE_PREFIXES):
+            continue
+        body_lines.append(stripped)
+    body = "\n".join(body_lines)
+    if body.startswith("{"):
+        match = _ANALYSIS_PROMPT_JSON_ERROR_RE.search(body[:2000])
+        if match and match.group(1).strip():
+            decoded = _analysis_unescape_json(match.group(1))
+            if decoded.lstrip().startswith("{") and depth < 1:
+                nested = _analysis_first_line(decoded, depth + 1)
+                if nested:
+                    return nested
+            for line in decoded.splitlines():
+                candidate = _ANALYSIS_PROMPT_SPACE_RE.sub(" ", line).strip()
+                if candidate and _ANALYSIS_PROMPT_WORD_RE.search(candidate):
+                    return candidate
+    for stripped in body_lines:
+        if _ANALYSIS_PROMPT_WORD_RE.search(stripped):
+            return stripped
+    return ""
+
+
+def _analysis_signature(name: Any, snippet: Any) -> str:
+    """Group key: tool name plus the first snippet line with numbers neutralised."""
+    line = _ANALYSIS_PROMPT_DIGITS_RE.sub("#", _analysis_first_line(snippet).lower())
+    return f"{str(name or 'unknown tool').strip().lower()}{line[:_ANALYSIS_PROMPT_SIGNATURE_CHARS]}"
+
+
+def _analysis_failure_groups(failures: Iterable[Mapping[str, Any]]) -> List[Dict[str, Any]]:
+    groups: Dict[str, Dict[str, Any]] = {}
+    for event in failures:
+        key = _analysis_signature(event.get("name"), event.get("result_snippet"))
+        timestamp = _number(event.get("timestamp"), 0) or None
+        group = groups.get(key)
+        if group is None:
+            headline = _analysis_first_line(event.get("result_snippet"))
+            group = groups[key] = {
+                "tool": str(event.get("name") or "unknown tool"),
+                "headline": headline[:_ANALYSIS_PROMPT_HEADLINE_CHARS] or "no result text recorded",
+                "count": 0,
+                "first_at": timestamp,
+                "last_at": timestamp,
+                "examples": [],
+            }
+        group["count"] += 1
+        if timestamp:
+            group["first_at"] = timestamp if group["first_at"] is None else min(group["first_at"], timestamp)
+            group["last_at"] = timestamp if group["last_at"] is None else max(group["last_at"], timestamp)
+        group["examples"].append(
+            {
+                "timestamp": timestamp,
+                "argument_summary": str(event.get("argument_summary") or "")[:_ANALYSIS_PROMPT_ARGUMENT_CHARS],
+                "result_snippet": str(event.get("result_snippet") or ""),
+            }
+        )
+    ordered = sorted(groups.values(), key=lambda item: (-item["count"], -(item["last_at"] or 0), item["tool"]))
+    for group in ordered:
+        # Detail failures arrive newest first; keep the most recent examples.
+        group["examples"] = group["examples"][:3]
+    return ordered
+
+
+def _analysis_stamp(timestamp: Any) -> str:
+    value = _number(timestamp, 0)
+    if not value:
+        return "time not recorded"
+    return dt.datetime.fromtimestamp(value).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _analysis_duration(seconds: Any) -> str:
+    value = _number(seconds, 0)
+    if value <= 0:
+        return "unknown"
+    total = int(value)
+    hours, rest = divmod(total, 3600)
+    minutes, secs = divmod(rest, 60)
+    if hours:
+        return f"{hours}h {minutes:02d}m"
+    if minutes:
+        return f"{minutes}m {secs:02d}s"
+    return f"{secs}s"
+
+
+def _analysis_cost(session: Mapping[str, Any]) -> str:
+    kind = str(session.get("cost_kind") or "unpriced")
+    value = session.get("display_cost_usd")
+    if kind in {"actual", "estimated"} and value is not None:
+        return f"${_number(value):.2f} ({kind})"
+    return kind
+
+
+def _analysis_fence(text: str) -> str:
+    fence = "```"
+    while fence in text:
+        fence += "`"
+    return fence
+
+
+def _render_analysis_prompt(
+    detail: Mapping[str, Any],
+    groups: List[Dict[str, Any]],
+    example_limit: int,
+    snippet_chars: int,
+) -> str:
+    session = detail.get("session") or {}
+    failures = detail.get("failures") or []
+    shown_groups = groups[:_ANALYSIS_PROMPT_MAX_GROUPS]
+    omitted_groups = len(groups) - len(shown_groups)
+    outcome = str(session.get("outcome_label") or session.get("outcome") or "closed")
+    end_reason = session.get("end_reason")
+
+    lines: List[str] = [
+        "You are helping a Hermes Agent user understand why tool calls failed in one of their sessions.",
+        "Work only from the evidence below. It was extracted by the Session Lens plugin from Hermes' own records, "
+        "then bounded and secret-redacted, so some detail is missing on purpose. Do not invent tool behaviour, "
+        "file contents, or error text that is not shown.",
+        "",
+        "Answer in this order, briefly:",
+        "1. For each failure group: what happened, the most likely cause with the evidence line that supports it, "
+        "and how confident you are.",
+        "2. The three actions most likely to prevent these failures next time, most valuable first, each concrete "
+        "enough to act on today (a prompt change, a tool or MCP setting, a model or provider change, a retry rule, "
+        "or a task split).",
+        "3. What cannot be determined from this evidence, and exactly which extra evidence would settle it.",
+        "If a failure looks harmless or expected (a search that found nothing, a file that did not exist yet), "
+        "say so instead of inventing a problem.",
+        "",
+        "## Session",
+        f"- Title: {session.get('title') or 'Untitled session'}",
+        f"- Hermes session id: {session.get('id') or 'unknown'}",
+        f"- Started: {_analysis_stamp(session.get('started_at'))} · Duration: {_analysis_duration(session.get('duration_seconds'))}"
+        f" · Outcome: {outcome}" + (f" (end reason: {end_reason})" if end_reason else " (no end reason recorded)"),
+        f"- Source: {session.get('source') or 'not recorded'} · Working directory: {session.get('cwd') or 'not recorded'}",
+        f"- Main model: {session.get('model') or 'not recorded'}",
+        f"- Messages: {_integer(session.get('message_count'))} · Tool calls: {_integer(session.get('tool_call_count'))}"
+        f" · Confirmed failures: {_integer(session.get('failure_count'))} ({len(failures)} shown below from the bounded event scan)",
+        f"- Tokens: {_integer(session.get('total_tokens')):,} · Cost: {_analysis_cost(session)}",
+    ]
+
+    models = detail.get("models") or []
+    if models:
+        lines += ["", "## Model usage", "| Model | Task | Calls | Tokens |", "| --- | --- | ---: | ---: |"]
+        for usage in models[:12]:
+            lines.append(
+                f"| {usage.get('model') or 'unknown'} | {usage.get('task') or 'main'} | "
+                f"{_integer(usage.get('api_call_count'))} | {_integer(usage.get('total_tokens')):,} |"
+            )
+
+    skills = [item.get("name") for item in detail.get("skills") or [] if item.get("name")]
+    delegations = detail.get("delegations") or []
+    if skills or delegations:
+        lines += ["", "## Context"]
+        if skills:
+            lines.append(f"- Skills invoked: {', '.join(str(name) for name in skills[:10])}")
+        if delegations:
+            lines.append(f"- Delegated work: {len(delegations)} async delegation(s) linked to this session")
+
+    lines += ["", "## Failure groups (most frequent first)"]
+    if not shown_groups:
+        lines.append("No failures fell inside the bounded event scan, so there is nothing to group.")
+    for index, group in enumerate(shown_groups, start=1):
+        when = (
+            f"once, at {_analysis_stamp(group['last_at'])}"
+            if group["count"] == 1
+            else (
+                f"{group['count']} times, all recorded at {_analysis_stamp(group['last_at'])}"
+                if _analysis_stamp(group["first_at"]) == _analysis_stamp(group["last_at"])
+                else f"{group['count']} times, first {_analysis_stamp(group['first_at'])}, last {_analysis_stamp(group['last_at'])}"
+            )
+        )
+        lines += ["", f"### {index}. {group['tool']} — {group['headline']}", f"Seen {when}."]
+        for example_index, example in enumerate(group["examples"][:example_limit], start=1):
+            lines.append(f"Example {example_index} ({_analysis_stamp(example['timestamp'])}):")
+            if example["argument_summary"]:
+                lines.append(f"Arguments: {example['argument_summary']}")
+            snippet = example["result_snippet"][:snippet_chars].rstrip()
+            if snippet:
+                fence = _analysis_fence(snippet)
+                truncated = len(example["result_snippet"]) > snippet_chars
+                lines += ["Result:", fence, snippet + (" …" if truncated else ""), fence]
+        if example_limit == 0:
+            lines.append("(examples omitted to keep this prompt short; ask the user for the Failures tab snippet if needed)")
+    if omitted_groups > 0:
+        lines.append(f"\n{omitted_groups} further failure group(s) omitted to keep this prompt short.")
+
+    analysis = detail.get("analysis") or {}
+    lines += [
+        "",
+        "## How this evidence was produced",
+        "- Failure detection: recorded Hermes error state plus conservative tool-result signatures; the signatures "
+        "match English error text only, so failures reported in other languages may be under-counted.",
+        "- Result snippets are bounded and secret-redacted; user and assistant message text is deliberately not included.",
+    ]
+    if analysis.get("truncated"):
+        lines.append(
+            f"- The event scan reached its {_integer(analysis.get('event_limit')):,}-event safety limit, "
+            "so older tool calls in this session are not represented."
+        )
+    return "\n".join(lines).strip() + "\n"
+
+
+def _build_analysis_prompt(detail: Mapping[str, Any]) -> Dict[str, Any]:
+    failures = list(detail.get("failures") or [])
+    groups = _analysis_failure_groups(failures)
+    example_limit, snippet_chars = _ANALYSIS_PROMPT_BUDGET_STEPS[-1]
+    text = ""
+    for example_limit, snippet_chars in _ANALYSIS_PROMPT_BUDGET_STEPS:
+        text = _render_analysis_prompt(detail, groups, example_limit, snippet_chars)
+        if len(text) <= _ANALYSIS_PROMPT_MAX_CHARS:
+            break
+    session = detail.get("session") or {}
+    return {
+        "session_id": session.get("id"),
+        "prompt": text,
+        "characters": len(text),
+        "failures_shown": len(failures),
+        "failures_total": _integer(session.get("failure_count")),
+        "failure_groups": len(groups),
+        "groups_included": min(len(groups), _ANALYSIS_PROMPT_MAX_GROUPS),
+        "examples_per_group": example_limit,
+        "snippet_chars": snippet_chars,
+        "max_chars": _ANALYSIS_PROMPT_MAX_CHARS,
+        "generated_at": time.time(),
+    }
+
+
+def _analysis_prompt_sync(session_id: str) -> Dict[str, Any]:
+    return _build_analysis_prompt(_session_detail_sync(session_id))
+
+
+@router.get("/sessions/{session_id}/analysis-prompt")
+async def session_analysis_prompt(session_id: str, profiles: str = Query("")) -> Dict[str, Any]:
+    return await asyncio.to_thread(_scoped_call, profiles, _analysis_prompt_sync, session_id)
+
+
 def _trace_sync(session_id: str, limit: int, offset: int) -> Dict[str, Any]:
     with _database() as db:
         sid = db.resolve_session_id(session_id)

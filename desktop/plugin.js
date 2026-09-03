@@ -692,6 +692,59 @@ function notifyHost(kind, message) {
   }
 }
 
+// ── Ask Hermes ─────────────────────────────────────────────────────────────
+// "Prepare and hand over": the backend renders a bounded, secret-redacted,
+// session-grounded failure-analysis prompt; the desktop copies it to the
+// clipboard and opens a fresh Hermes chat for the user to paste it into.
+// Session Lens never submits a prompt or creates a session itself, so it stays
+// read-only and the user sees exactly what the model will read before any
+// tokens are spent.
+async function askHermesAboutFailures({ ctx, sessionId, profile }) {
+  const payload = await ctx.rest(apiPath(`/sessions/${encodeURIComponent(sessionId)}/analysis-prompt`, profile ? { profiles: profile } : {}))
+  const prompt = payload?.prompt
+  if (typeof prompt !== 'string' || !prompt.trim()) throw new Error('the analysis prompt came back empty')
+  await copyText(prompt)
+  let opened = false
+  try {
+    if (typeof host?.newChat === 'function') {
+      await host.newChat(profile || undefined)
+      opened = true
+    }
+  } catch {
+    // Opening the chat is a convenience; the prompt is already on the clipboard.
+  }
+  return { ...payload, opened }
+}
+
+function AskHermesButton({ ctx, session, profile, failuresShown }) {
+  const [busy, setBusy] = useState(false)
+  if (!failuresShown) return null
+  const run = async () => {
+    setBusy(true)
+    try {
+      const result = await askHermesAboutFailures({ ctx, sessionId: session.id, profile })
+      const groups = Number(result.failure_groups) || 0
+      const size = `${formatCount(result.characters)} characters · ${formatCount(groups)} failure group${groups === 1 ? '' : 's'}`
+      notifyHost('success', result.opened
+        ? `Analysis prompt copied (${size}). Paste it into the new chat and send.`
+        : `Analysis prompt copied (${size}). Open a new Hermes chat, paste it, and send.`)
+    } catch (error) {
+      notifyHost('error', `Could not prepare the analysis prompt: ${error?.message || error}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+  return jsx(Button, {
+    variant: 'outline',
+    size: 'xs',
+    disabled: busy,
+    onClick: run,
+    title: "Copy a failure-analysis prompt built from this session's recorded failures (bounded, secret-redacted) and open a new Hermes chat to paste it into. Nothing is sent until you press send.",
+    children: jsxs(Fragment, { children: [busy ? jsx(SpinIcon, { size: '0.7rem' }) : jsx(Codicon, { name: 'comment-discussion' }), 'Ask Hermes'] })
+  })
+}
+// ── End Ask Hermes ─────────────────────────────────────────────────────────
+
 // Items: { id, label, hint?, filename, mime?, build: () => string | Promise<string> }.
 // Every item offers Download (Save File dialog) and Copy (clipboard).
 function ExportMenu({ items, label = 'Export', title = 'Export this view as CSV, JSON, or Markdown' }) {
@@ -1161,7 +1214,7 @@ function FailureInspector({ failures, detectedTotal = 0 }) {
     children: [
       jsx('div', {
         style: { background: color.dangerSoft, borderBottom: border, color: color.danger, fontSize: '0.6875rem', lineHeight: 1.5, padding: '0.65rem 1rem' },
-        children: `${formatCount(failures.length)} shown in the bounded event scan; ${formatCount(detectedTotal || failures.length)} confirmed failure${detectedTotal === 1 ? '' : 's'} in the full session. Review the recorded result before drawing conclusions.`
+        children: `${formatCount(failures.length)} shown in the bounded event scan; ${formatCount(detectedTotal || failures.length)} confirmed failure${detectedTotal === 1 ? '' : 's'} in the full session. Review the recorded result before drawing conclusions, or use Ask Hermes above to have a fresh chat explain them.`
       }),
       jsx(ToolEvents, { events: failures })
     ]
@@ -1317,7 +1370,7 @@ function TraceView({ ctx, sessionId, period }) {
   })
 }
 
-function SessionDetail({ query, detailTab, setDetailTab, ctx, period, onBack }) {
+function SessionDetail({ query, detailTab, setDetailTab, ctx, period, profile, onBack }) {
   if (!query) {
     return jsx(EmptyState, { title: 'Choose a session', description: 'Select a session to inspect its recorded evidence.' })
   }
@@ -1372,11 +1425,17 @@ function SessionDetail({ query, detailTab, setDetailTab, ctx, period, onBack }) 
               })
             ]
           }),
-          jsx(Button, {
-            variant: 'outline',
-            size: 'xs',
-            onClick: () => host.openSession(session.id, { intent: 'stack' }),
-            children: jsxs(Fragment, { children: [jsx(Codicon, { name: 'go-to-file' }), 'Open session'] })
+          jsxs('div', {
+            style: { display: 'flex', flexShrink: 0, flexWrap: 'wrap', gap: '0.4rem', justifyContent: 'flex-end' },
+            children: [
+              jsx(AskHermesButton, { ctx, session, profile, failuresShown: detail.failures?.length || 0 }),
+              jsx(Button, {
+                variant: 'outline',
+                size: 'xs',
+                onClick: () => host.openSession(session.id, { intent: 'stack' }),
+                children: jsxs(Fragment, { children: [jsx(Codicon, { name: 'go-to-file' }), 'Open session'] })
+              })
+            ]
           })
         ]
       }),
@@ -1717,9 +1776,10 @@ function SessionsView({ ctx, period, narrow, drill }) {
                   ? jsx(SessionDetail, {
                       query: detailQuery,
                       detailTab,
-                       setDetailTab,
-                       ctx,
-                       period,
+                      setDetailTab,
+                      ctx,
+                      period,
+                      profile: selectedProfile,
                       onBack: narrow ? () => setNarrowPane('list') : undefined
                     })
                   : jsx(EmptyState, { title: 'Choose a session', description: 'Session evidence will appear here.' })
