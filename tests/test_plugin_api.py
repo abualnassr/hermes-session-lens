@@ -1729,61 +1729,285 @@ process.stdout.write(JSON.stringify(out))
         )
         self.assertEqual(payload["details"], ["Extra usage: 1.50 / 20.00 USD"])
 
-    def test_anthropic_api_key_shadowing_falls_back_to_stored_oauth(self):
+    _ANTHROPIC_UNIFIED_HEADERS = {
+        "anthropic-ratelimit-unified-status": "allowed",
+        "anthropic-ratelimit-unified-5h-utilization": "0.14",
+        "anthropic-ratelimit-unified-5h-reset": "1790000000",
+        "anthropic-ratelimit-unified-7d-utilization": "0.17",
+        "anthropic-ratelimit-unified-7d-reset": "1790400000",
+        "anthropic-ratelimit-unified-overage-status": "rejected",
+        "anthropic-ratelimit-unified-overage-disabled-reason": "org_level_disabled",
+        "anthropic-organization-id": "org-max",
+    }
+    _ANTHROPIC_CONSOLE_HEADERS = {
+        "anthropic-ratelimit-requests-limit": "10000",
+        "anthropic-ratelimit-requests-remaining": "9999",
+        "anthropic-ratelimit-requests-reset": "2027-01-15T21:00:30Z",
+        "anthropic-ratelimit-input-tokens-limit": "10000000",
+        "anthropic-ratelimit-input-tokens-remaining": "10000000",
+        "anthropic-ratelimit-input-tokens-reset": "2027-01-15T21:00:30Z",
+        "anthropic-ratelimit-output-tokens-limit": "2000000",
+        "anthropic-ratelimit-output-tokens-remaining": "2000000",
+        "anthropic-ratelimit-output-tokens-reset": "2027-01-15T21:00:30Z",
+        "anthropic-ratelimit-tokens-limit": "12000000",
+        "anthropic-ratelimit-tokens-remaining": "12000000",
+        "anthropic-ratelimit-tokens-reset": "2027-01-15T21:00:30Z",
+        "anthropic-organization-id": "org-console",
+    }
+
+    @contextlib.contextmanager
+    def _anthropic_sources(self, env=(), resolver="", claude_code="", pool=(), probe_enabled=True):
+        """Stub every read-only Anthropic credential source and clear the probe cache."""
         from dashboard._providers import anthropic as anthropic_provider
 
-        shadowed = patch.object(
-            anthropic_provider, "_resolve_anthropic_oauth", return_value=("sk-ant-api-key", False)
+        anthropic_provider._anthropic_probe_cache.clear()
+        provider_shared._set_collect_fresh(False)
+        with patch.object(anthropic_provider, "_anthropic_env_credentials", return_value=list(env)):
+            with patch.object(anthropic_provider, "_resolve_anthropic_oauth", return_value=(resolver, bool(resolver))):
+                with patch.object(anthropic_provider, "_resolve_anthropic_claude_code_oauth", return_value=claude_code):
+                    with patch.object(anthropic_provider, "_anthropic_pool_oauth_accounts", return_value=list(pool)):
+                        with patch.object(anthropic_provider, "_anthropic_probe_enabled", return_value=probe_enabled):
+                            yield anthropic_provider
+
+    def test_anthropic_setup_token_reads_subscription_windows_from_message_headers(self):
+        oat = "sk-ant-oat01-setup-token"
+        with self._anthropic_sources(env=[("CLAUDE_CODE_OAUTH_TOKEN", oat)], resolver=oat) as ap:
+            with patch.object(ap, "_collect_anthropic_direct") as direct:
+                with patch.object(
+                    ap, "_anthropic_probe_request", return_value=(200, dict(self._ANTHROPIC_UNIFIED_HEADERS), {"id": "msg"})
+                ) as probe:
+                    result = ap._collect_anthropic_usage()
+        direct.assert_not_called()  # a setup token never touches /api/oauth/usage (403 there is expected)
+        probe.assert_called_once_with(oat, "subscription")
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["provider"], "anthropic")
+        self.assertEqual(result["label"], "Anthropic Claude")
+        self.assertEqual(result["plan"], "Claude subscription")
+        self.assertIn("CLAUDE_CODE_OAUTH_TOKEN", result["auth_source"])
+        self.assertEqual(
+            [(window["label"], window["percentage_used"]) for window in result["windows"]],
+            [("Current session", 14.0), ("Current week", 17.0)],
         )
-        ok = api._provider_payload("anthropic", status="ok")
-        expired = api._provider_payload("anthropic", status="expired", message="rejected")
+        self.assertTrue(result["windows"][0]["reset_at"].startswith("2026"))
+        self.assertIn("Extra usage: off (org_level_disabled)", result["details"])
+        self.assertIsNone(result["message"])
+        self.assertNotIn("extra_accounts", result)
+        self.assertNotIn("Sign in with Claude", json.dumps(result))
 
-        # Claude Code's own token is preferred: it stays fresh through use.
-        with shadowed:
-            with patch.object(anthropic_provider, "_resolve_anthropic_claude_code_oauth", return_value="cc-token"):
-                with patch.object(anthropic_provider, "_resolve_anthropic_pool_oauth", return_value="pool-token"):
-                    with patch.object(anthropic_provider, "_collect_anthropic_direct", return_value=ok) as direct:
-                        result = anthropic_provider._collect_anthropic_usage()
-        direct.assert_called_once_with("cc-token")
-        self.assertIs(result, ok)
+        # Claude Code identity rides on the OAuth lane only; an API key is plain x-api-key.
+        headers = ap._anthropic_probe_headers(oat, "subscription")
+        self.assertTrue(headers["Authorization"].startswith("Bearer "))
+        self.assertTrue(headers["user-agent"].startswith("claude-code/"))
+        self.assertIn("oauth-2025-04-20", headers["anthropic-beta"])
+        self.assertEqual(headers["anthropic-version"], "2023-06-01")
+        key_headers = ap._anthropic_probe_headers("sk-ant-api03-key", "api_key")
+        self.assertEqual(key_headers["x-api-key"], "sk-ant-api03-key")
+        self.assertNotIn("user-agent", key_headers)
+        self.assertNotIn("Authorization", key_headers)
+        body = ap._anthropic_probe_body("subscription")
+        self.assertEqual(body["max_tokens"], 1)
+        self.assertEqual(body["messages"], [{"role": "user", "content": "."}])
+        self.assertIn("Claude Code", body["system"][0]["text"])
+        self.assertNotIn("system", ap._anthropic_probe_body("api_key"))
 
-        # A rejected Claude Code token falls through to the pool login.
-        with shadowed:
-            with patch.object(anthropic_provider, "_resolve_anthropic_claude_code_oauth", return_value="cc-token"):
-                with patch.object(anthropic_provider, "_resolve_anthropic_pool_oauth", return_value="pool-token"):
-                    with patch.object(
-                        anthropic_provider, "_collect_anthropic_direct", side_effect=[expired, ok]
-                    ) as direct:
-                        result = anthropic_provider._collect_anthropic_usage()
-        self.assertEqual(direct.call_count, 2)
-        direct.assert_any_call("pool-token")
-        self.assertIs(result, ok)
+    def test_anthropic_console_key_reads_per_minute_rate_limits(self):
+        key = "sk-ant-api03-console-key"
+        with self._anthropic_sources(env=[("ANTHROPIC_API_KEY", key)], resolver=key) as ap:
+            with patch.object(
+                ap, "_anthropic_probe_request", return_value=(200, dict(self._ANTHROPIC_CONSOLE_HEADERS), {})
+            ) as probe:
+                result = ap._collect_anthropic_usage()
+        probe.assert_called_once_with(key, "api_key")
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["provider"], "anthropic")
+        self.assertEqual(result["label"], "Anthropic API (console)")
+        self.assertEqual(result["plan"], "Pay per token")
+        self.assertNotIn("Max", json.dumps(result))
+        windows = {window["label"]: window for window in result["windows"]}
+        self.assertEqual(
+            set(windows),
+            {"Requests per minute", "Input tokens per minute", "Output tokens per minute", "Tokens per minute"},
+        )
+        requests = windows["Requests per minute"]
+        self.assertEqual(requests["kind"], "rate_limit")
+        self.assertEqual(
+            (requests["limit"], requests["remaining"], requests["used"], requests["unit"]),
+            (10000.0, 9999.0, 1.0, "requests"),
+        )
+        self.assertAlmostEqual(requests["percentage_used"], 0.01)
+        self.assertIn("2027", requests["reset_at"])
+        self.assertEqual(windows["Input tokens per minute"]["unit"], "tokens")
+        self.assertTrue(any("Admin API key" in line for line in result["details"]))
 
-        # No Claude Code credentials: the pool login alone still works.
-        with shadowed:
-            with patch.object(anthropic_provider, "_resolve_anthropic_claude_code_oauth", return_value=""):
-                with patch.object(anthropic_provider, "_resolve_anthropic_pool_oauth", return_value="pool-token"):
-                    with patch.object(anthropic_provider, "_collect_anthropic_direct", return_value=ok) as direct:
-                        result = anthropic_provider._collect_anthropic_usage()
-        direct.assert_called_once_with("pool-token")
-        self.assertIs(result, ok)
+    def test_anthropic_subscription_and_console_key_become_two_cards(self):
+        oat, key = "sk-ant-oat01-setup", "sk-ant-api03-key"
+        responses = {
+            oat: (200, dict(self._ANTHROPIC_UNIFIED_HEADERS), {}),
+            key: (200, dict(self._ANTHROPIC_CONSOLE_HEADERS), {}),
+        }
+        with self._anthropic_sources(
+            env=[("CLAUDE_CODE_OAUTH_TOKEN", oat), ("ANTHROPIC_API_KEY", key)], resolver=oat
+        ) as ap:
+            with patch.object(ap, "_anthropic_probe_request", side_effect=lambda token, kind: responses[token]) as probe:
+                result = ap._collect_anthropic_usage()
+        self.assertEqual(probe.call_count, 2)
+        self.assertEqual(result["provider"], "anthropic")
+        self.assertEqual(result["label"], "Anthropic Claude")
+        extras = result["extra_accounts"]
+        self.assertEqual(len(extras), 1)
+        self.assertEqual(extras[0]["provider"], "anthropic:1")
+        self.assertEqual(extras[0]["base_provider"], "anthropic")
+        self.assertTrue(extras[0]["account_extra"])
+        self.assertEqual(extras[0]["label"], "Anthropic API (console)")
+        self.assertEqual(extras[0]["status"], "ok")
+        self.assertNotIn("organization_id", result)
+        self.assertNotIn("organization_id", extras[0])
 
-        # Every stored login rejected: surface the first failure.
-        with shadowed:
-            with patch.object(anthropic_provider, "_resolve_anthropic_claude_code_oauth", return_value="cc-token"):
-                with patch.object(anthropic_provider, "_resolve_anthropic_pool_oauth", return_value="cc-token"):
-                    with patch.object(anthropic_provider, "_collect_anthropic_direct", return_value=expired) as direct:
-                        result = anthropic_provider._collect_anthropic_usage()
-        direct.assert_called_once_with("cc-token")  # identical tokens tried once
-        self.assertIs(result, expired)
+        # A second credential for the SAME organisation is one card, not two.
+        twin = "sk-ant-oat01-same-org-twin"
+        with self._anthropic_sources(env=[("ANTHROPIC_TOKEN", oat), ("CLAUDE_CODE_OAUTH_TOKEN", twin)], resolver=oat) as ap:
+            with patch.object(
+                ap, "_anthropic_probe_request", return_value=(200, dict(self._ANTHROPIC_UNIFIED_HEADERS), {})
+            ):
+                result = ap._collect_anthropic_usage()
+        self.assertEqual(result["status"], "ok")
+        self.assertNotIn("extra_accounts", result)
 
-        # API key but no saved OAuth login: explain the requirement plainly.
-        with shadowed:
-            with patch.object(anthropic_provider, "_resolve_anthropic_claude_code_oauth", return_value=""):
-                with patch.object(anthropic_provider, "_resolve_anthropic_pool_oauth", return_value=""):
-                    result = anthropic_provider._collect_anthropic_usage()
+    def test_anthropic_full_login_tries_usage_endpoint_then_falls_back_to_headers(self):
+        pool = [{"label": "work", "token": "sk-ant-oat01-pool-login"}]
+        forbidden = api._provider_payload("anthropic", status="forbidden", message="HTTP 403")
+        okay = api._provider_payload(
+            "anthropic", status="ok", windows=[api._usage_window("Current week", used_percent=25)]
+        )
+        expired = api._provider_payload("anthropic", status="expired", message="expired")
+
+        # 403 (no user:profile scope): fall through to the header probe.
+        with self._anthropic_sources(pool=pool) as ap:
+            with patch.object(ap, "_collect_anthropic_direct", return_value=dict(forbidden)) as direct:
+                with patch.object(
+                    ap, "_anthropic_probe_request", return_value=(200, dict(self._ANTHROPIC_UNIFIED_HEADERS), {})
+                ) as probe:
+                    result = ap._collect_anthropic_usage()
+        direct.assert_called_once_with("sk-ant-oat01-pool-login")
+        probe.assert_called_once()
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["account"], "work")
+        self.assertEqual(result["auth_source"], "Hermes OAuth login")
+
+        # The usage endpoint answering is the whole story: no message is sent.
+        with self._anthropic_sources(pool=pool) as ap:
+            with patch.object(ap, "_collect_anthropic_direct", return_value=dict(okay)):
+                with patch.object(ap, "_anthropic_probe_request") as probe:
+                    result = ap._collect_anthropic_usage()
+        probe.assert_not_called()
+        self.assertEqual(result["status"], "ok")
+
+        # An expired login is expired on both paths; no probe either.
+        with self._anthropic_sources(pool=pool) as ap:
+            with patch.object(ap, "_collect_anthropic_direct", return_value=dict(expired)):
+                with patch.object(ap, "_anthropic_probe_request") as probe:
+                    result = ap._collect_anthropic_usage()
+        probe.assert_not_called()
+        self.assertEqual(result["status"], "expired")
+
+        # Hermes' delegated fetch returning nothing is not "no Anthropic usage".
+        nothing = api._provider_payload("anthropic", status="unavailable", message="Hermes returned None")
+        with self._anthropic_sources(claude_code="sk-ant-oat01-claude-code") as ap:
+            with patch.object(ap, "_collect_anthropic_direct", return_value=dict(nothing)):
+                with patch.object(
+                    ap, "_anthropic_probe_request", return_value=(200, dict(self._ANTHROPIC_UNIFIED_HEADERS), {})
+                ):
+                    result = ap._collect_anthropic_usage()
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["auth_source"], "Claude Code OAuth login")
+
+    def test_anthropic_probe_outcomes_are_cached_and_rate_limits_are_not_retried(self):
+        oat = "sk-ant-oat01-setup"
+        limited = (429, {"retry-after": "30"}, {"error": {"type": "rate_limit_error", "message": "slow down"}})
+        with self._anthropic_sources(env=[("CLAUDE_CODE_OAUTH_TOKEN", oat)]) as ap:
+            with patch.object(ap, "_anthropic_probe_request", return_value=limited) as probe:
+                first = ap._collect_anthropic_usage()
+                second = ap._collect_anthropic_usage()
+                provider_shared._set_collect_fresh(True)
+                try:
+                    third = ap._collect_anthropic_usage()
+                finally:
+                    provider_shared._set_collect_fresh(False)
+        self.assertEqual(first["status"], "unavailable")
+        self.assertIn("429", first["message"])
+        self.assertEqual(probe.call_count, 2)  # cached until the TTL; a manual refresh re-probes
+        self.assertIn("probe_cached_at", second)
+        self.assertNotIn("probe_cached_at", third)
+
+        # A 429 that still carries the headers is a reading, not a failure.
+        card = ap._anthropic_probe_card("subscription", 429, dict(self._ANTHROPIC_UNIFIED_HEADERS), {})
+        self.assertEqual(card["status"], "ok")
+        self.assertTrue(any("HTTP 429" in line for line in card["details"]))
+        # 401 is expired; 403 without headers is forbidden with Anthropic's own reason.
+        self.assertEqual(ap._anthropic_probe_card("subscription", 401, {}, {})["status"], "expired")
+        denied = ap._anthropic_probe_card("api_key", 403, {}, {"error": {"message": "permission denied"}})
+        self.assertEqual((denied["status"], denied["message"]), ("forbidden", "permission denied"))
+        # A 400 with no headers (e.g. out of extra usage) states Anthropic's reason.
+        bad = ap._anthropic_probe_card("subscription", 400, {}, {"error": {"message": "out of extra usage"}})
+        self.assertEqual(bad["status"], "unavailable")
+        self.assertIn("out of extra usage", bad["message"])
+
+    def test_anthropic_probe_can_be_turned_off_in_settings(self):
+        oat = "sk-ant-oat01-setup"
+        pool = [{"label": "work", "token": "sk-ant-oat01-pool"}]
+        okay = api._provider_payload(
+            "anthropic", status="ok", windows=[api._usage_window("Current week", used_percent=25)]
+        )
+        with self._anthropic_sources(env=[("CLAUDE_CODE_OAUTH_TOKEN", oat)], pool=pool, probe_enabled=False) as ap:
+            with patch.object(ap, "_collect_anthropic_direct", return_value=dict(okay)) as direct:
+                with patch.object(ap, "_anthropic_probe_request") as probe:
+                    result = ap._collect_anthropic_usage()
+        probe.assert_not_called()
+        direct.assert_called_once_with("sk-ant-oat01-pool")
+        # The full login still answers through the usage endpoint and leads the cards ...
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["auth_source"], "Hermes OAuth login")
+        # ... while the setup token says plainly why it has no reading.
+        off = result["extra_accounts"][0]
+        self.assertEqual(off["status"], "not_configured")
+        self.assertIn("anthropic_usage_probe", off["message"])
+
+        from dashboard._providers import anthropic as anthropic_provider
+
+        for value, expected in (({}, True), ({"anthropic_usage_probe": "off"}, False), ({"anthropic_usage_probe": False}, False), ({"anthropic_usage_probe": "yes"}, True)):
+            with patch.object(anthropic_provider, "_plugin_settings", return_value=value):
+                self.assertEqual(anthropic_provider._anthropic_probe_enabled(), expected, value)
+
+    def test_anthropic_credential_inventory_classifies_and_deduplicates(self):
+        env = [
+            ("ANTHROPIC_TOKEN", "not-an-anthropic-token"),
+            ("ANTHROPIC_API_KEY", "sk-ant-api03-k"),
+            ("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-s"),
+        ]
+        pool = [{"label": "w", "token": "eyJ-jwt"}, {"label": "x", "token": "sk-ant-admin01-a"}]
+        with self._anthropic_sources(env=env, resolver="sk-ant-oat01-s", claude_code="sk-ant-oat01-s", pool=pool) as ap:
+            creds = ap._anthropic_credentials()
+        self.assertEqual(
+            [(item["kind"], item["source"], item["usage_endpoint"]) for item in creds],
+            [
+                ("api_key", "API key (ANTHROPIC_API_KEY)", False),
+                ("subscription", "OAuth token (CLAUDE_CODE_OAUTH_TOKEN)", False),
+                ("subscription", "Hermes OAuth login", True),
+                ("admin", "Hermes OAuth login", True),
+            ],
+        )
+        # Only an Admin key: nothing to probe, and the card says so.
+        with self._anthropic_sources(env=[("ANTHROPIC_API_KEY", "sk-ant-admin01-a")]) as ap:
+            with patch.object(ap, "_anthropic_probe_request") as probe:
+                result = ap._collect_anthropic_usage()
+        probe.assert_not_called()
         self.assertEqual(result["status"], "not_configured")
-        self.assertIn("Sign in with Claude in Hermes", result["message"])
+        self.assertIn("Admin API key", result["message"])
+        # Nothing at all: the registry's not-configured message.
+        with self._anthropic_sources() as ap:
+            result = ap._collect_anthropic_usage()
+        self.assertEqual(result["status"], "not_configured")
+        self.assertIn("No Anthropic credential", result["message"])
 
     def test_zai_no_coding_plan_is_nothing_to_monitor_not_a_fault(self):
         payload = api._zai_payload({"code": 500, "msg": "当前用户不存在coding plan", "success": False})
@@ -1793,26 +2017,6 @@ process.stdout.write(JSON.stringify(out))
         generic = api._zai_payload({"code": 500, "msg": "internal error", "success": False})
         self.assertEqual(generic["status"], "unavailable")
         self.assertIn("internal error", generic["message"])
-
-    def test_anthropic_multi_account_cards_from_pool(self):
-        from dashboard._providers import anthropic as anthropic_provider
-
-        accounts = [
-            {"label": "work", "token": "tok-primary"},
-            {"label": "personal", "token": "tok-personal"},
-        ]
-        ok = api._provider_payload("anthropic", status="ok")
-        with patch.object(anthropic_provider, "_anthropic_pool_oauth_accounts", return_value=accounts):
-            with patch.object(anthropic_provider, "_collect_anthropic_direct", return_value=dict(ok)) as direct:
-                cards = anthropic_provider._anthropic_account_cards(["tok-primary"])
-        direct.assert_called_once_with("tok-personal")
-        self.assertEqual(len(cards), 1)
-        card = cards[0]
-        self.assertEqual(card["provider"], "anthropic:1")
-        self.assertEqual(card["base_provider"], "anthropic")
-        self.assertEqual(card["account"], "personal")
-        self.assertTrue(card["account_extra"])
-        self.assertIn("personal", card["label"])
 
     def test_ai_usage_flattens_account_cards_without_inflating_summary(self):
         def ok(provider):
@@ -3323,6 +3527,17 @@ class AdapterRegistryTests(unittest.TestCase):
         plugin_source = root.joinpath("desktop", "plugin.js").read_text(encoding="utf-8")
         self.assertIn("['External hosts',", plugin_source)
         self.assertIn("English error text", plugin_source)
+        anthropic = next(item for item in payload["providers"] if item["id"] == "anthropic")
+        self.assertEqual(anthropic["request_kind"], "inference_probe")
+        self.assertIn("one-token", anthropic["note"])
+        self.assertEqual([item["id"] for item in api._inference_probe_adapters()], ["anthropic"])
+        for item in payload["providers"] + payload["services"]:
+            self.assertIn(item["request_kind"], {"usage_endpoint", "inference_probe"})
+        self.assertIn("one-token", readme)
+        self.assertIn("anthropic_usage_probe", readme)
+        self.assertIn("inference_probe", adapters_doc)
+        self.assertIn('"inference_probes": _inference_probe_adapters(),', routes_source)
+        self.assertIn("['Inference probes',", plugin_source)
 
 
 if __name__ == "__main__":

@@ -63,7 +63,7 @@ def _plugin_version() -> str:
             return match.group(1)
     except OSError:
         pass
-    return "0.31.0"
+    return "0.32.0"
 
 
 PLUGIN_VERSION = _plugin_version()
@@ -78,6 +78,9 @@ MAX_LOG_FILE_BYTES = 6 * 1024 * 1024
 AI_USAGE_CACHE_TTL_SECONDS = 300
 AI_MODELS_CACHE_TTL_SECONDS = 60
 AI_USAGE_PROVIDER_TIMEOUT_SECONDS = 12
+# The Anthropic adapter reads allowances from the headers of a one-token
+# message; one probe per credential per this many seconds (manual refresh bypasses).
+ANTHROPIC_PROBE_TTL_SECONDS = 900
 DEFAULT_RATE_SAMPLE_THRESHOLD = 20
 MAX_ROUTE_MAPPINGS = 200
 

@@ -32,7 +32,7 @@ class Adapter:
     __slots__ = (
         "kind", "id", "label", "auth_source", "collect", "probe", "not_configured_message",
         "billing_keys", "registry_ids", "hosts", "via", "env_keys", "mcp_hints", "cli", "note",
-        "order", "sequence", "module",
+        "order", "sequence", "module", "request_kind",
     )
 
     def __init__(
@@ -55,6 +55,7 @@ class Adapter:
         note: Optional[str] = None,
         order: int = 100,
         module: Optional[str] = None,
+        request_kind: str = "usage_endpoint",
     ) -> None:
         if kind not in {"provider", "service"}:
             raise ValueError(f"unknown adapter kind {kind!r}")
@@ -62,6 +63,10 @@ class Adapter:
             raise ValueError(f"adapter id must be a lowercase slug, got {id!r}")
         if via not in {"direct", "hermes", "cli", "none"}:
             raise ValueError(f"unknown adapter via {via!r}")
+        if request_kind not in {"usage_endpoint", "inference_probe"}:
+            raise ValueError(f"unknown adapter request_kind {request_kind!r}")
+        if request_kind == "inference_probe" and not note:
+            raise ValueError(f"adapter {id!r} sends an inference probe and must say so in note")
         self.kind = kind
         self.id = id
         self.label = label
@@ -80,6 +85,7 @@ class Adapter:
         self.order = int(order)
         self.sequence = next(_registration_sequence)
         self.module = module
+        self.request_kind = request_kind if collect is not None else "usage_endpoint"
 
     @property
     def readable(self) -> bool:
@@ -96,6 +102,7 @@ class Adapter:
             "via": self.via,
             "hosts": list(self.hosts),
             "module": self.module,
+            "request_kind": self.request_kind,
         }
         if self.kind == "provider":
             item["registry_ids"] = list(self.registry_ids)
@@ -136,6 +143,8 @@ def register_provider(
     via: str = "direct",
     order: int = 100,
     module: Optional[str] = None,
+    request_kind: str = "usage_endpoint",
+    note: Optional[str] = None,
 ) -> Adapter:
     """Declare a model-provider adapter.
 
@@ -144,6 +153,9 @@ def register_provider(
     registry ids (and aliases) this adapter covers, so they never appear in
     the "configured but unreadable" list. ``billing_keys`` are the
     ``billing_provider`` values local records use for this account.
+    ``request_kind`` is ``usage_endpoint`` unless the adapter has to send a
+    token-sized inference request to read rate-limit headers, in which case
+    it is ``inference_probe`` and ``note`` must say what is sent and how often.
     """
     return _register(
         _PROVIDERS,
@@ -151,7 +163,7 @@ def register_provider(
             "provider", id, label, auth_source, collect=collect, probe=probe,
             not_configured_message=not_configured_message or f"No Hermes {label} credential was found.",
             billing_keys=billing_keys, registry_ids=tuple(registry_ids) or (id,), hosts=hosts, via=via,
-            order=order, module=module,
+            order=order, module=module, request_kind=request_kind, note=note,
         ),
     )
 
@@ -226,6 +238,15 @@ def _usage_covered_provider_ids() -> set:
         covered.add(adapter.id)
         covered.update(adapter.registry_ids)
     return covered
+
+
+def _inference_probe_adapters() -> List[Dict[str, Any]]:
+    """Adapters that send a token-sized inference request instead of calling a usage endpoint."""
+    return [
+        {"id": adapter.id, "label": adapter.label, "hosts": list(adapter.hosts), "note": adapter.note}
+        for adapter in list(_PROVIDERS.values()) + list(_SERVICES.values())
+        if adapter.request_kind == "inference_probe"
+    ]
 
 
 def _adapter_hosts() -> List[str]:

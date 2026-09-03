@@ -11,6 +11,18 @@ except ImportError:  # pragma: no cover
     from _hermes_compat import *
     from _adapters import *
 
+_collect_state: Dict[str, bool] = {"fresh": False}
+
+
+def _set_collect_fresh(flag: bool) -> None:
+    """Tell collectors whether the current pass is a manual refresh (bypass their own caches)."""
+    _collect_state["fresh"] = bool(flag)
+
+
+def _collect_is_fresh() -> bool:
+    return bool(_collect_state.get("fresh"))
+
+
 def _provider_meta(provider: str) -> Dict[str, str]:
     """Label and auth source for a registered provider id (KeyError otherwise)."""
     adapter = _provider_adapters().get(provider)

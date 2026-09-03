@@ -1992,25 +1992,6 @@ _MODEL_ORIGIN_NAMES = {
 }
 
 
-def _plugin_settings() -> Dict[str, Any]:
-    try:
-        from hermes_cli.config import load_config_readonly
-
-        config = load_config_readonly() or {}
-    except (ImportError, OSError, ValueError):
-        return {}
-    plugins = config.get("plugins") if isinstance(config, Mapping) else None
-    entries = plugins.get("entries") if isinstance(plugins, Mapping) else None
-    entry = entries.get("session-lens") if isinstance(entries, Mapping) else None
-    if not isinstance(entry, Mapping):
-        return {}
-    settings = entry.get("settings")
-    if isinstance(settings, Mapping):
-        return dict(settings)
-    legacy = entry.get("config")
-    return dict(legacy) if isinstance(legacy, Mapping) else {}
-
-
 def _rate_sample_threshold(settings: Optional[Mapping[str, Any]] = None) -> int:
     value = (settings if settings is not None else _plugin_settings()).get(
         "rate_sample_threshold", DEFAULT_RATE_SAMPLE_THRESHOLD
@@ -3907,15 +3888,19 @@ def _ai_usage_sync(fresh: bool = False, only_provider: Optional[str] = None) -> 
                 message=_provider_not_configured_message(provider),
             )
     if active:
-        with ThreadPoolExecutor(max_workers=len(active), thread_name_prefix="session-lens-usage") as pool:
-            futures = {pool.submit(collector): provider for provider, collector in active.items()}
-            for future in as_completed(futures):
-                provider = futures[future]
-                try:
-                    result = future.result()
-                except Exception as error:
-                    result = _provider_payload(provider, status="unavailable", message=_provider_message(error))
-                results[provider] = result
+        _set_collect_fresh(fresh)
+        try:
+            with ThreadPoolExecutor(max_workers=len(active), thread_name_prefix="session-lens-usage") as pool:
+                futures = {pool.submit(collector): provider for provider, collector in active.items()}
+                for future in as_completed(futures):
+                    provider = futures[future]
+                    try:
+                        result = future.result()
+                    except Exception as error:
+                        result = _provider_payload(provider, status="unavailable", message=_provider_message(error))
+                    results[provider] = result
+        finally:
+            _set_collect_fresh(False)
 
     recorded = _usage_recorded_7d()
     with _ai_usage_cache_lock:
@@ -4549,10 +4534,13 @@ def _ai_usage_refresh_provider(provider: str, collector: Any) -> Optional[Dict[s
         cached_at, base = _ai_usage_cache
         base = copy.deepcopy(base)
     if _probe_usage_provider(provider):
+        _set_collect_fresh(True)
         try:
             result = collector()
         except Exception as error:
             result = _provider_payload(provider, status="unavailable", message=_provider_message(error))
+        finally:
+            _set_collect_fresh(False)
     else:
         result = _provider_payload(
             provider,
@@ -4643,6 +4631,7 @@ def _system_sync() -> Dict[str, Any]:
                 "provider_usage_requests": True,
                 "provider_credentials_returned_to_desktop": False,
                 "external_hosts": _adapter_hosts(),
+                "inference_probes": _inference_probe_adapters(),
                 "mutation_endpoints": 0,
                 "snippets_redacted_and_bounded": True,
                 "failure_signatures_language": "english",

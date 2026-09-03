@@ -13,3 +13,7 @@ Its product behavior was informed by:
 - [Hermes ResetWatch](https://github.com/Adolanium/hermes-resetwatch), by Adolanium, MIT licensed — behavior reference for per-account Claude quota cards (walking pooled logins and rendering one card per account).
 
 No upstream logo is reused, and this project does not imply endorsement by any upstream author or Nous Research. Source code should carry file-level notices if a future change copies or substantially adapts an upstream implementation.
+
+## Requests worth raising upstream
+
+- **Hermes Agent: record the last `anthropic-ratelimit-unified-*` and `anthropic-ratelimit-*` response headers per Anthropic credential.** Hermes receives these on every Claude call it makes (its adapter already uses them as a billing-lane oracle in its own diagnostics). If it persisted the latest values — even only in memory, exposed through `agent.account_usage` — Session Lens could read subscription and API-key allowances with zero side effects and retire its one-token probe. Until then the probe is the only readable source for setup tokens and API keys, since `/api/oauth/usage` requires the `user:profile` scope those credentials do not carry.

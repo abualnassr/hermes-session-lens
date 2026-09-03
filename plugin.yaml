@@ -2,7 +2,7 @@ manifest_version: 2
 api_version: 1
 name: session-lens
 label: Hermes Session Lens
-version: 0.31.0
+version: 0.32.0
 description: "Native Hermes Desktop observability: session trace, cost, provider usage, runtime health, profiles, and schedules."
 author: "Hermes Session Lens contributors"
 kind: standalone
@@ -21,3 +21,7 @@ config_schema:
     type: dict
     default: {}
     description: "Optional model-id glob to route-label overrides; for example, gpt-5.6-*: OpenAI OAuth."
+  anthropic_usage_probe:
+    type: bool
+    default: true
+    description: "Read Anthropic allowances from the rate-limit headers of a one-token Claude Haiku message per credential (cached 15 minutes). Set false to disable; setup tokens and API keys then show Not configured."

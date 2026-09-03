@@ -3414,6 +3414,9 @@ function SystemView({ ctx }) {
                 ['Provider usage checks', data.privacy.provider_usage_requests ? 'Direct to configured providers' : 'Disabled'],
                 ['Credentials in desktop UI', data.privacy.provider_credentials_returned_to_desktop ? 'Review required' : 'Never returned'],
                 ['External hosts', (data.privacy.external_hosts || []).length ? data.privacy.external_hosts.join(', ') : 'None declared'],
+                ['Inference probes', (data.privacy.inference_probes || []).length
+                  ? data.privacy.inference_probes.map(item => `${item.label}: ${item.note || 'token-sized request to read rate-limit headers'}`).join(' · ')
+                  : 'None — usage and balance endpoints only'],
                 ['Mutation endpoints', String(data.privacy.mutation_endpoints)],
                 ['Snippets', data.privacy.snippets_redacted_and_bounded ? 'Redacted and bounded' : 'Review required'],
                 ['Failure signatures', data.privacy.failure_signatures_language === 'english' ? 'English error text only, plus recorded error states in any language' : 'Review required'],

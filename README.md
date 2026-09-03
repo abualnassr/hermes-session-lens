@@ -4,7 +4,7 @@ Hermes Session Lens is a native observability page for Hermes Desktop. It appear
 
 It is a unified Hermes plugin—one install contains the native Desktop page and its namespaced Python API. There is no iframe, separate dashboard, Node server, or third-party telemetry service.
 
-This documentation describes Hermes Session Lens `0.31.0`.
+This documentation describes Hermes Session Lens `0.32.0`.
 
 ## What it includes
 
@@ -38,7 +38,7 @@ This documentation describes Hermes Session Lens `0.31.0`.
 - Gateway and platform health for the default and named profiles.
 - Schedule status, next/last run, delivery errors, and failure streaks without exposing schedule prompts.
 - Overview, Operations, Tools (with skill invocations), System, AI Usage, and AI Models views. Aggregates on AI Models drill through to the filtered Sessions view.
-- Live account-level usage for OpenAI Codex, Anthropic Claude, Nous Research Portal, OpenRouter, DeepSeek, Grok, Kimi Code Plan, and Z.AI GLM Coding Plan using credentials already configured in Hermes.
+- Live account-level usage for OpenAI Codex, Anthropic Claude, Nous Research Portal, OpenRouter, DeepSeek, Grok, Kimi Code Plan, and Z.AI GLM Coding Plan using credentials already configured in Hermes. Anthropic gets one card per product Hermes holds a credential for: the Claude subscription (5-hour and 7-day windows, extra-usage state) and the Console API key (per-minute request and token limits, as its own card), each read from the rate-limit headers of a one-token message when the credential cannot use the account-usage endpoint — see [Trust](#trust) for exactly what is sent and how to turn it off.
 - Five-minute in-memory provider cache, explicit partial/stale states, and a manual fresh refresh.
 - AI Models caches immutable closed-session classification facts in memory and reuses unchanged period payloads for 60 seconds. The Desktop polls every five minutes; manual refresh bypasses the payload cache immediately. No cache file is written.
 - Failure-first, recent, cost, token, and tool-call sorting; pagination grows to a 500-session safety limit.
@@ -97,7 +97,10 @@ plugins:
         rate_sample_threshold: 20
         model_route_mappings:
           "gpt-5.6-*": "OpenAI OAuth"
+        anthropic_usage_probe: true
 ```
+
+`anthropic_usage_probe` controls the one request Session Lens makes that is not a usage or balance endpoint (see [Trust](#trust)). Set it to `false` to stop the one-token Claude message; the Anthropic card then reads only logins that answer the account-usage endpoint, and a setup token or API key shows "Not configured" with the reason.
 
 ## Privacy and safety
 
@@ -107,10 +110,10 @@ plugins:
 - Schedule and system prompts are never returned by the API.
 - Runtime logs and AI Models classification/payloads use bounded in-memory caching only; no new cache file is written.
 - Session content, prompts, and local telemetry are never sent to a third-party analytics service.
-- The AI Usage and Services cards make direct authenticated usage requests only to the hosts listed under [Trust](#trust) below, each declared by its adapter and published by `GET /adapters`. Credentials remain in the Python backend and are never returned to the Desktop plugin.
+- The AI Usage and Services cards make direct authenticated requests only to the hosts listed under [Trust](#trust) below, each declared by its adapter and published by `GET /adapters`, and only to usage or balance endpoints — with one declared exception, the Anthropic one-token probe described there. Credentials remain in the Python backend and are never returned to the Desktop plugin.
 - AI Models reads model IDs, routes, accounting, and session evidence locally. Session Lens—not Hermes—assigns one primary session type using first-match precedence: Orchestration, Coding, Writing, Analysis, then General. Classification uses recorded tool calls and arguments, including code-mutating commands and artifact paths; read-only Git/GitHub inspection does not imply Coding, cron, Telegram, webhook, desktop, and schedule remain sources, and auxiliary jobs retain separate unscored labels. OAuth quota is shared at provider-account level, suppresses pace judgments during the first 10% of a billing period, and only shows per-accepted-task efficiency after ten valid accepted tasks. General and Analysis use the conservative first-attempt proxy; Coding requires a resolved session with a successful code artifact save or commit; Writing requires a resolved session with a successful non-code artifact write; Orchestration and auxiliary jobs show `n/a`. Retry/switch counts rewinds, near-identical same-model prompt resends within five minutes, and same-role model changes. The table's Fail rate remains an API-attempt metric from bounded logs. Expanded work reliability instead scores completed main-role tasks, recovered tasks, clean completions, and terminal model/API failures; open, cancelled, orchestration, auxiliary, ambiguous, switched-away, and uncovered runs cannot improve the rate. Models with at least the configurable sample threshold rank by the lowest 95% Wilson upper failure bound. Fail and retry/switch cells display their own denominators; samples below the threshold render as neutral fractions and sort after adequately sampled rows. Models below the eligible-task floor open with a not-rankable banner stating the 95% Wilson upper bound rather than a headline completion percentage. Zero-request rows suppress bounded-log failure and latency values to avoid mixing windows. Recorded tool-call failures are reconciled separately against the recorded tool-call total. Unknown routes first use explicit mappings, then distinct historical routes for the model or family, and otherwise become actionable `Unmapped (edit in config)` labels. Cost preserves recorded actual, estimated, free, subscription, mixed, or unpriced state; cached tokens show zero only after the route demonstrates cache reporting. TTFT is unavailable because Hermes does not record it.
-- Provider checks do not read browser cookies. Anthropic reuses Hermes OAuth, Grok reuses Hermes `xai-oauth`, and Kimi/Z.AI reuse Hermes API keys; no provider CLI needs to remain running.
-- Usage checks accept provider credentials only when Hermes resolves them for the official provider host. Z.AI credential resolution deliberately avoids Hermes inference probes.
+- Provider checks do not read browser cookies. Anthropic reuses the credentials Hermes already holds (environment tokens, its pool logins, Claude Code's login), Grok reuses Hermes `xai-oauth`, and Kimi/Z.AI reuse Hermes API keys; no provider CLI needs to remain running.
+- Usage checks accept provider credentials only when Hermes resolves them for the official provider host. Z.AI credential resolution deliberately avoids Hermes inference probes; the Anthropic adapter is the only one that sends an inference request, and it is declared, cached, and switchable.
 
 Failure detection combines authoritative Hermes finish/effect states with conservative signatures in tool results. SQL signatures only identify candidates; the Python signature confirms content before any API metric counts it. The inspector distinguishes the bounded evidence currently shown from the confirmed full-session total so users can verify it. File paths are observed evidence, not a guaranteed audit of every filesystem operation.
 
@@ -124,12 +127,12 @@ Session Lens is meant to be inspected, not trusted on its word. This is what the
 
 **What it writes.** Nothing. There is no mutation route (`/system` reports `mutation_endpoints: 0`), no cache file, no export file — CSV, JSON, and Markdown exports are assembled in the desktop from the read-only routes, and rules, budgets, and dismissals live in the desktop's plugin storage and travel as query parameters. Session Lens itself never rotates or rewrites a Hermes login. Two adapters ask Hermes' own credential resolvers for a current token (OpenAI Codex through Hermes' account-usage module, Grok through Hermes' xAI resolver), and Hermes may refresh an expiring OAuth token through its normal path when asked; the Anthropic adapter deliberately does not, and an expired Anthropic login is reported as expired.
 
-**What it contacts.** Only the hosts below, each with the credential Hermes already holds for that vendor, and only for the vendor's own usage or balance endpoint. Every host is declared by its adapter module, published credential-free by `GET /adapters`, shown on the System tab under "External hosts", and this table is checked by the test suite against the registry:
+**What it contacts.** Only the hosts below, each with the credential Hermes already holds for that vendor, and only for the vendor's own usage or balance endpoint — with one exception, stated in full in the next paragraph. Every host is declared by its adapter module, published credential-free by `GET /adapters`, shown on the System tab under "External hosts", and this table is checked by the test suite against the registry:
 
 | Adapter | Host | How |
 | --- | --- | --- |
 | OpenAI Codex | `chatgpt.com` | Hermes' own account-usage code with the Hermes Codex OAuth login |
-| Anthropic Claude | `api.anthropic.com` | Hermes Anthropic OAuth token |
+| Anthropic Claude | `api.anthropic.com` | the account-usage endpoint for full OAuth logins; otherwise a one-token message whose response headers carry the allowance (see below) |
 | Nous Research Portal | `portal.nousresearch.com` | Hermes' own portal client with the Hermes Nous login |
 | OpenRouter | `openrouter.ai` | Hermes OpenRouter API key |
 | DeepSeek | `api.deepseek.com` | Hermes DeepSeek API key |
@@ -143,6 +146,8 @@ Session Lens is meant to be inspected, not trusted on its word. This is what the
 | Monid | none directly | the local `monid` CLI, which talks to Monid itself |
 
 No request is made for a provider whose local credential probe shows nothing configured, no request carries session content, prompts, or telemetry, and nothing is sent to any analytics or telemetry service. Brave Search, Telegram, here.now, and unknown keys or MCP servers are inventoried by name and never contacted.
+
+**The one inference request: the Anthropic probe.** Anthropic's account-usage endpoint answers only OAuth logins that carry the `user:profile` scope. A Claude setup token (`CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_TOKEN`) carries `user:inference` alone and an API key is not OAuth at all, so for those credentials the only readable source is the `anthropic-ratelimit-*` headers Anthropic attaches to every message response. Session Lens therefore sends one message to Claude Haiku — the single character `.`, `max_tokens: 1`, no session content — per Anthropic credential, reads the headers, and discards the reply. For a subscription token that yields the 5-hour and 7-day allowance and whether extra usage is on; for a Console API key it yields the per-minute request and token limits, and each becomes its own card. The cost is one request against the subscription window or a fraction of a cent on the key, and the call appears in the Anthropic Console request log. Every outcome is cached for 15 minutes per credential (a manual refresh re-probes), a full login is tried against the usage endpoint first and probed only if that fails, the adapter is registered with `request_kind: inference_probe` so `GET /adapters` and the System tab ("Inference probes") name it, and `anthropic_usage_probe: false` in the plugin settings turns it off. Subscription tokens are sent with the same Claude Code identity headers Hermes itself uses for its OAuth inference; API keys are sent plain. Nothing is refreshed, rotated, or written.
 
 **What reaches the desktop.** Normalized usage figures, redacted and length-bounded snippets, and never a credential (`/system` reports `provider_credentials_returned_to_desktop: false`). System prompts and schedule prompts are never returned.
 

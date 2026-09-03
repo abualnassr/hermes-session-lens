@@ -256,6 +256,55 @@ def _resolve_hermes_api_key(provider_id: str) -> Tuple[str, str]:
         raise RuntimeError("Hermes API-key resolution is unavailable") from error
 
 
+def _plugin_settings() -> Dict[str, Any]:
+    """This plugin's ``settings`` block from Hermes' config, read-only ({} outside Hermes)."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly() or {}
+    except (ImportError, OSError, ValueError):
+        return {}
+    plugins = config.get("plugins") if isinstance(config, Mapping) else None
+    entries = plugins.get("entries") if isinstance(plugins, Mapping) else None
+    entry = entries.get("session-lens") if isinstance(entries, Mapping) else None
+    if not isinstance(entry, Mapping):
+        return {}
+    settings = entry.get("settings")
+    if isinstance(settings, Mapping):
+        return dict(settings)
+    legacy = entry.get("config")
+    return dict(legacy) if isinstance(legacy, Mapping) else {}
+
+
+_ANTHROPIC_ENV_KEYS = ("ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")
+
+
+def _anthropic_env_credentials() -> List[Tuple[str, str]]:
+    """(env name, value) for every Anthropic credential set in the environment.
+
+    Reads through Hermes' profile-scoped secret reader — the same one its
+    Anthropic resolver uses — so a multiplexed profile sees exactly what
+    Hermes sees; plain os.environ outside Hermes. Read-only.
+    """
+    getenv = None
+    try:
+        from agent import anthropic_credentials
+
+        getenv = anthropic_credentials._getenv
+    except Exception:
+        getenv = None
+    found: List[Tuple[str, str]] = []
+    for name in _ANTHROPIC_ENV_KEYS:
+        try:
+            value = str(getenv(name) or "") if getenv is not None else str(os.environ.get(name) or "")
+        except Exception:
+            value = ""
+        value = value.strip()
+        if value:
+            found.append((name, value))
+    return found
+
+
 def _resolve_anthropic_oauth() -> Tuple[str, bool]:
     try:
         from agent import anthropic_adapter
