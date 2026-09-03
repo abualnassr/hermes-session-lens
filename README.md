@@ -25,7 +25,7 @@ From a local checkout:
 
 3. Restart Hermes Desktop so its embedded backend mounts `dashboard/plugin_api.py`. **Session Lens** appears in the left sidebar.
 
-Once this repository is public, Hermes' confirmation-based install link works too — Hermes shows the source and components before installing anything:
+Or use Hermes' confirmation-based install link — Hermes shows the source and components before installing anything:
 
 ```text
 hermes://plugin/install?repo=abualnassr/hermes-session-lens&enable=1
