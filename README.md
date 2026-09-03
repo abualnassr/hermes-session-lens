@@ -51,6 +51,8 @@ The **Trace** tab replays the session in order — user, assistant, reasoning, t
 
 **Ask Hermes.** A session with failures gets an **Ask Hermes** button beside **Open session**. It builds a failure-analysis prompt from the evidence the Failures tab already shows — failures grouped by tool and error signature with counts, timestamps, and bounded, secret-redacted result snippets, plus the session's model usage and outcome — copies it to the clipboard, and opens a fresh Hermes chat in the session's profile for you to paste it into. Session Lens never submits the prompt or creates a session itself: you see exactly what the model will read, and no tokens are spent until you press send. The prompt stays under 12,000 characters; user and assistant message text is deliberately left out. The same text is available as `GET /api/plugins/session-lens/sessions/{id}/analysis-prompt`.
 
+![Ask Hermes: the prepared prompt and the analysis Hermes produced — a likely cause per failure group, three actions, and what the evidence cannot settle](docs/screenshots/ask-hermes.png)
+
 ### Overview — where the spend goes
 
 ![Overview: usage over time and the project rollup](docs/screenshots/overview.png)
