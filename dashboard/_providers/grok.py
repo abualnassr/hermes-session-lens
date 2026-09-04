@@ -20,15 +20,37 @@ def _grok_windows_from_payloads(
     if isinstance(weekly_config, Mapping):
         used_pct = _usage_percent(weekly_config.get("creditUsagePercent"))
         period = weekly_config.get("currentPeriod")
+        period_type = str(period.get("type") or "") if isinstance(period, Mapping) else ""
         reset_at = period.get("end") if isinstance(period, Mapping) else None
         reset_at = reset_at or weekly_config.get("billingPeriodEnd")
+        detail = "Shared across Grok products"
+        if used_pct is None and period_type == "USAGE_PERIOD_TYPE_WEEKLY" and reset_at:
+            # xAI serialises this config from protobuf, which omits zero-valued
+            # fields: no creditUsagePercent inside a confirmed weekly period means
+            # 0% used, not unknown. xAI's own Grok Build client reads it the same
+            # way (credit_usage_percent None -> 0.0), verified against the live
+            # API on 2026-09-04 for a unified-billing account.
+            used_pct = 0.0
+            detail = "No usage recorded in this period yet · shared across Grok products"
         if used_pct is not None:
             windows.append(
                 _usage_window(
                     "Weekly allowance",
                     used_percent=used_pct,
                     reset_at=reset_at,
-                    detail="Shared across Grok products",
+                    detail=detail,
+                )
+            )
+        prepaid = weekly_config.get("prepaidBalance")
+        prepaid_value = _usage_number(prepaid.get("val")) if isinstance(prepaid, Mapping) else None
+        if prepaid_value is not None and prepaid_value > 0:
+            windows.append(
+                _usage_window(
+                    "Prepaid credits",
+                    kind="balance",
+                    remaining=prepaid_value / 100.0,
+                    unit="credits",
+                    detail="Purchased credits beyond the allowance",
                 )
             )
 
@@ -123,7 +145,7 @@ def _collect_grok_usage() -> Dict[str, Any]:
         return _provider_payload(
             "grok",
             status="unavailable",
-            message="Grok returned no recognized quota fields.",
+            message="Grok returned neither a usage percentage nor a weekly billing period; the billing response shape may have changed.",
             partial=bool(errors),
         )
     return _provider_payload(

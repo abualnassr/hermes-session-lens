@@ -1769,6 +1769,55 @@ process.stdout.write(JSON.stringify(out))
         self.assertEqual(windows[1]["remaining"], 37.5)
         self.assertEqual(windows[1]["unit"], "credits")
 
+    def test_grok_missing_percent_in_a_confirmed_weekly_period_is_zero_used(self):
+        # The exact shape xAI returned on 2026-09-04 for a unified-billing account:
+        # protobuf JSON drops zero-valued fields, so creditUsagePercent is absent.
+        weekly = {
+            "config": {
+                "currentPeriod": {
+                    "type": "USAGE_PERIOD_TYPE_WEEKLY",
+                    "start": "2026-09-03T23:42:49.371354+00:00",
+                    "end": "2026-09-10T23:42:49.371354+00:00",
+                },
+                "onDemandCap": {"val": 0},
+                "onDemandUsed": {"val": 0},
+                "isUnifiedBillingUser": True,
+                "prepaidBalance": {"val": 0},
+                "topUpMethod": "TOP_UP_METHOD_SAVED_PAYMENT_METHOD",
+                "billingPeriodStart": "2026-09-03T23:42:49.371354+00:00",
+                "billingPeriodEnd": "2026-09-10T23:42:49.371354+00:00",
+            }
+        }
+        monthly = {
+            "config": {
+                "monthlyLimit": {"val": 0},
+                "used": {"val": 0},
+                "billingPeriodEnd": "2026-10-01T00:00:00+00:00",
+            }
+        }
+        windows = api._grok_windows_from_payloads(weekly, monthly)
+        self.assertEqual(len(windows), 1)
+        self.assertEqual(windows[0]["label"], "Weekly allowance")
+        self.assertEqual(windows[0]["percentage_used"], 0.0)
+        self.assertEqual(windows[0]["percentage_remaining"], 100.0)
+        self.assertIn("No usage recorded in this period yet", windows[0]["detail"])
+        self.assertTrue(windows[0]["reset_at"].startswith("2026-09-10"))
+
+        # A purchased balance becomes its own window.
+        weekly["config"]["prepaidBalance"] = {"val": 1500}
+        windows = api._grok_windows_from_payloads(weekly, monthly)
+        self.assertEqual(len(windows), 2)
+        self.assertEqual(windows[1]["label"], "Prepaid credits")
+        self.assertEqual(windows[1]["kind"], "balance")
+        self.assertEqual(windows[1]["remaining"], 15.0)
+
+        # No percentage and no weekly period is still unknown, never a guess.
+        self.assertEqual(api._grok_windows_from_payloads({"config": {"isUnifiedBillingUser": True}}, monthly), [])
+        self.assertEqual(
+            api._grok_windows_from_payloads({"config": {"currentPeriod": {"type": "USAGE_PERIOD_TYPE_MONTHLY", "end": "2026-10-01T00:00:00+00:00"}}}, monthly),
+            [],
+        )
+
     def test_openrouter_keeps_key_usage_when_account_credits_need_management_key(self):
         payload = api._openrouter_payload(
             {

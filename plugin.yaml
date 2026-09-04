@@ -2,7 +2,7 @@ manifest_version: 2
 api_version: 1
 name: session-lens
 label: Hermes Session Lens
-version: 0.34.1
+version: 0.34.2
 description: "Native Hermes Desktop observability: session trace, cost, provider usage, runtime health, profiles, and schedules."
 author: "Hermes Session Lens contributors"
 kind: standalone
