@@ -3240,7 +3240,25 @@ function serviceInventoryStatus(row) {
   return { tone: 'neutral', label: 'No usage API', icon: 'circle-slash' }
 }
 
-function ServicesSection({ query, narrow, history, onRefresh }) {
+// Services without an adapter are inventoried from their key name or MCP
+// entry and never hidden; a balance card needs a small adapter module. The
+// recipe lives in the repository, one click from every unreadable row.
+const ADAPTER_RECIPE_URL = 'https://github.com/abualnassr/hermes-session-lens/blob/main/ADAPTERS.md'
+
+async function openExternalLink(ctx, url) {
+  try {
+    if (typeof ctx?.os?.openExternal === 'function' && (await ctx.os.openExternal(url))) return
+  } catch {
+    // Fall through to the browser-style open below.
+  }
+  try {
+    window.open(url, '_blank', 'noopener')
+  } catch {
+    // Nothing else to try; the URL is also in the README.
+  }
+}
+
+function ServicesSection({ ctx, query, narrow, history, onRefresh }) {
   const data = query.data
   const cards = data?.cards || []
   const inventory = data?.inventory || []
@@ -3273,7 +3291,7 @@ function ServicesSection({ query, narrow, history, onRefresh }) {
                   jsx('h3', { id: 'service-inventory', style: { color: color.primary, fontSize: '0.9375rem', fontWeight: 650, lineHeight: 1.35, margin: 0 }, children: 'Everything configured' }),
                   jsx('p', {
                     style: { color: color.tertiary, fontSize: '0.6875rem', lineHeight: 1.5, margin: '0.15rem 0 0' },
-                    children: `${formatCount(summary.configured)} non-model service${Number(summary.configured) === 1 ? '' : 's'} found in Hermes — ${formatCount(summary.monitored)} monitored, ${formatCount(summary.unreadable)} with no usage API Session Lens can read. ${data.definition || ''}`
+                    children: `${formatCount(summary.configured)} non-model service${Number(summary.configured) === 1 ? '' : 's'} found in Hermes — ${formatCount(summary.monitored)} monitored, ${formatCount(summary.unreadable)} with no usage API Session Lens can read. ${data.definition || ''} A service without an adapter is still listed from its key name or MCP entry, never hidden; a balance card needs a small adapter, and the recipe is linked on each such row.`
                   })
                 ]
               }),
@@ -3309,7 +3327,21 @@ function ServicesSection({ query, narrow, history, onRefresh }) {
                   {
                     key: 'note',
                     label: 'Note',
-                    render: row => jsx('span', { style: { color: color.quaternary, fontSize: '0.6875rem', lineHeight: 1.4 }, children: row.note || (row.status === 'monitored' ? 'Read from the vendor’s usage endpoint.' : '') }),
+                    render: row => jsxs('span', {
+                      style: { color: color.quaternary, fontSize: '0.6875rem', lineHeight: 1.4 },
+                      children: [
+                        row.note || (row.status === 'monitored' ? 'Read from the vendor’s usage endpoint.' : ''),
+                        !row.adapter
+                          ? jsx('button', {
+                              type: 'button',
+                              onClick: () => openExternalLink(ctx, ADAPTER_RECIPE_URL),
+                              title: 'Opens ADAPTERS.md on GitHub: how a small adapter module gives this service a balance card',
+                              style: { background: 'transparent', border: 'none', color: color.accent, cursor: 'pointer', font: 'inherit', fontSize: '0.625rem', marginLeft: '0.35rem', outlineColor: color.accent, padding: 0, textDecoration: 'underline', textUnderlineOffset: '2px' },
+                              children: 'How to add an adapter'
+                            })
+                          : null
+                      ]
+                    }),
                     muted: true
                   }
                 ],
@@ -3378,7 +3410,7 @@ function AIUsageView({ ctx, query, servicesQuery, narrow, refreshError, history,
                   : 'No provider credentials were found in Hermes.'
               ].filter(Boolean).join(' ')
             }),
-        jsx(ServicesSection, { query: servicesQuery, narrow, history, onRefresh: onRefreshService }),
+        jsx(ServicesSection, { ctx, query: servicesQuery, narrow, history, onRefresh: onRefreshService }),
         jsx(BudgetsSection, { ctx, budgets, onChange: onBudgetsChange, narrow }),
         configured.length && unconfigured.length
           ? jsxs('div', {

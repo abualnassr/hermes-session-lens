@@ -165,7 +165,7 @@ def _services_inventory() -> Dict[str, Dict[str, Any]]:
             if not generic or generic in {"hermes", "session_lens"}:
                 continue
             item = entry(generic, "key")
-            item["note"] = item["note"] or "No Session Lens adapter reads this service yet."
+            item["note"] = item["note"] or "Listed from its key name; no Session Lens adapter reads its balance yet."
         else:
             continue
         item["sources"].append(f"env:{name}")
@@ -179,7 +179,7 @@ def _services_inventory() -> Dict[str, Dict[str, Any]]:
         item["sources"].append(source)
         item["mcp"] = {key: server[key] for key in ("transport", "enabled", "tool_count")}
         if item["kind"] == "mcp" and not item["note"]:
-            item["note"] = "MCP server with no usage API Session Lens knows how to read."
+            item["note"] = "Listed from config.yaml; no Session Lens adapter reads a usage API for this MCP server."
 
     for adapter in adapters.values():
         if not adapter.cli:

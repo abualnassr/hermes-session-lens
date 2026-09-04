@@ -3737,6 +3737,12 @@ process.stdout.write(JSON.stringify(out))
         self.assertIn("jsx(ServicesSection, {", source)
         self.assertIn("'/services?fresh=true'", source)
         self.assertIn("Everything configured", source)
+        self.assertIn("const ADAPTER_RECIPE_URL = 'https://github.com/abualnassr/hermes-session-lens/blob/main/ADAPTERS.md'", source)
+        self.assertIn("'How to add an adapter'", source)
+        self.assertIn("ctx?.os?.openExternal", source)
+        self.assertIn("jsx(ServicesSection, { ctx,", source)
+        readme = (MODULE_PATH.parents[1] / "README.md").read_text(encoding="utf-8")
+        self.assertIn("never hidden; giving it a balance card is a small adapter module", readme)
         routes = {route.path for route in api.router.routes}
         self.assertIn("/services", routes)
 
