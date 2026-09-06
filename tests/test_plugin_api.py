@@ -525,6 +525,62 @@ class SessionLensApiTests(unittest.TestCase):
         detail = api._scoped_call("beta", api._session_detail_sync, "beta-session-1")
         self.assertEqual(detail["session"]["id"], "beta-session-1")
 
+    def _relayout_beta_tables(self, beta_db):
+        """Rebuild beta's tables the way a freshly created Hermes state.db lays
+        them out: a column that a migrated database appended with ALTER TABLE
+        sits inline instead, and one column is missing entirely."""
+        connection = sqlite3.connect(beta_db)
+        for table, moved, dropped in (
+            ("sessions", "system_prompt_hash", "title_source"),
+            ("messages", "compacted", "platform_message_id"),
+        ):
+            columns = [row[1] for row in connection.execute(f"PRAGMA table_info({table})")]
+            create_sql = connection.execute(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name=?", (table,)
+            ).fetchone()[0]
+            body = create_sql[create_sql.index("(") + 1 : create_sql.rindex(")")]
+            defs = {}
+            for chunk in body.split(",\n"):
+                chunk = chunk.strip().rstrip(",")
+                if chunk:
+                    defs[chunk.split()[0]] = chunk
+            reordered = [column for column in columns if column not in (moved, dropped)]
+            reordered.insert(3, moved)
+            self.assertNotEqual(reordered, columns)
+            connection.execute(f"ALTER TABLE {table} RENAME TO {table}_old")
+            connection.execute(
+                f"CREATE TABLE {table} (" + ", ".join(defs[column] for column in reordered) + ")"
+            )
+            names = ", ".join(reordered)
+            connection.execute(f"INSERT INTO {table} ({names}) SELECT {names} FROM {table}_old")
+            connection.execute(f"DROP TABLE {table}_old")
+        connection.commit()
+        connection.close()
+
+    def test_profile_scope_union_matches_columns_by_name_not_position(self):
+        beta_db = self._make_beta_profile()
+        self._relayout_beta_tables(beta_db)
+        list_kwargs = dict(
+            days=0, query="", sort="recent", failures_only=False,
+            include_archived=False, limit=50, offset=0,
+        )
+        payload = api._scoped_call("all", api._list_sessions_sync, **list_kwargs)
+        by_id = {item["id"]: item for item in payload["sessions"]}
+        self.assertEqual(set(by_id), {"session-1", "beta-session-1"})
+        self.assertEqual(by_id["beta-session-1"]["total_tokens"], by_id["session-1"]["total_tokens"])
+        self.assertEqual(by_id["beta-session-1"]["started_at"], by_id["session-1"]["started_at"])
+
+        overview = api._scoped_call("all", api._overview_sync, 0)
+        self.assertEqual(overview["totals"]["sessions"], 2)
+        self.assertTrue(overview["daily"])
+        self.assertTrue(all(row["day"] for row in overview["daily"]))
+        self.assertEqual(sum(row["sessions"] for row in overview["daily"]), 2)
+
+        detail = api._scoped_call("all", api._session_detail_sync, "beta-session-1")
+        self.assertEqual(detail["session"]["id"], "beta-session-1")
+        self.assertTrue(detail["message_roles"])
+        self.assertTrue(detail["tools"])
+
     def test_profile_scope_search_and_query_syntax_span_profiles(self):
         self._make_beta_profile()
         list_kwargs = dict(
@@ -1419,7 +1475,7 @@ process.stdout.write(JSON.stringify(out))
                 INSERT INTO sessions (id, source, model, started_at, last_activity_at, ended_at,
                                       git_repo_root, input_tokens, output_tokens, actual_cost_usd, message_count)
                 VALUES ('session-repo', 'desktop', 'provider/model-a', 1800000300, 1800000400, 1800000400,
-                        'C:\work\demo-repo', 2000, 1000, 0.5, 3)
+                        'C:\\work\\demo-repo', 2000, 1000, 0.5, 3)
                 """
             )
             connection.execute(

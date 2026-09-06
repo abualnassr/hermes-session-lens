@@ -102,6 +102,10 @@ def _scope_db_paths() -> List[Tuple[str, Path]]:
     return [(name, path) for name, path in paths if path.exists()]
 
 
+def _quote_identifier(name: str) -> str:
+    return '"' + str(name).replace('"', '""') + '"'
+
+
 class _UnionDB:
     """Read-only view over several profiles' state.db files.
 
@@ -126,11 +130,34 @@ class _UnionDB:
             self._conn.execute(f"ATTACH DATABASE ? AS {alias}", (f"file:{path.as_posix()}?mode=ro",))
             aliases.append(alias)
         for table in self._UNION_TABLES:
+            # UNION ALL matches columns by position, and two state.db files
+            # rarely agree on position: a column Hermes adds with ALTER TABLE
+            # lands at the end of a migrated database but inline in a
+            # database created later. Project every profile onto one named
+            # column list (NULL where a profile lacks the column) so a row's
+            # started_at is always its started_at.
+            columns_by_alias: Dict[str, List[str]] = {}
+            for alias in aliases:
+                if self._table_exists(alias, table):
+                    columns_by_alias[alias] = self._table_columns(alias, table)
+            ordered: List[str] = []
+            for columns in columns_by_alias.values():
+                for column in columns:
+                    if column not in ordered:
+                        ordered.append(column)
             selects = []
             for alias, (name, _path) in zip(aliases, named_paths):
-                if self._table_exists(alias, table):
-                    literal = str(name).replace("'", "''")
-                    selects.append(f"SELECT *, '{literal}' AS __profile FROM {alias}.{table}")
+                columns = columns_by_alias.get(alias)
+                if columns is None:
+                    continue
+                present = set(columns)
+                projected = ", ".join(
+                    _quote_identifier(column) if column in present
+                    else f"NULL AS {_quote_identifier(column)}"
+                    for column in ordered
+                )
+                literal = str(name).replace("'", "''")
+                selects.append(f"SELECT {projected}, '{literal}' AS __profile FROM {alias}.{table}")
             if selects:
                 self._conn.execute(f"CREATE TEMP VIEW {table} AS " + " UNION ALL ".join(selects))
 
@@ -143,6 +170,13 @@ class _UnionDB:
         except sqlite3.Error:
             return False
         return row is not None
+
+    def _table_columns(self, alias: str, table: str) -> List[str]:
+        try:
+            rows = self._conn.execute(f"PRAGMA {alias}.table_info({table})").fetchall()
+        except sqlite3.Error:
+            return []
+        return [str(row[1]) for row in rows]
 
     def resolve_session_id(self, session_id: Any) -> Optional[str]:
         sid = str(session_id or "").strip()
@@ -305,12 +339,33 @@ def _anthropic_env_credentials() -> List[Tuple[str, str]]:
     return found
 
 
+def _hermes_anthropic_credentials() -> Any:
+    """Hermes' Anthropic credential helpers, wherever this Hermes keeps them.
+
+    Hermes moved resolve_anthropic_token, _resolve_anthropic_pool_token and
+    _is_oauth_token out of agent.anthropic_adapter into
+    agent.anthropic_credentials; the adapter re-exports the public name with
+    a deprecation warning until 2026-09-14 and the private ones not at all.
+    Prefer the new module and fall back to the adapter for older builds.
+    """
+    try:
+        from agent import anthropic_credentials
+
+        if hasattr(anthropic_credentials, "resolve_anthropic_token"):
+            return anthropic_credentials
+    except ImportError:
+        pass
+    from agent import anthropic_adapter
+
+    return anthropic_adapter
+
+
 def _resolve_anthropic_oauth() -> Tuple[str, bool]:
     try:
-        from agent import anthropic_adapter
+        credentials = _hermes_anthropic_credentials()
 
-        token = str(anthropic_adapter.resolve_anthropic_token() or "").strip()
-        token_check = getattr(anthropic_adapter, "_is_oauth_token", None)
+        token = str(credentials.resolve_anthropic_token() or "").strip()
+        token_check = getattr(credentials, "_is_oauth_token", None)
         if not callable(token_check):
             return token, False
         return token, bool(token_check(token))
@@ -327,10 +382,10 @@ def _resolve_anthropic_pool_oauth() -> str:
     Empty string when no OAuth login is stored.
     """
     try:
-        from agent import anthropic_adapter
+        credentials = _hermes_anthropic_credentials()
 
-        token = str(anthropic_adapter._resolve_anthropic_pool_token() or "").strip()
-        if token and anthropic_adapter._is_oauth_token(token):
+        token = str(credentials._resolve_anthropic_pool_token() or "").strip()
+        if token and credentials._is_oauth_token(token):
             return token
     except Exception:
         pass
@@ -347,7 +402,7 @@ def _anthropic_pool_oauth_accounts() -> List[Dict[str, str]]:
     """
     accounts: List[Dict[str, str]] = []
     try:
-        from agent import anthropic_adapter
+        credentials = _hermes_anthropic_credentials()
         from agent.credential_pool import AUTH_TYPE_OAUTH, load_pool
 
         pool = load_pool("anthropic")
@@ -356,7 +411,7 @@ def _anthropic_pool_oauth_accounts() -> List[Dict[str, str]]:
             if getattr(entry, "auth_type", None) != AUTH_TYPE_OAUTH:
                 continue
             token = str(getattr(entry, "access_token", "") or "").strip()
-            if not token or not anthropic_adapter._is_oauth_token(token):
+            if not token or not credentials._is_oauth_token(token):
                 continue
             label = str(getattr(entry, "label", "") or "").strip() or str(getattr(entry, "id", "") or "")[:8]
             accounts.append({"label": label[:60], "token": token})
