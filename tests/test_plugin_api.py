@@ -581,6 +581,28 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertTrue(detail["message_roles"])
         self.assertTrue(detail["tools"])
 
+    def test_file_references_stay_linear_on_slash_heavy_tokens(self):
+        import time
+
+        from dashboard import _classify, _common
+
+        self.assertEqual(_common._file_references("edit src/app/main.py now"), ["src/app/main.py"])
+        self.assertEqual(_common._file_references("C:\\work\\demo\\notes.md"), ["C:\\work\\demo\\notes.md"])
+        self.assertEqual(
+            _common._file_references("see docs/foo.test.py and /tmp/x.txt; 'quoted/q.md'"),
+            ["docs/foo.test.py", "/tmp/x.txt", "quoted/q.md"],
+        )
+        self.assertEqual(_common._file_references("a.py.md src/a.py:12 .py python3 a.python"), ["a.py.md", "src/a.py"])
+        self.assertEqual(_common._file_references("https://host/path/file.js?x=1"), ["https://host/path/file.js"])
+
+        # One base64 blob or slash-heavy URL in a tool call used to hold the
+        # interpreter for minutes (exponential backtracking); it must be instant.
+        blob = "data:image/png;base64," + "aGVsbG8v" * 6000 + "/" + "a/" * 20000 + "b"
+        started = time.time()
+        paths = _classify._paths_from_tool_call({"name": "terminal", "arguments": {"command": "echo " + blob}})
+        self.assertLess(time.time() - started, 2.0)
+        self.assertEqual(paths, [])
+
     def test_profile_scope_search_and_query_syntax_span_profiles(self):
         self._make_beta_profile()
         list_kwargs = dict(
@@ -1300,7 +1322,7 @@ process.stdout.write(JSON.stringify(out))
         self.assertIn("if (activeRulesParam && path === '/digest') merged.rules = activeRulesParam", source)
         self.assertIn("ctx.storage.set(RULES_STORAGE_KEY, rules)", source)
         self.assertIn("jsx(RulesView, { ctx, period, onDrill: drillToSessions, rules, onRulesChange: setRules, availableProfiles })", source)
-        self.assertIn("ctx.rest(apiPath('/rules', { ...period, rules: rulesParam, min_samples: minSamples }))", source)
+        self.assertIn("pluginRest(ctx, apiPath('/rules', { ...period, rules: rulesParam, min_samples: minSamples }))", source)
         # The trial seed was removed before the public release: a fresh install opens empty.
         self.assertNotIn("TRIAL SEED", source)
         self.assertNotIn("RULES_TRIAL_SEED", source)
@@ -1455,7 +1477,7 @@ process.stdout.write(JSON.stringify(out))
         self.assertIn("/tool-names", {route.path for route in api.router.routes})
         source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
         for needle in ("const TOOL_NAMES_LIST_ID = 'session-lens-tool-names'", "list: isTool ? TOOL_NAMES_LIST_ID : undefined",
-                       "jsx(ToolNamesDatalist, { directory })", "ctx.rest(apiPath('/tool-names'))", "'not seen in Hermes'"):
+                       "jsx(ToolNamesDatalist, { directory })", "pluginRest(ctx, apiPath('/tool-names'))", "'not seen in Hermes'"):
             self.assertIn(needle, source)
 
     def test_quota_exhaust_forecast_math(self):

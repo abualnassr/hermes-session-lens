@@ -96,6 +96,26 @@ function apiPath(path, params = {}) {
   return query ? `${path}?${query}` : path
 }
 
+// Every read goes through here. Hermes' desktop bridge resolves null for an
+// empty 2xx body, and a query that resolves to nothing would render as a
+// crash deep inside a view; a thrown error instead lands in ErrorBlock with
+// its Retry button. The path is trimmed to its route so the message never
+// carries query parameters.
+async function pluginRest(ctx, path, options) {
+  const result = options === undefined ? await ctx.rest(path) : await ctx.rest(path, options)
+  if (result === undefined || result === null) {
+    throw new Error(`Hermes returned no data for ${String(path).split('?')[0]} — the backend may be busy or restarting`)
+  }
+  return result
+}
+
+// A query that is neither loading nor failed can still have no data: React
+// Query pauses fetches while the app believes it is offline, and a reset
+// query sits idle until its next fetch. Treat both as "still waiting".
+function queryPending(query) {
+  return Boolean(query?.isLoading || (query?.data === undefined && !query?.isError))
+}
+
 function dateInputValue(date) {
   const year = date.getFullYear()
   const month = String(date.getMonth() + 1).padStart(2, '0')
@@ -700,7 +720,7 @@ function notifyHost(kind, message) {
 // read-only and the user sees exactly what the model will read before any
 // tokens are spent.
 async function askHermesAboutFailures({ ctx, sessionId, profile }) {
-  const payload = await ctx.rest(apiPath(`/sessions/${encodeURIComponent(sessionId)}/analysis-prompt`, profile ? { profiles: profile } : {}))
+  const payload = await pluginRest(ctx, apiPath(`/sessions/${encodeURIComponent(sessionId)}/analysis-prompt`, profile ? { profiles: profile } : {}))
   const prompt = payload?.prompt
   if (typeof prompt !== 'string' || !prompt.trim()) throw new Error('the analysis prompt came back empty')
   await copyText(prompt)
@@ -930,7 +950,7 @@ function digestExportItem(ctx, period) {
     hint: 'Totals, attention, models, monthly spend, quota windows, service balances — the same text GET /digest returns for this period',
     filename: exportFilename('digest', period, 'md'),
     mime: 'text/markdown;charset=utf-8',
-    build: async () => String((await ctx.rest(apiPath('/digest', period)))?.markdown || '')
+    build: async () => String((await pluginRest(ctx, apiPath('/digest', period)))?.markdown || '')
   }
 }
 
@@ -1259,17 +1279,17 @@ function TraceView({ ctx, sessionId, period }) {
   useEffect(() => setLimit(100), [sessionId])
   const traceQuery = useQuery({
     queryKey: [PLUGIN_ID, 'trace', sessionId, limit],
-    queryFn: () => ctx.rest(apiPath(`/sessions/${encodeURIComponent(sessionId)}/trace`, { limit })),
+    queryFn: () => pluginRest(ctx, apiPath(`/sessions/${encodeURIComponent(sessionId)}/trace`, { limit })),
     enabled: Boolean(sessionId),
     placeholderData: previous => previous
   })
   const telemetryQuery = useQuery({
     queryKey: [PLUGIN_ID, 'session-telemetry', sessionId, period.days, period.start_at, period.end_at],
-    queryFn: () => ctx.rest(apiPath('/telemetry', { ...period, session_id: sessionId })),
+    queryFn: () => pluginRest(ctx, apiPath('/telemetry', { ...period, session_id: sessionId })),
     enabled: Boolean(sessionId),
     refetchInterval: 60_000
   })
-  if (traceQuery.isLoading) return jsx(LoadingBlock, { rows: 9 })
+  if (queryPending(traceQuery)) return jsx(LoadingBlock, { rows: 9 })
   if (traceQuery.isError) return jsx(ErrorBlock, { error: traceQuery.error, onRetry: traceQuery.refetch, title: 'Session trace unavailable' })
   const data = traceQuery.data
   const runtime = telemetryQuery.data?.summary
@@ -1374,7 +1394,7 @@ function SessionDetail({ query, detailTab, setDetailTab, ctx, period, profile, o
   if (!query) {
     return jsx(EmptyState, { title: 'Choose a session', description: 'Select a session to inspect its recorded evidence.' })
   }
-  if (query.isLoading) return jsx(LoadingBlock, { rows: 7 })
+  if (queryPending(query)) return jsx(LoadingBlock, { rows: 7 })
   if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'Session detail unavailable' })
   const detail = query.data
   const session = detail.session
@@ -1590,13 +1610,13 @@ function SessionsView({ ctx, period, narrow, drill }) {
   }, [ctx, dismissedAttention])
   const attentionQuery = useQuery({
     queryKey: [PLUGIN_ID, 'attention', period.days, period.start_at, period.end_at],
-    queryFn: () => ctx.rest(apiPath('/attention', period)),
+    queryFn: () => pluginRest(ctx, apiPath('/attention', period)),
     refetchInterval: 120_000
   })
   const listQuery = useQuery({
     queryKey: [PLUGIN_ID, 'sessions', period.days, period.start_at, period.end_at, debouncedSearch, sort, failuresOnly, limit],
     queryFn: () =>
-      ctx.rest(apiPath('/sessions', {
+      pluginRest(ctx, apiPath('/sessions', {
         ...period,
         q: debouncedSearch,
         sort,
@@ -1622,7 +1642,7 @@ function SessionsView({ ctx, period, narrow, drill }) {
   const selectedProfile = sessions.find(item => item.id === selected)?.profile || ''
   const detailQuery = useQuery({
     queryKey: [PLUGIN_ID, 'session', selected, selectedProfile],
-    queryFn: () => ctx.rest(apiPath(`/sessions/${encodeURIComponent(selected)}`, selectedProfile ? { profiles: selectedProfile } : {})),
+    queryFn: () => pluginRest(ctx, apiPath(`/sessions/${encodeURIComponent(selected)}`, selectedProfile ? { profiles: selectedProfile } : {})),
     enabled: Boolean(selected),
     refetchInterval: 30_000
   })
@@ -1681,7 +1701,7 @@ function SessionsView({ ctx, period, narrow, drill }) {
             title: 'Export the sessions matching the current search, sort, and period',
             items: (() => {
               const params = { ...period, q: debouncedSearch, sort, failures_only: failuresOnly, limit: 500, offset: 0 }
-              const fetchPage = () => ctx.rest(apiPath('/sessions', params))
+              const fetchPage = () => pluginRest(ctx, apiPath('/sessions', params))
               const hint = `Current filters and sort, up to 500 sessions${pagination?.total > 500 ? ` (${formatCount(pagination.total)} match)` : ''}`
               return [
                 {
@@ -1838,10 +1858,10 @@ function formatDurationShort(seconds) {
 function ProjectsSection({ ctx, period }) {
   const query = useQuery({
     queryKey: [PLUGIN_ID, 'projects', period.days, period.start_at, period.end_at],
-    queryFn: () => ctx.rest(apiPath('/projects', period)),
+    queryFn: () => pluginRest(ctx, apiPath('/projects', period)),
     refetchInterval: 120_000
   })
-  if (query.isLoading) return jsx(LoadingBlock, { rows: 4 })
+  if (queryPending(query)) return jsx(LoadingBlock, { rows: 4 })
   if (query.isError) return jsx('p', { style: { color: color.tertiary, fontSize: '0.6875rem' }, children: 'Project rollup is temporarily unavailable.' })
   const data = query.data
   const totals = data.totals || {}
@@ -1913,7 +1933,7 @@ function _modelBasename(model) {
 }
 
 function OverviewView({ query, ctx, period }) {
-  if (query.isLoading) return jsx(LoadingBlock, { rows: 8 })
+  if (queryPending(query)) return jsx(LoadingBlock, { rows: 8 })
   if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'Overview unavailable' })
   const data = query.data
   return jsx('div', {
@@ -2046,15 +2066,15 @@ function ContextWeightCell({ row }) {
 function ToolsView({ ctx, period }) {
   const query = useQuery({
     queryKey: [PLUGIN_ID, 'tools', period.days, period.start_at, period.end_at],
-    queryFn: () => ctx.rest(apiPath('/tools', period)),
+    queryFn: () => pluginRest(ctx, apiPath('/tools', period)),
     refetchInterval: 60_000
   })
   const skillsQuery = useQuery({
     queryKey: [PLUGIN_ID, 'skills', period.days, period.start_at, period.end_at],
-    queryFn: () => ctx.rest(apiPath('/skills', period)),
+    queryFn: () => pluginRest(ctx, apiPath('/skills', period)),
     refetchInterval: 60_000
   })
-  if (query.isLoading) return jsx(LoadingBlock, { rows: 8 })
+  if (queryPending(query)) return jsx(LoadingBlock, { rows: 8 })
   if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'Tool analytics unavailable' })
   const data = query.data
   const skills = skillsQuery.data
@@ -2219,7 +2239,7 @@ function ToolsView({ ctx, period }) {
 function CompressionStrip({ ctx }) {
   const query = useQuery({
     queryKey: [PLUGIN_ID, 'compression'],
-    queryFn: () => ctx.rest(apiPath('/compression')),
+    queryFn: () => pluginRest(ctx, apiPath('/compression')),
     refetchInterval: 300_000
   })
   const data = query.data
@@ -2264,15 +2284,15 @@ function CompressionStrip({ ctx }) {
 function RuntimeHealth({ ctx, period }) {
   const telemetryQuery = useQuery({
     queryKey: [PLUGIN_ID, 'telemetry', period.days, period.start_at, period.end_at],
-    queryFn: () => ctx.rest(apiPath('/telemetry', period)),
+    queryFn: () => pluginRest(ctx, apiPath('/telemetry', period)),
     refetchInterval: 60_000
   })
   const gatewayQuery = useQuery({
     queryKey: [PLUGIN_ID, 'gateway'],
-    queryFn: () => ctx.rest('/gateway'),
+    queryFn: () => pluginRest(ctx, '/gateway'),
     refetchInterval: 30_000
   })
-  if (telemetryQuery.isLoading || gatewayQuery.isLoading) return jsx(LoadingBlock, { rows: 9 })
+  if (queryPending(telemetryQuery) || queryPending(gatewayQuery)) return jsx(LoadingBlock, { rows: 9 })
   if (telemetryQuery.isError) return jsx(ErrorBlock, { error: telemetryQuery.error, onRetry: telemetryQuery.refetch, title: 'Runtime telemetry unavailable' })
   if (gatewayQuery.isError) return jsx(ErrorBlock, { error: gatewayQuery.error, onRetry: gatewayQuery.refetch, title: 'Gateway health unavailable' })
   const telemetry = telemetryQuery.data
@@ -2350,10 +2370,10 @@ function RuntimeHealth({ ctx, period }) {
 function ProfilesView({ ctx, period }) {
   const query = useQuery({
     queryKey: [PLUGIN_ID, 'profiles', period.days, period.start_at, period.end_at],
-    queryFn: () => ctx.rest(apiPath('/profiles', period)),
+    queryFn: () => pluginRest(ctx, apiPath('/profiles', period)),
     refetchInterval: 60_000
   })
-  if (query.isLoading) return jsx(LoadingBlock, { rows: 8 })
+  if (queryPending(query)) return jsx(LoadingBlock, { rows: 8 })
   if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'Profile analytics unavailable' })
   const data = query.data
   return jsxs('div', {
@@ -2408,10 +2428,10 @@ function AgentRunStrip({ runs }) {
 function AgentScoreboard({ ctx, period, onSelectJob }) {
   const query = useQuery({
     queryKey: [PLUGIN_ID, 'agent-runs', period.days, period.start_at, period.end_at],
-    queryFn: () => ctx.rest(apiPath('/agent-runs', period)),
+    queryFn: () => pluginRest(ctx, apiPath('/agent-runs', period)),
     refetchInterval: 120_000
   })
-  if (query.isLoading) return jsx(LoadingBlock, { rows: 3 })
+  if (queryPending(query)) return jsx(LoadingBlock, { rows: 3 })
   if (query.isError) return jsx('p', { style: { color: color.tertiary, fontSize: '0.6875rem' }, children: 'Agent run history is temporarily unavailable.' })
   const data = query.data
   const jobs = data?.jobs || []
@@ -2458,10 +2478,10 @@ function AgentScoreboard({ ctx, period, onSelectJob }) {
 function SchedulesView({ ctx, period, onSelectJob }) {
   const query = useQuery({
     queryKey: [PLUGIN_ID, 'schedules'],
-    queryFn: () => ctx.rest('/schedules'),
+    queryFn: () => pluginRest(ctx, '/schedules'),
     refetchInterval: 30_000
   })
-  if (query.isLoading) return jsx(LoadingBlock, { rows: 8 })
+  if (queryPending(query)) return jsx(LoadingBlock, { rows: 8 })
   if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'Schedules unavailable' })
   const data = query.data
   return jsxs('div', {
@@ -3194,7 +3214,7 @@ function BudgetRow({ entry, month, onChange, narrow }) {
 function BudgetsSection({ ctx, budgets, onChange, narrow }) {
   const query = useQuery({
     queryKey: [PLUGIN_ID, 'budgets'],
-    queryFn: () => ctx.rest(apiPath('/budgets')),
+    queryFn: () => pluginRest(ctx, apiPath('/budgets')),
     refetchInterval: 300_000
   })
   const data = query.data
@@ -3357,7 +3377,7 @@ function ServicesSection({ ctx, query, narrow, history, onRefresh }) {
 }
 
 function AIUsageView({ ctx, query, servicesQuery, narrow, refreshError, history, onRefreshProvider, onRefreshService, onDrill, budgets, onBudgetsChange, period }) {
-  if (query.isLoading) return jsx(LoadingBlock, { rows: 8 })
+  if (queryPending(query)) return jsx(LoadingBlock, { rows: 8 })
   if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'AI usage is unavailable' })
   const data = query.data
   const providers = data?.providers || []
@@ -3477,10 +3497,10 @@ function DefinitionList({ rows }) {
 function SystemView({ ctx }) {
   const query = useQuery({
     queryKey: [PLUGIN_ID, 'system'],
-    queryFn: () => ctx.rest(apiPath('/system')),
+    queryFn: () => pluginRest(ctx, apiPath('/system')),
     refetchInterval: 60_000
   })
-  if (query.isLoading) return jsx(LoadingBlock, { rows: 8 })
+  if (queryPending(query)) return jsx(LoadingBlock, { rows: 8 })
   if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'System information unavailable' })
   const data = query.data
   const db = data.database
@@ -4104,13 +4124,13 @@ function RulesView({ ctx, period, onDrill, rules, onRulesChange, availableProfil
   useEffect(() => { ctx.storage.set(RULES_MIN_SAMPLES_KEY, minSamples) }, [ctx, minSamples])
   const templatesQuery = useQuery({
     queryKey: [PLUGIN_ID, 'rules-templates'],
-    queryFn: () => ctx.rest('/rules/templates'),
+    queryFn: () => pluginRest(ctx, '/rules/templates'),
     staleTime: Infinity
   })
   const catalog = templatesQuery.data?.conditions ? templatesQuery.data : null
   const toolNamesQuery = useQuery({
     queryKey: [PLUGIN_ID, 'tool-names', activeProfilesParam],
-    queryFn: () => ctx.rest(apiPath('/tool-names')),
+    queryFn: () => pluginRest(ctx, apiPath('/tool-names')),
     staleTime: 300_000
   })
   const directory = toolNamesQuery.data?.tools ? toolNamesQuery.data : null
@@ -4122,7 +4142,7 @@ function RulesView({ ctx, period, onDrill, rules, onRulesChange, availableProfil
   const rulesParam = enabledRulesParam(rules)
   const evalQuery = useQuery({
     queryKey: [PLUGIN_ID, 'rules', period.days, period.start_at, period.end_at, rulesParam, minSamples],
-    queryFn: () => ctx.rest(apiPath('/rules', { ...period, rules: rulesParam, min_samples: minSamples })),
+    queryFn: () => pluginRest(ctx, apiPath('/rules', { ...period, rules: rulesParam, min_samples: minSamples })),
     enabled: Boolean(rulesParam),
     placeholderData: previous => previous,
     refetchInterval: 120_000
@@ -4349,24 +4369,24 @@ function SessionLensPage({ ctx }) {
   const period = useMemo(() => periodParams(daysText, customStart, customEnd), [daysText, customStart, customEnd])
   const overviewQuery = useQuery({
     queryKey: [PLUGIN_ID, 'overview', period.days, period.start_at, period.end_at],
-    queryFn: () => ctx.rest(apiPath('/overview', period)),
+    queryFn: () => pluginRest(ctx, apiPath('/overview', period)),
     refetchInterval: 60_000
   })
   const aiUsageQuery = useQuery({
     queryKey: [PLUGIN_ID, 'ai-usage'],
-    queryFn: () => ctx.rest('/ai-usage'),
+    queryFn: () => pluginRest(ctx, '/ai-usage'),
     enabled: tab === 'ai-usage' || tab === 'ai-models',
     refetchInterval: tab === 'ai-usage' || tab === 'ai-models' ? 300_000 : false
   })
   const servicesQuery = useQuery({
     queryKey: [PLUGIN_ID, 'services'],
-    queryFn: () => ctx.rest('/services'),
+    queryFn: () => pluginRest(ctx, '/services'),
     enabled: tab === 'ai-usage',
     refetchInterval: tab === 'ai-usage' ? 300_000 : false
   })
   const aiModelsQuery = useQuery({
     queryKey: [PLUGIN_ID, 'ai-models', period.days, period.start_at, period.end_at],
-    queryFn: () => ctx.rest(apiPath('/ai-models', period)),
+    queryFn: () => pluginRest(ctx, apiPath('/ai-models', period)),
     enabled: tab === 'ai-models',
     refetchInterval: tab === 'ai-models' ? 300_000 : false
   })
@@ -4441,7 +4461,7 @@ function SessionLensPage({ ctx }) {
     const refreshErrors = []
     if (tab === 'ai-models') {
       try {
-        const data = await ctx.rest(apiPath('/ai-models', { ...period, fresh: true }))
+        const data = await pluginRest(ctx, apiPath('/ai-models', { ...period, fresh: true }))
         queryClient.setQueryData(
           [PLUGIN_ID, 'ai-models', period.days, period.start_at, period.end_at],
           data
@@ -4451,14 +4471,14 @@ function SessionLensPage({ ctx }) {
       }
     }
     try {
-      const data = await ctx.rest('/ai-usage?fresh=true')
+      const data = await pluginRest(ctx, '/ai-usage?fresh=true')
       queryClient.setQueryData([PLUGIN_ID, 'ai-usage'], data)
     } catch (error) {
       refreshErrors.push(`OAuth quotas: ${error?.message || String(error || 'the backend did not return data')}`)
     }
     if (tab === 'ai-usage') {
       try {
-        const data = await ctx.rest('/services?fresh=true')
+        const data = await pluginRest(ctx, '/services?fresh=true')
         queryClient.setQueryData([PLUGIN_ID, 'services'], data)
         queryClient.invalidateQueries({ queryKey: [PLUGIN_ID, 'budgets'] })
       } catch (error) {
@@ -4480,7 +4500,7 @@ function SessionLensPage({ ctx }) {
   }
   const healthQuery = useQuery({
     queryKey: [PLUGIN_ID, 'health'],
-    queryFn: () => ctx.rest('/health'),
+    queryFn: () => pluginRest(ctx, '/health'),
     refetchInterval: 120_000
   })
   const servingProfile = healthQuery.data?.profile_name
@@ -4501,7 +4521,7 @@ function SessionLensPage({ ctx }) {
   activeProfilesParam = profilesParam
   const profileListQuery = useQuery({
     queryKey: [PLUGIN_ID, 'profile-names'],
-    queryFn: () => ctx.rest(apiPath('/profiles', { days: 30 })),
+    queryFn: () => pluginRest(ctx, apiPath('/profiles', { days: 30 })),
     staleTime: 300_000
   })
   const availableProfiles = (profileListQuery.data?.profiles || [])
@@ -4520,7 +4540,7 @@ function SessionLensPage({ ctx }) {
   // request; this page-level copy keeps quota notes visible on every tab.
   const pageAttentionQuery = useQuery({
     queryKey: [PLUGIN_ID, 'attention', period.days, period.start_at, period.end_at],
-    queryFn: () => ctx.rest(apiPath('/attention', period)),
+    queryFn: () => pluginRest(ctx, apiPath('/attention', period)),
     refetchInterval: 120_000
   })
   const [quotaDismissed, setQuotaDismissed] = useState(() => {
@@ -4578,7 +4598,7 @@ function SessionLensPage({ ctx }) {
   if (tab === 'system') content = jsx(SystemView, { ctx })
   const refreshProvider = async provider => {
     try {
-      const data = await ctx.rest(`/ai-usage?fresh=true&provider=${encodeURIComponent(provider)}`)
+      const data = await pluginRest(ctx, `/ai-usage?fresh=true&provider=${encodeURIComponent(provider)}`)
       queryClient.setQueryData([PLUGIN_ID, 'ai-usage'], data)
     } catch (error) {
       setAiRefreshError(`${provider}: ${error?.message || String(error || 'refresh failed')}`)
@@ -4586,7 +4606,7 @@ function SessionLensPage({ ctx }) {
   }
   const refreshService = async service => {
     try {
-      const data = await ctx.rest(`/services?fresh=true&service=${encodeURIComponent(service)}`)
+      const data = await pluginRest(ctx, `/services?fresh=true&service=${encodeURIComponent(service)}`)
       queryClient.setQueryData([PLUGIN_ID, 'services'], data)
       queryClient.invalidateQueries({ queryKey: [PLUGIN_ID, 'budgets'] })
     } catch (error) {
@@ -5737,7 +5757,7 @@ function AIModelsStatStrip({ data }) {
 }
 
 function AIModelsView({ query, quotaQuery, narrow, refreshError, onDrill, period }) {
-  if (query.isLoading) return jsx(LoadingBlock, { rows: 9 })
+  if (queryPending(query)) return jsx(LoadingBlock, { rows: 9 })
   if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'AI model analytics are unavailable' })
   const data = query.data
   const window = formatLogWindow(data.coverage)

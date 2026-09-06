@@ -241,12 +241,38 @@ _WRITING_FILE_EXTENSIONS = {
     ".xls",
     ".xlsx",
 }
-_FILE_REFERENCE_RE = re.compile(
-    r"(?i)(?P<path>(?:[a-z]:)?(?:[^\s\"'<>|;&]+[\\/])*[^\s\"'<>|;&]+\."
-    r"(?:bash|c|cc|cjs|cpp|css|csv|docx|go|gradle|h|hpp|html|java|js|json|jsx|kt|lock|"
+# A file reference is a run of non-separator characters that ends in a known
+# extension. It used to be one regex, `(?:[^\s"'<>|;&]+[\\/])*[^\s"'<>|;&]+\.ext`,
+# whose segment loop could split a slash-heavy token in exponentially many
+# ways: a single base64 blob or long URL inside a tool call held the
+# interpreter — and with it the whole Hermes backend — for minutes. The
+# tokenizer plus extension scan below finds the same paths in linear time.
+_FILE_TOKEN_RE = re.compile(r"[^\s\"'<>|;&]+")
+_FILE_EXTENSION_RE = re.compile(
+    r"(?i)\.(?:bash|c|cc|cjs|cpp|css|csv|docx|go|gradle|h|hpp|html|java|js|json|jsx|kt|lock|"
     r"markdown|md|mjs|pdf|pptx|ps1|py|rs|rtf|scss|sh|sql|svelte|swift|toml|ts|tsx|txt|"
-    r"vue|xls|xlsx|xml|yaml|yml))\b"
+    r"vue|xls|xlsx|xml|yaml|yml)\b"
 )
+
+
+def _file_references(text: str) -> List[str]:
+    """Paths ending in a known file extension, in order of appearance.
+
+    Within one token the rightmost extension wins, exactly as the greedy
+    regex this replaced behaved: `a.py.md` is one path, `src/a.py:12`
+    yields `src/a.py`. Linear in the length of the text.
+    """
+    paths: List[str] = []
+    for token in _FILE_TOKEN_RE.finditer(text):
+        value = token.group(0)
+        last = None
+        for match in _FILE_EXTENSION_RE.finditer(value):
+            last = match
+        if last is not None and last.start() > 0:
+            paths.append(value[: last.end()])
+    return paths
+
+
 _PATCH_FILE_RE = re.compile(r"(?im)^\*\*\* (?:add|delete|update) file:\s*(?P<path>.+?)\s*$")
 _CODE_RUNNER_RE = re.compile(
     r"(?ix)(?:^|\s)(?:"

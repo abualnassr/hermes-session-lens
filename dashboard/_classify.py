@@ -30,8 +30,7 @@ def _paths_from_tool_call(call: Mapping[str, Any], extra_text: Any = None) -> Li
     for value in searchable:
         for match in _PATCH_FILE_RE.finditer(value):
             paths.append(match.group("path"))
-        for match in _FILE_REFERENCE_RE.finditer(value):
-            paths.append(match.group("path"))
+        paths.extend(_file_references(value))
     return list(dict.fromkeys(path for path in paths if path))
 
 
