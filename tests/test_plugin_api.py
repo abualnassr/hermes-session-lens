@@ -603,6 +603,62 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertLess(time.time() - started, 2.0)
         self.assertEqual(paths, [])
 
+    def test_route_budget_stops_a_slow_python_loop(self):
+        import time
+
+        def slow_builder():
+            for _ in range(200):
+                time.sleep(0.01)
+                hermes_compat._check_route_budget()
+            return {"finished": True}
+
+        with patch.object(api, "_plugin_settings", return_value={"route_budget_seconds": 0.15}):
+            with self.assertRaises(api.HTTPException) as caught:
+                api._scoped_call("", slow_builder)
+        self.assertEqual(caught.exception.status_code, 503)
+        self.assertIn("route_budget_seconds", caught.exception.detail)
+        self.assertIn("so Hermes stays responsive", caught.exception.detail)
+        self.assertNotIn("across", caught.exception.detail)
+        self.assertIsNone(api._get_profile_scope())
+
+        with patch.object(api, "_plugin_settings", return_value={"route_budget_seconds": 0}):
+            self.assertEqual(api._scoped_call("", slow_builder), {"finished": True})
+
+    def test_route_budget_interrupts_a_slow_sql_statement(self):
+        def slow_query():
+            with api._database() as db:
+                return api._db_connection(db).execute(
+                    """
+                    WITH RECURSIVE counter(x) AS (
+                        SELECT 1 UNION ALL SELECT x + 1 FROM counter WHERE x < 200000000
+                    )
+                    SELECT COUNT(*) FROM counter
+                    """
+                ).fetchone()[0]
+
+        self._make_beta_profile()
+        with patch.object(api, "_plugin_settings", return_value={"route_budget_seconds": 0.2}):
+            with self.assertRaises(api.HTTPException) as caught:
+                api._scoped_call("all", slow_query)
+        self.assertEqual(caught.exception.status_code, 503)
+        self.assertIn("across 2 profiles", caught.exception.detail)
+
+        # The budget travels with the request thread only: a fresh call runs normally.
+        with patch.object(api, "_plugin_settings", return_value={"route_budget_seconds": 30}):
+            self.assertEqual(api._scoped_call("all", lambda: {"ok": True}), {"ok": True})
+        self.assertEqual(api._route_budget_seconds({"route_budget_seconds": "abc"}), 30.0)
+        self.assertEqual(api._route_budget_seconds({"route_budget_seconds": -5}), 0.0)
+
+    def test_route_budget_is_documented_and_visible(self):
+        repo = MODULE_PATH.parents[1]
+        source = (repo / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("function describeError(error)", source)
+        self.assertIn("['Time budget per view'", source)
+        self.assertIn("route_budget_seconds", (repo / "plugin.yaml").read_text(encoding="utf-8"))
+        self.assertIn("`route_budget_seconds`", (repo / "README.md").read_text(encoding="utf-8"))
+        payload = api._system_sync()
+        self.assertEqual(payload["privacy"]["route_budget_seconds"], 30.0)
+
     def test_profile_scope_search_and_query_syntax_span_profiles(self):
         self._make_beta_profile()
         list_kwargs = dict(

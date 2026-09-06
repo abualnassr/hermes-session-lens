@@ -2,7 +2,7 @@ manifest_version: 2
 api_version: 1
 name: session-lens
 label: Hermes Session Lens
-version: 0.34.3
+version: 0.35.0
 description: "Native Hermes Desktop observability: session trace, cost, provider usage, runtime health, profiles, and schedules."
 author: "Hermes Session Lens contributors"
 kind: standalone
@@ -21,6 +21,10 @@ config_schema:
     type: dict
     default: {}
     description: "Optional model-id glob to route-label overrides; for example, gpt-5.6-*: OpenAI OAuth."
+  route_budget_seconds:
+    type: int
+    default: 30
+    description: "Seconds one Session Lens view may spend building its data before the backend stops it and the view shows why. Keeps Hermes responsive when a scope is too heavy. 0 disables the budget."
   anthropic_usage_probe:
     type: bool
     default: true

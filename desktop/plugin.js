@@ -260,8 +260,25 @@ function LoadingBlock({ rows = 4 }) {
   })
 }
 
+// Hermes' bridge rejects with "<status>: <body>"; when the body is the
+// backend's own JSON detail (a 503 from the route budget, a 404), show that
+// sentence rather than the envelope, and skip the first-install hint.
+function describeError(error) {
+  const raw = error?.message || String(error || 'The backend did not return data.')
+  const envelope = raw.match(/^(\d{3}):\s*(\{[\s\S]*\})\s*$/)
+  if (envelope) {
+    try {
+      const detail = JSON.parse(envelope[2])?.detail
+      if (typeof detail === 'string' && detail.trim()) return { message: detail.trim(), fromBackend: true }
+    } catch {
+      // fall through to the raw text
+    }
+  }
+  return { message: raw, fromBackend: false }
+}
+
 function ErrorBlock({ error, onRetry, title = 'Session Lens could not load this view' }) {
-  const message = error?.message || String(error || 'The backend did not return data.')
+  const { message, fromBackend } = describeError(error)
   if (/plugin not found/i.test(message)) {
     return jsx('div', {
       style: { display: 'grid', minHeight: '15rem', placeItems: 'center', padding: '2rem' },
@@ -278,7 +295,7 @@ function ErrorBlock({ error, onRetry, title = 'Session Lens could not load this 
     style: { display: 'grid', minHeight: '15rem', placeItems: 'center', padding: '2rem' },
     children: jsxs(ErrorState, {
       title,
-      description: `${message} Enable session-lens in Hermes plugins and restart the gateway if this is the first install.`,
+      description: fromBackend ? message : `${message} Enable session-lens in Hermes plugins and restart the gateway if this is the first install.`,
       children: [
         jsx(Button, { variant: 'outline', size: 'sm', onClick: onRetry, children: 'Try again' })
       ]
@@ -3553,6 +3570,7 @@ function SystemView({ ctx }) {
                   ? data.privacy.inference_probes.map(item => `${item.label}: ${item.note || 'token-sized request to read rate-limit headers'}`).join(' · ')
                   : 'None — usage and balance endpoints only'],
                 ['Mutation endpoints', String(data.privacy.mutation_endpoints)],
+                ['Time budget per view', Number(data.privacy.route_budget_seconds) > 0 ? `${Number(data.privacy.route_budget_seconds)} s, then the backend stops the build and the view says so (route_budget_seconds)` : 'Disabled (route_budget_seconds: 0)'],
                 ['Snippets', data.privacy.snippets_redacted_and_bounded ? 'Redacted and bounded' : 'Review required'],
                 ['Failure signatures', data.privacy.failure_signatures_language === 'english' ? 'English error text only, plus recorded error states in any language' : 'Review required'],
                 ['Connection', data.privacy.database_connection],

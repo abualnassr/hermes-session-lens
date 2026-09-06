@@ -6,6 +6,7 @@ import hashlib
 import os
 import sqlite3
 import threading
+import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
@@ -220,6 +221,111 @@ class _UnionDB:
             pass
 
 
+# ── Route time budget ─────────────────────────────────────────────────────
+# One slow payload build must never take Hermes down with it. The desktop
+# backend is a single process, and a thread that grinds for minutes starves
+# every request behind it — the gateway indicator included (2026-09-06, a
+# backtracking regex in the classifier). Every payload builder therefore
+# runs under a deadline: SQLite statements are interrupted through a
+# progress handler, long Python loops call _check_route_budget() between
+# units of work, and the route answers 503 with a sentence that names the
+# budget and how to change it. Read-only throughout; nothing is cancelled
+# except our own work.
+
+DEFAULT_ROUTE_BUDGET_SECONDS = 30.0
+
+
+class RouteBudgetExceeded(RuntimeError):
+    def __init__(self, limit: float, elapsed: float) -> None:
+        super().__init__(f"route budget of {limit:g}s exceeded after {elapsed:.1f}s")
+        self.limit = limit
+        self.elapsed = elapsed
+
+
+_route_budget = threading.local()
+
+
+def _route_budget_seconds(settings: Optional[Mapping[str, Any]] = None) -> float:
+    """Seconds one payload build may take; 0 disables the budget."""
+    raw = (settings if settings is not None else _plugin_settings()).get(
+        "route_budget_seconds", DEFAULT_ROUTE_BUDGET_SECONDS
+    )
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        value = DEFAULT_ROUTE_BUDGET_SECONDS
+    if value != value:  # NaN
+        value = DEFAULT_ROUTE_BUDGET_SECONDS
+    return max(0.0, value)
+
+
+@contextmanager
+def _route_budget_scope(seconds: float) -> Iterator[None]:
+    previous = (
+        getattr(_route_budget, "deadline", None),
+        getattr(_route_budget, "limit", 0.0),
+        getattr(_route_budget, "started", None),
+    )
+    now = time.monotonic()
+    _route_budget.started = now
+    _route_budget.limit = float(seconds)
+    _route_budget.deadline = now + seconds if seconds > 0 else None
+    try:
+        yield
+    finally:
+        _route_budget.deadline, _route_budget.limit, _route_budget.started = previous
+
+
+def _route_budget_elapsed() -> float:
+    started = getattr(_route_budget, "started", None)
+    return time.monotonic() - started if started is not None else 0.0
+
+
+def _route_budget_exhausted() -> bool:
+    deadline = getattr(_route_budget, "deadline", None)
+    return deadline is not None and time.monotonic() > deadline
+
+
+def _check_route_budget() -> None:
+    """Call between units of work in a long Python loop."""
+    if _route_budget_exhausted():
+        raise RouteBudgetExceeded(getattr(_route_budget, "limit", 0.0), _route_budget_elapsed())
+
+
+def _route_budget_interrupted(exc: BaseException) -> bool:
+    """True when `exc` is SQLite reporting the interrupt our progress handler raised."""
+    return (
+        isinstance(exc, sqlite3.OperationalError)
+        and "interrupt" in str(exc).lower()
+        and _route_budget_exhausted()
+    )
+
+
+def _arm_route_budget(connection: Any) -> bool:
+    deadline = getattr(_route_budget, "deadline", None)
+    handler_setter = getattr(connection, "set_progress_handler", None)
+    if deadline is None or not callable(handler_setter):
+        return False
+
+    def interrupt_when_late() -> int:
+        return 1 if time.monotonic() > deadline else 0
+
+    try:
+        handler_setter(interrupt_when_late, 20_000)
+    except Exception:
+        return False
+    return True
+
+
+def _disarm_route_budget(connection: Any) -> None:
+    handler_setter = getattr(connection, "set_progress_handler", None)
+    if callable(handler_setter):
+        try:
+            handler_setter(None, 0)
+        except Exception:
+            pass
+
+
 @contextmanager
 def _database(db_path: Optional[Path] = None) -> Iterator[Any]:
     if SessionDB is None:
@@ -229,17 +335,24 @@ def _database(db_path: Optional[Path] = None) -> Iterator[Any]:
         scoped = _scope_db_paths()
         if len(scoped) > 1:
             union = _UnionDB(scoped)
+            armed = _arm_route_budget(union._conn)
             try:
                 yield union
             finally:
+                if armed:
+                    _disarm_route_budget(union._conn)
                 union.close()
             return
         if scoped:
             db_path = scoped[0][1]
     db = SessionDB(db_path=db_path, read_only=True) if db_path else SessionDB(read_only=True)
+    connection = getattr(db, "_conn", None)
+    armed = _arm_route_budget(connection)
     try:
         yield db
     finally:
+        if armed:
+            _disarm_route_budget(connection)
         db.close()
 
 

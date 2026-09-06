@@ -6,7 +6,7 @@
 
 It installs as one Hermes plugin: a native Desktop page plus its namespaced Python API. No iframe, no separate server, no telemetry service, and no write path — the backend defines zero mutation routes and never touches a credential store.
 
-This documentation describes Hermes Session Lens `0.34.3`, verified on Hermes Agent and Desktop `0.21.0`. MIT licensed. A community plugin, not affiliated with or endorsed by Nous Research.
+This documentation describes Hermes Session Lens `0.35.0`, verified on Hermes Agent and Desktop `0.21.0`. MIT licensed. A community plugin, not affiliated with or endorsed by Nous Research.
 
 ![How Session Lens works: what it reads, what it answers, and what it never does](docs/how-it-works.svg)
 
@@ -140,9 +140,10 @@ plugins:
         model_route_mappings:
           "gpt-5.6-*": "OpenAI OAuth"
         anthropic_usage_probe: true
+        route_budget_seconds: 30
 ```
 
-`rate_sample_threshold` is the sample floor before fail and retry/switch rates rank and colour (default 20). `model_route_mappings` are model-id globs that override the route label Session Lens infers from a model's recorded history. `anthropic_usage_probe` controls the one request Session Lens makes that is not a usage or balance endpoint (see [Trust](#trust)); set it to `false` to stop the one-token Claude message — the Anthropic card then reads only logins that answer the account-usage endpoint, and a setup token or API key shows "Not configured" with the reason.
+`rate_sample_threshold` is the sample floor before fail and retry/switch rates rank and colour (default 20). `model_route_mappings` are model-id globs that override the route label Session Lens infers from a model's recorded history. `anthropic_usage_probe` controls the one request Session Lens makes that is not a usage or balance endpoint (see [Trust](#trust)); set it to `false` to stop the one-token Claude message — the Anthropic card then reads only logins that answer the account-usage endpoint, and a setup token or API key shows "Not configured" with the reason. `route_budget_seconds` is how long one view may spend building its data (default 30). The Hermes Desktop backend is a single process, so a build that grinds for minutes would stall every other request behind it, the gateway indicator included; past the budget the backend interrupts its own query, and the view shows a sentence saying so with the scope that caused it. Raise it for a very large install, or set `0` to disable.
 
 ## Trust
 

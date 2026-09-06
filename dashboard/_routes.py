@@ -43,11 +43,35 @@ def _parse_profiles_param(raw: str) -> Optional[List[str]]:
     return chosen or None
 
 
+def _route_budget_message(limit: float, elapsed: float, names: Optional[List[str]]) -> str:
+    scope = f" across {len(names)} profiles" if names and len(names) > 1 else ""
+    return (
+        f"Session Lens stopped building this view after {elapsed:.0f} s{scope} so Hermes stays "
+        f"responsive (budget {limit:g} s). Try a shorter period or a single profile, or raise "
+        "route_budget_seconds in the plugin settings; 0 disables the budget."
+    )
+
+
 def _scoped_call(profiles_param: str, fn: Any, *args: Any, **kwargs: Any) -> Any:
-    """Run one payload builder under the requested profile scope."""
-    _set_profile_scope(_parse_profiles_param(profiles_param))
+    """Run one payload builder under the requested profile scope and the route time budget."""
+    names = _parse_profiles_param(profiles_param)
+    _set_profile_scope(names)
+    budget = _route_budget_seconds(_plugin_settings())
     try:
-        return fn(*args, **kwargs)
+        with _route_budget_scope(budget):
+            try:
+                return fn(*args, **kwargs)
+            except RouteBudgetExceeded as exc:
+                raise HTTPException(
+                    status_code=503, detail=_route_budget_message(exc.limit, exc.elapsed, names)
+                ) from None
+            except Exception as exc:
+                if _route_budget_interrupted(exc):
+                    raise HTTPException(
+                        status_code=503,
+                        detail=_route_budget_message(budget, _route_budget_elapsed(), names),
+                    ) from None
+                raise
     finally:
         _set_profile_scope(None)
 
@@ -2717,6 +2741,7 @@ def _ai_models_payload_sync(
 
     retry_switch_models_by_session: Dict[str, set[str]] = defaultdict(set)
     for session_id in classification_session_ids:
+        _check_route_budget()
         cached_facts_by_session[session_id] = _classification_facts(
             sessions_by_id.get(session_id, {}),
             message_rows_by_session.get(session_id, []),
@@ -3678,7 +3703,9 @@ def _tools_sync(
         assistant: Dict[str, Dict[str, Any]] = {}
         trend_end = period_end or time.time()
         trend_start = trend_end - 7 * 86400
-        for row in assistant_rows:
+        for index, row in enumerate(assistant_rows):
+            if index % 500 == 0:
+                _check_route_budget()
             for call in _iter_tool_calls(row["tool_calls"]):
                 name = call["name"]
                 entry = assistant.setdefault(
@@ -4983,6 +5010,7 @@ def _system_sync() -> Dict[str, Any]:
                 "external_hosts": _adapter_hosts(),
                 "inference_probes": _inference_probe_adapters(),
                 "mutation_endpoints": 0,
+                "route_budget_seconds": _route_budget_seconds(_plugin_settings()),
                 "snippets_redacted_and_bounded": True,
                 "failure_signatures_language": "english",
                 "database_connection": "Hermes SessionDB(read_only=True)",
