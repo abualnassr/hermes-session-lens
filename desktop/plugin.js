@@ -116,6 +116,19 @@ function queryPending(query) {
   return Boolean(query?.isLoading || (query?.data === undefined && !query?.isError))
 }
 
+// The header's refresh button should turn whenever any Session Lens query
+// is in flight, whichever tab declared it. React Query's useIsFetching is
+// not part of the Hermes SDK surface, so subscribe to the cache directly.
+function usePluginFetching(queryClient) {
+  const [fetching, setFetching] = useState(() => queryClient.isFetching({ queryKey: [PLUGIN_ID] }) > 0)
+  useEffect(() => {
+    const update = () => setFetching(queryClient.isFetching({ queryKey: [PLUGIN_ID] }) > 0)
+    update()
+    return queryClient.getQueryCache().subscribe(update)
+  }, [queryClient])
+  return fetching
+}
+
 function dateInputValue(date) {
   const year = date.getFullYear()
   const month = String(date.getMonth() + 1).padStart(2, '0')
@@ -4469,6 +4482,7 @@ function SessionLensPage({ ctx }) {
     ctx.storage.set('customEnd', customEnd)
   }, [ctx, customEnd])
 
+  const pluginFetching = usePluginFetching(queryClient)
   const refresh = async () => {
     if (tab !== 'ai-usage' && tab !== 'ai-models') {
       queryClient.invalidateQueries({ queryKey: [PLUGIN_ID] })
@@ -4707,9 +4721,7 @@ function SessionLensPage({ ctx }) {
                 'aria-label': 'Refresh Session Lens',
                 title: 'Refresh Session Lens',
                 disabled: aiManualRefreshing,
-                children: (tab === 'ai-usage' || tab === 'ai-models'
-                  ? aiManualRefreshing || aiUsageQuery.isFetching || (tab === 'ai-models' && aiModelsQuery.isFetching)
-                  : overviewQuery.isFetching)
+                children: aiManualRefreshing || pluginFetching
                   ? jsx(SpinIcon, {})
                   : jsx(Codicon, { name: 'refresh' })
               })

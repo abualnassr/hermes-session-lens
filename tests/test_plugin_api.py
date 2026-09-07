@@ -770,6 +770,13 @@ class SessionLensApiTests(unittest.TestCase):
         session_one = api._session_detail_sync("session-1")["session"]
         self.assertEqual(session_one["input_tokens"], 1000)
 
+    def test_refresh_spinner_follows_every_plugin_query(self):
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("function usePluginFetching(queryClient)", source)
+        self.assertIn("queryClient.getQueryCache().subscribe(update)", source)
+        self.assertIn("children: aiManualRefreshing || pluginFetching", source)
+        self.assertNotIn(": overviewQuery.isFetching)", source)
+
     def test_profile_scope_search_and_query_syntax_span_profiles(self):
         self._make_beta_profile()
         list_kwargs = dict(
