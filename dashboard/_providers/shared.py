@@ -286,6 +286,11 @@ def _ai_usage_summary(providers: List[Dict[str, Any]]) -> Dict[str, Any]:
     ]
     base = [item for item in providers if not item.get("account_extra")]
     not_configured = sum(1 for item in base if item.get("status") == "not_configured")
+    # A window on pace to run out is something to act on, so it counts here
+    # exactly when its forecast line shows on the card.
+    forecasts = sum(
+        1 for item in base for window in item.get("windows", []) if window.get("forecast")
+    )
     return {
         "providers": len(base),
         "configured": len(base) - not_configured,
@@ -293,7 +298,8 @@ def _ai_usage_summary(providers: List[Dict[str, Any]]) -> Dict[str, Any]:
         "not_configured": not_configured,
         "needs_attention": sum(
             1 for item in base if item.get("status") in {"expired", "forbidden", "unavailable", "stale"}
-        ),
+        ) + forecasts,
+        "forecasts": forecasts,
         "stale": sum(1 for item in base if item.get("status") == "stale"),
         "next_reset_at": _usage_iso(min(reset_epochs)) if reset_epochs else None,
     }

@@ -6,7 +6,7 @@
 
 It installs as one Hermes plugin: a native Desktop page plus its namespaced Python API. No iframe, no separate server, no telemetry service, and no write path — the backend defines zero mutation routes and never touches a credential store.
 
-This documentation describes Hermes Session Lens `0.39.0`, verified on Hermes Agent and Desktop `0.21.0`. MIT licensed. A community plugin, not affiliated with or endorsed by Nous Research.
+This documentation describes Hermes Session Lens `0.40.0`, verified on Hermes Agent and Desktop `0.21.0`. MIT licensed. A community plugin, not affiliated with or endorsed by Nous Research.
 
 ![How Session Lens works: what it reads, what it answers, and what it never does](docs/how-it-works.svg)
 
@@ -63,7 +63,7 @@ Tokens by day, then the spend rolled up by git repository, working directory, or
 
 ![AI Usage: provider cards with allowance windows and "What consumed this window"](docs/screenshots/ai-usage.png)
 
-Live account-level allowances and balances for the providers Hermes already holds credentials for: OpenAI Codex, Anthropic Claude, Nous Research Portal, OpenRouter, DeepSeek, Grok, Kimi Code Plan, and Z.AI GLM Coding Plan. Each window shows what remains, when it resets, and — when it is burning faster than the period elapses — when it will run out at the current pace. **What consumed this window** joins Hermes' own usage records — from every profile in the selected scope — to the window's span and ranks the projects, sessions, and models behind it; money windows state how much of the account figure local sessions explain, and that the rest came from other machines or tools.
+Live account-level allowances and balances for the providers Hermes already holds credentials for: OpenAI Codex, Anthropic Claude, Nous Research Portal, OpenRouter, DeepSeek, Grok, Kimi Code Plan, and Z.AI GLM Coding Plan. Each window shows what remains, when it resets, and — when it is burning faster than the period elapses and would run out at least a tenth of the window before the reset — when it will run out at the current pace, with the two numbers the forecast rests on; every such window counts under Needs attention. **What consumed this window** joins Hermes' own usage records — from every profile in the selected scope — to the window's span and ranks the projects, sessions, and models behind it; money windows state how much of the account figure local sessions explain, and that the rest came from other machines or tools.
 
 Anthropic gets one card per product Hermes holds a credential for: the Claude subscription (5-hour and 7-day windows, extra-usage state) and the Console API key (per-minute request and token limits). Because Anthropic's usage endpoint only answers full OAuth logins, those cards are read from the response headers of a one-token message — the single inference request Session Lens makes, described in full under [Trust](#trust).
 

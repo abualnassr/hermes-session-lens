@@ -2640,34 +2640,6 @@ function formatUsageAmount(value, unit) {
   return normalisedUnit ? `${formatted} ${normalisedUnit}` : formatted
 }
 
-function usageSlopeForecast(series, resetAt) {
-  if (!Array.isArray(series) || series.length < 3) return null
-  const cutoff = Date.now() - 3 * 3_600_000
-  const recent = series.filter(point => point[0] >= cutoff)
-  const points = recent.length >= 3 ? recent : series.slice(-6)
-  if (points.length < 3) return null
-  const spanMs = points[points.length - 1][0] - points[0][0]
-  if (spanMs < 20 * 60_000) return null
-  const n = points.length
-  const meanT = points.reduce((sum, point) => sum + point[0], 0) / n
-  const meanP = points.reduce((sum, point) => sum + point[1], 0) / n
-  let numerator = 0
-  let denominator = 0
-  for (const [t, p] of points) {
-    numerator += (t - meanT) * (p - meanP)
-    denominator += (t - meanT) ** 2
-  }
-  if (!denominator) return null
-  const slope = numerator / denominator
-  if (slope <= 1e-9) return null
-  const [lastT, lastP] = points[points.length - 1]
-  const exhaustMs = lastT + (100 - lastP) / slope
-  if (!Number.isFinite(exhaustMs) || exhaustMs < Date.now() - 3_600_000) return null
-  const reset = timestampDate(resetAt)
-  if (reset && exhaustMs >= reset.getTime()) return null
-  return { exhaustAt: exhaustMs / 1000, spanHours: spanMs / 3_600_000, samples: n }
-}
-
 function SpinIcon({ size }) {
   // Hermes' Codicon component does not understand codicon spin-modifier
   // names (they rendered a blank box), so the rotation is animated here.
@@ -2817,10 +2789,11 @@ function UsageWindow({ window, series, onDrill }) {
   const usedAmount = formatUsageAmount(window.used, window.unit)
   const limitAmount = formatUsageAmount(window.limit, window.unit)
   const value = remainingAmount || (remainingPercent !== null ? `${Math.round(remainingPercent)}% remaining` : 'Recorded balance')
-  const slope = window.kind === 'quota' && hasPercent ? usageSlopeForecast(series, window.reset_at) : null
-  const exhaustAt = slope
-    ? slope.exhaustAt
-    : window.kind === 'quota' && hasPercent ? quotaExhaustAt(window, used) : null
+  // The backend computes the one forecast every surface shows (card line,
+  // attention strip, header counter, AI Models cell, digest), with its rules
+  // and its basis; the desktop only renders it.
+  const forecast = window.kind === 'quota' && window.forecast?.exhaust_at ? window.forecast : null
+  const exhaustAt = forecast ? forecast.exhaust_at : null
   const detailParts = []
   if (usedAmount && limitAmount) detailParts.push(`${usedAmount} used of ${limitAmount}`)
   if (window.detail) detailParts.push(window.detail)
@@ -2861,11 +2834,9 @@ function UsageWindow({ window, series, onDrill }) {
         : null,
       exhaustAt
         ? jsx('div', {
-            title: slope
-              ? `Extrapolated from the recorded burn slope of the last ${slope.spanHours >= 1.5 ? `${Math.round(slope.spanHours)} hours` : `${Math.max(1, Math.round(slope.spanHours * 60))} minutes`} (${slope.samples} readings).`
-              : 'Linear extrapolation of the current burn rate over the elapsed share of this window.',
+            title: `Linear extrapolation of this window's own burn (${forecast.basis}). Shown only when the window is at least 10% elapsed, usage runs ahead of time, and the run-out lands at least 10% of the window before the reset; counted under Needs attention.`,
             style: { color: used >= 90 ? color.danger : color.warning, fontSize: '0.6875rem', fontWeight: 600 },
-            children: `At this pace, empty ~${formatShortDate(exhaustAt)} — before the reset.`
+            children: `At this pace, empty ~${formatShortDate(exhaustAt)} — before the reset (${forecast.basis}).`
           })
         : null,
       detailParts.length
@@ -3045,7 +3016,7 @@ function AIUsageStatStrip({ data }) {
       jsx(Metric, {
         label: 'Needs attention',
         value: data ? formatCount(summary.needs_attention) : '—',
-        detail: data ? `${formatCount(summary.stale)} last-known readings` : null,
+        detail: data ? `${formatCount(summary.forecasts)} on pace to run out · ${formatCount(summary.stale)} last-known readings` : null,
         danger: Number(summary.needs_attention) > 0
       }, 'attention'),
       jsx(Metric, {
@@ -4815,22 +4786,6 @@ function quotaWindowDurationSeconds(label) {
   return null
 }
 
-function quotaExhaustAt(window, burnPercent) {
-  const duration = quotaWindowDurationSeconds(window?.label)
-  const reset = timestampDate(window?.reset_at)
-  const burn = Number(burnPercent)
-  if (!duration || !reset || !Number.isFinite(burn) || burn <= 0) return null
-  const startedAtMs = reset.getTime() - duration * 1000
-  const elapsedMs = Date.now() - startedAtMs
-  if (elapsedMs <= 0) return null
-  const elapsedPercent = (elapsedMs / (duration * 1000)) * 100
-  if (elapsedPercent < 10) return null
-  if (burn <= elapsedPercent) return null
-  const exhaustMs = startedAtMs + elapsedMs * (100 / burn)
-  if (exhaustMs >= reset.getTime()) return null
-  return exhaustMs / 1000
-}
-
 function modelQuota(model, quotaData, allModels) {
   const routes = model.routes || []
   const oauthInventoryRoutes = routes.filter(route => route.oauth && route.subscription)
@@ -4883,7 +4838,7 @@ function modelQuota(model, quotaData, allModels) {
     provider,
     route,
     capPerCompletedTask,
-    exhaustAt: quotaExhaustAt(window, burn)
+    exhaustAt: window.forecast?.exhaust_at || null
   }
 }
 

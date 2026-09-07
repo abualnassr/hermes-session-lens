@@ -927,8 +927,23 @@ def _quota_window_duration_seconds(label: Any) -> Optional[float]:
     return None
 
 
-def _quota_exhaust_at(label: Any, reset_at: Any, used_percent: Any) -> Optional[float]:
-    """Linear extrapolation of window burn; None unless it runs out before reset."""
+# A run-out forecast is shown only when it would change what the reader does:
+# the window must be at least this far along (a fresh window says nothing
+# yet), usage must run ahead of time, and the projected run-out must land at
+# least this share of the window before the reset — a forecast that says
+# "empty six minutes before it resets anyway" is noise, not a warning.
+QUOTA_FORECAST_MIN_ELAPSED_PERCENT = 10.0
+QUOTA_FORECAST_MIN_MARGIN_FRACTION = 0.10
+
+
+def _quota_forecast(label: Any, reset_at: Any, used_percent: Any) -> Optional[Dict[str, Any]]:
+    """Linear run-out forecast for one quota window, or None when none is warranted.
+
+    The single source of truth for every forecast Session Lens shows: the
+    card line, the attention strip, the header counter, the AI Models quota
+    cell, and the digest all read this. The basis names the two numbers the
+    extrapolation rests on so the reader can judge it.
+    """
     duration = _quota_window_duration_seconds(label)
     reset_epoch = _usage_reset_epoch(reset_at)
     used = _number(used_percent)
@@ -939,12 +954,25 @@ def _quota_exhaust_at(label: Any, reset_at: Any, used_percent: Any) -> Optional[
     if elapsed <= 0:
         return None
     elapsed_percent = (elapsed / duration) * 100
-    if elapsed_percent < 10 or used <= elapsed_percent:
+    if elapsed_percent < QUOTA_FORECAST_MIN_ELAPSED_PERCENT or used <= elapsed_percent:
         return None
     exhaust_at = started_at + elapsed * (100 / used)
-    if exhaust_at >= reset_epoch:
+    margin = reset_epoch - exhaust_at
+    if margin < duration * QUOTA_FORECAST_MIN_MARGIN_FRACTION:
         return None
-    return exhaust_at
+    return {
+        "exhaust_at": exhaust_at,
+        "used_percent": round(used, 1),
+        "elapsed_percent": round(elapsed_percent, 1),
+        "margin_seconds": round(margin),
+        "basis": f"{used:.0f}% used with {elapsed_percent:.0f}% of the window elapsed",
+    }
+
+
+def _quota_exhaust_at(label: Any, reset_at: Any, used_percent: Any) -> Optional[float]:
+    """Run-out time from _quota_forecast, for callers that need only the moment."""
+    forecast = _quota_forecast(label, reset_at, used_percent)
+    return forecast["exhaust_at"] if forecast else None
 
 
 def _digest_period_totals(
@@ -1930,13 +1958,14 @@ def _quota_attention_notes() -> List[Dict[str, Any]]:
             used = _number(window.get("percentage_used"), None)
             if used is None:
                 continue
-            exhaust_at = _quota_exhaust_at(window.get("label"), window.get("reset_at"), used)
+            forecast = _quota_forecast(window.get("label"), window.get("reset_at"), used)
+            exhaust_at = forecast["exhaust_at"] if forecast else None
             if used >= QUOTA_ATTENTION_PERCENT:
                 severity = "danger"
                 reason = f"{round(used)}% of the window is used"
-            elif exhaust_at:
+            elif forecast:
                 severity = "warning"
-                reason = "on pace to run out before the reset"
+                reason = f"on pace to run out before the reset ({forecast['basis']})"
             else:
                 continue
             notes.append(
@@ -1948,6 +1977,7 @@ def _quota_attention_notes() -> List[Dict[str, Any]]:
                     "severity": severity,
                     "percent_used": round(used, 1),
                     "exhaust_at": exhaust_at,
+                    "basis": forecast["basis"] if forecast else None,
                     "reset_at": window.get("reset_at"),
                     "reason": reason,
                     "as_of": payload.get("generated_at"),
@@ -4249,7 +4279,7 @@ def _ai_usage_sync(fresh: bool = False, only_provider: Optional[str] = None) -> 
         if not fresh and _ai_usage_cache and now - _ai_usage_cache[0] < AI_USAGE_CACHE_TTL_SECONDS:
             cached = copy.deepcopy(_ai_usage_cache[1])
             cached["cached"] = True
-            return _attach_local_usage_records(cached)
+            return _finish_usage_payload(cached)
 
     collectors = {provider: adapter.collect for provider, adapter in _provider_adapters().items()}
     if fresh and only_provider:
@@ -4257,7 +4287,7 @@ def _ai_usage_sync(fresh: bool = False, only_provider: Optional[str] = None) -> 
         if collector is not None:
             merged = _ai_usage_refresh_provider(only_provider, collector)
             if merged is not None:
-                return _attach_local_usage_records(merged)
+                return _finish_usage_payload(merged)
         # Unknown provider name or no cached payload to merge into — a full
         # pass answers correctly either way.
     # Stage 1: local-only credential probes decide which collectors run at
@@ -4325,7 +4355,33 @@ def _ai_usage_sync(fresh: bool = False, only_provider: Optional[str] = None) -> 
             },
         }
         _ai_usage_cache = (time.time(), copy.deepcopy(payload))
-        return _attach_local_usage_records(payload)
+        return _finish_usage_payload(payload)
+
+
+def _attach_window_forecasts(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Give every quota window its run-out forecast (or None) as of now.
+
+    Forecasts depend on the clock, so they are computed per response and
+    never cached with the provider readings.
+    """
+    for card in payload.get("providers", []):
+        if card.get("status") not in {"ok", "stale"}:
+            continue
+        for window in card.get("windows", []):
+            if window.get("kind") != "quota":
+                continue
+            window["forecast"] = _quota_forecast(
+                window.get("label"), window.get("reset_at"), window.get("percentage_used")
+            )
+    return payload
+
+
+def _finish_usage_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Everything a usage response carries beyond the cached provider readings."""
+    _attach_local_usage_records(payload)
+    _attach_window_forecasts(payload)
+    payload["summary"] = _ai_usage_summary(payload.get("providers", []))
+    return payload
 
 
 def _attach_local_usage_records(payload: Dict[str, Any]) -> Dict[str, Any]:

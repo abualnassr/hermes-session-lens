@@ -1731,6 +1731,58 @@ process.stdout.write(JSON.stringify(out))
         self.assertIsNone(api._quota_exhaust_at("Weekly quota", reset_at, 15))
         self.assertIsNone(api._quota_exhaust_at("Balance", reset_at, 50))
 
+    def test_quota_forecast_needs_a_margin_and_names_its_basis(self):
+        now = time.time()
+        week = 7 * 86400
+        # 17% elapsed, 31% used: runs out well before the reset -> forecast with basis.
+        forecast = api._quota_forecast("Weekly quota", now + 0.83 * week, 31)
+        self.assertIsNotNone(forecast)
+        self.assertEqual(forecast["basis"], "31% used with 17% of the window elapsed")
+        self.assertGreater(forecast["margin_seconds"], 0.1 * week)
+        # 39% elapsed, 41% used: over pace, but the run-out lands ~5% of the
+        # window before the reset -> below the margin, no forecast.
+        self.assertIsNone(api._quota_forecast("Weekly quota", now + 0.61 * week, 41))
+        # 5-hour session windows: 37% elapsed, 28% used -> under pace, nothing.
+        self.assertIsNone(api._quota_forecast("Current session", now + 0.63 * 5 * 3600, 28))
+        # Early in the window nothing is said, however steep.
+        self.assertIsNone(api._quota_forecast("Weekly quota", now + 0.95 * week, 40))
+
+    def test_usage_payload_carries_forecasts_and_counts_them(self):
+        import time as _time
+
+        now = _time.time()
+        week = 7 * 86400
+        windows = [
+            api._usage_window("Weekly", used_percent=46, reset_at=now + 0.61 * week),
+            api._usage_window("Session", used_percent=28, reset_at=now + 0.63 * 5 * 3600),
+        ]
+
+        def ok(provider, with_windows=False):
+            return api._provider_payload(provider, status="ok", windows=list(windows) if with_windows else [])
+
+        collectors = {name: Mock(return_value=ok(name.replace("_collect_", "").replace("_usage", ""), with_windows=(name == "_collect_codex_usage")))
+                      for name in ("_collect_codex_usage", "_collect_anthropic_usage", "_collect_nous_usage",
+                                   "_collect_openrouter_usage", "_collect_deepseek_usage", "_collect_grok_usage",
+                                   "_collect_kimi_usage", "_collect_zai_usage")}
+        with _provider_collectors(collectors):
+            payload = api._ai_usage_sync(True)
+            codex = next(card for card in payload["providers"] if card["provider"] == "codex")
+            weekly, session = codex["windows"]
+            self.assertIsNotNone(weekly["forecast"])
+            self.assertIn("46% used with 39% of the window elapsed", weekly["forecast"]["basis"])
+            self.assertIsNone(session["forecast"])
+            self.assertEqual(payload["summary"]["forecasts"], 1)
+            self.assertEqual(payload["summary"]["needs_attention"], 1)
+            # The cache never holds a forecast; a cached response gets a fresh one.
+            cached_card = next(card for card in api._ai_usage_cache[1]["providers"] if card["provider"] == "codex")
+            self.assertNotIn("forecast", cached_card["windows"][0])
+            again = api._ai_usage_sync(False)
+            self.assertTrue(again["cached"])
+            self.assertEqual(again["summary"]["forecasts"], 1)
+            notes = api._quota_attention_notes()
+            self.assertEqual(len(notes), 1)
+            self.assertIn("(46% used with 39% of the window elapsed)", notes[0]["reason"])
+
     def test_projects_group_by_repo_directory_then_source(self):
         connection = sqlite3.connect(self.db_path)
         try:
@@ -2920,10 +2972,13 @@ process.stdout.write(JSON.stringify(out))
         self.assertIn("if (!data || data.cached) return", source)
         # A percentage drop means the window reset; the series starts over.
         self.assertIn("pct < last[1] - 1", source)
-        self.assertIn("function usageSlopeForecast", source)
-        self.assertIn("recorded burn slope", source)
-        # Sparklines were removed at the user's request (0.19.0); history
-        # still feeds the slope forecast.
+        # The desktop no longer forecasts on its own: the backend's forecast is
+        # the one every surface renders (0.40.0).
+        self.assertNotIn("function usageSlopeForecast", source)
+        self.assertNotIn("function quotaExhaustAt", source)
+        self.assertIn("window.forecast?.exhaust_at", source)
+        self.assertIn("before the reset (${forecast.basis})", source)
+        self.assertIn("on pace to run out · ", source)
         self.assertNotIn("UsageSparkline", source)
 
     def test_refresh_buttons_spin_with_animated_icon(self):
