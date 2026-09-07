@@ -2779,9 +2779,11 @@ function UsageAttribution({ window, onDrill }) {
     Number(attribution.cost_usd) > 0 ? formatUsageAmount(attribution.cost_usd, 'USD') : null,
     `${formatCount(sessions)} session${sessions === 1 ? '' : 's'}`
   ].filter(Boolean).join(' · ')
+  const profileRows = attribution.by_profile || []
+  const views = profileRows.length ? [...usageAttributionViews, { id: 'profile', label: 'Profiles' }] : usageAttributionViews
   const rows = view === 'session'
     ? attribution.by_session
-    : view === 'model' ? attribution.by_model : attribution.by_project
+    : view === 'model' ? attribution.by_model : view === 'profile' ? profileRows : attribution.by_project
   const notes = []
   if (trailing) notes.push('This allowance has no readable window span, so local records cover the trailing 7 days instead.')
   if (attribution.model_family) notes.push(`Counting only ${attribution.model_family} models, to match this window.`)
@@ -2812,7 +2814,7 @@ function UsageAttribution({ window, onDrill }) {
             'aria-label': `${window.label} usage by ${view}`,
             style: { display: 'grid', gap: '0.4rem', paddingLeft: '1rem' },
             children: [
-              jsx(SegmentedControl, { options: usageAttributionViews, value: view, onChange: setView }),
+              jsx(SegmentedControl, { options: views, value: view, onChange: setView }),
               ...(rows || []).map((row, index) => jsx(UsageAttributionRow, { row, onDrill }, `${view}-${row.search || row.label || index}`)),
               explainedLine
                 ? jsx('div', { style: { color: explained.percent < 50 ? color.warning : color.quaternary, fontSize: '0.625rem', lineHeight: 1.45 }, children: explainedLine })
@@ -3045,11 +3047,18 @@ function UsageProvider({ ctx, provider, history, ledger, onRefresh, onDrill }) {
             }, `${provider.provider}-link-${link.url}`))
           })
         : null,
-      provider.recorded_7d && (provider.recorded_7d.tokens || provider.recorded_7d.sessions)
+      provider.month_reconciliation
         ? jsx('div', {
-            title: 'What your local Hermes sessions recorded against this provider in the last 7 days. The account quota above may also include usage from other machines or tools on the same account.',
+            title: 'The provider\'s own month-to-date figure beside the local estimate for the same calendar month. The local estimate prices cached tokens at the full rate and cannot see other machines on the account, so the two are expected to differ.',
             style: { color: color.quaternary, fontSize: '0.625rem', marginTop: '0.65rem' },
-            children: `Recorded locally: ${formatCount(provider.recorded_7d.tokens)} tok · ${formatUsageAmount(provider.recorded_7d.cost_usd, 'USD')} across ${formatCount(provider.recorded_7d.sessions)} session${Number(provider.recorded_7d.sessions) === 1 ? '' : 's'} (7d)`
+            children: `This month: provider ${formatUsageAmount(provider.month_reconciliation.provider_usd, 'USD')} · local estimate ${formatUsageAmount(provider.month_reconciliation.local_usd, 'USD')} across ${formatCount(provider.month_reconciliation.local_sessions)} session${Number(provider.month_reconciliation.local_sessions) === 1 ? '' : 's'}`
+          })
+        : null,
+      provider.recorded_local && (provider.recorded_local.tokens || provider.recorded_local.sessions)
+        ? jsx('div', {
+            title: 'What your local Hermes sessions recorded against this provider in the selected period. The account quota above may also include usage from other machines or tools on the same account.',
+            style: { color: color.quaternary, fontSize: '0.625rem', marginTop: '0.65rem' },
+            children: `Recorded locally: ${formatCount(provider.recorded_local.tokens)} tok · ${formatUsageAmount(provider.recorded_local.cost_usd, 'USD')} across ${formatCount(provider.recorded_local.sessions)} session${Number(provider.recorded_local.sessions) === 1 ? '' : 's'} (${provider.recorded_local.label})`
           })
         : null,
       provider.fetched_at
@@ -4488,8 +4497,8 @@ function SessionLensPage({ ctx }) {
     refetchInterval: 60_000
   })
   const aiUsageQuery = useQuery({
-    queryKey: [PLUGIN_ID, 'ai-usage', activeProfilesParam],
-    queryFn: () => pluginRest(ctx, apiPath('/ai-usage')),
+    queryKey: [PLUGIN_ID, 'ai-usage', activeProfilesParam, period.days, period.start_at, period.end_at],
+    queryFn: () => pluginRest(ctx, apiPath('/ai-usage', period)),
     enabled: tab === 'ai-usage' || tab === 'ai-models',
     refetchInterval: tab === 'ai-usage' || tab === 'ai-models' ? 300_000 : false
   })
@@ -4621,8 +4630,8 @@ function SessionLensPage({ ctx }) {
       }
     }
     try {
-      const data = await pluginRest(ctx, apiPath('/ai-usage', { fresh: true }))
-      queryClient.setQueryData([PLUGIN_ID, 'ai-usage'], data)
+      const data = await pluginRest(ctx, apiPath('/ai-usage', { ...period, fresh: true }))
+      queryClient.setQueryData([PLUGIN_ID, 'ai-usage', activeProfilesParam, period.days, period.start_at, period.end_at], data)
     } catch (error) {
       refreshErrors.push(`OAuth quotas: ${error?.message || String(error || 'the backend did not return data')}`)
     }
@@ -4750,8 +4759,8 @@ function SessionLensPage({ ctx }) {
   if (tab === 'system') content = jsx(SystemView, { ctx })
   const refreshProvider = async provider => {
     try {
-      const data = await pluginRest(ctx, apiPath('/ai-usage', { fresh: true, provider }))
-      queryClient.setQueryData([PLUGIN_ID, 'ai-usage'], data)
+      const data = await pluginRest(ctx, apiPath('/ai-usage', { ...period, fresh: true, provider }))
+      queryClient.setQueryData([PLUGIN_ID, 'ai-usage', activeProfilesParam, period.days, period.start_at, period.end_at], data)
     } catch (error) {
       setAiRefreshError(`${provider}: ${error?.message || String(error || 'refresh failed')}`)
     }
@@ -4820,10 +4829,12 @@ function SessionLensPage({ ctx }) {
               tab === 'ai-usage'
                 ? jsx(Pill, {
                     tone: 'accent',
+                    title: 'Account readings are live from each provider; the period below governs only the local "recorded locally" figures.',
                     children: jsxs(Fragment, { children: [jsx(Codicon, { name: 'pulse', size: '0.65rem' }), 'Live account quotas'] })
                   })
-                : jsx(SegmentedControl, { options: timeOptions, value: daysText, onChange: setDaysText }),
-              tab !== 'ai-usage' && daysText === 'custom'
+                : null,
+              jsx(SegmentedControl, { options: timeOptions, value: daysText, onChange: setDaysText }),
+              daysText === 'custom'
                 ? jsxs('div', {
                     'aria-label': 'Custom date range',
                     style: { alignItems: 'center', display: 'flex', flexWrap: 'wrap', gap: '0.45rem' },

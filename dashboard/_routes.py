@@ -4282,14 +4282,21 @@ async def schedules() -> Dict[str, Any]:
     return await asyncio.to_thread(_schedules_sync)
 
 
-def _ai_usage_sync(fresh: bool = False, only_provider: Optional[str] = None) -> Dict[str, Any]:
+def _ai_usage_sync(
+    fresh: bool = False,
+    only_provider: Optional[str] = None,
+    days: int = 7,
+    start_at: Optional[float] = None,
+    end_at: Optional[float] = None,
+) -> Dict[str, Any]:
     global _ai_usage_cache
     now = time.time()
+    period = (days, start_at, end_at)
     with _ai_usage_cache_lock:
         if not fresh and _ai_usage_cache and now - _ai_usage_cache[0] < AI_USAGE_CACHE_TTL_SECONDS:
             cached = copy.deepcopy(_ai_usage_cache[1])
             cached["cached"] = True
-            return _finish_usage_payload(cached)
+            return _finish_usage_payload(cached, period)
 
     collectors = {provider: adapter.collect for provider, adapter in _provider_adapters().items()}
     if fresh and only_provider:
@@ -4297,7 +4304,7 @@ def _ai_usage_sync(fresh: bool = False, only_provider: Optional[str] = None) -> 
         if collector is not None:
             merged = _ai_usage_refresh_provider(only_provider, collector)
             if merged is not None:
-                return _finish_usage_payload(merged)
+                return _finish_usage_payload(merged, period)
         # Unknown provider name or no cached payload to merge into — a full
         # pass answers correctly either way.
     # Stage 1: local-only credential probes decide which collectors run at
@@ -4365,7 +4372,7 @@ def _ai_usage_sync(fresh: bool = False, only_provider: Optional[str] = None) -> 
             },
         }
         _ai_usage_cache = (time.time(), copy.deepcopy(payload))
-        return _finish_usage_payload(payload)
+        return _finish_usage_payload(payload, period)
 
 
 def _attach_window_forecasts(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -4386,30 +4393,57 @@ def _attach_window_forecasts(payload: Dict[str, Any]) -> Dict[str, Any]:
     return payload
 
 
-def _finish_usage_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
+def _finish_usage_payload(
+    payload: Dict[str, Any], period: Tuple[int, Optional[float], Optional[float]] = (7, None, None)
+) -> Dict[str, Any]:
     """Everything a usage response carries beyond the cached provider readings."""
-    _attach_local_usage_records(payload)
+    _attach_local_usage_records(payload, period)
     _attach_window_forecasts(payload)
     payload["providers"] = _order_usage_cards(payload.get("providers", []))
     payload["summary"] = _ai_usage_summary(payload["providers"])
     return payload
 
 
-def _attach_local_usage_records(payload: Dict[str, Any]) -> Dict[str, Any]:
-    """Join the 7-day local records and each window's attribution to every base card.
+def _attach_local_usage_records(
+    payload: Dict[str, Any], period: Tuple[int, Optional[float], Optional[float]] = (7, None, None)
+) -> Dict[str, Any]:
+    """Join the local records, the month reconciliation and each window's attribution to every base card.
 
     Applied to every response and never to the cache. The provider readings
     are account-level and identical for every profile scope, but "recorded
     locally" and "what consumed this window" come from the profiles in
     scope — a reading cached under one scope must never carry another
-    scope's records.
+    scope's records. "Recorded locally" follows the selected period, like
+    every other tab; a window's attribution keeps the window's own span.
     """
-    recorded = _usage_recorded_7d()
+    days, start_at, end_at = period
+    period_start, period_end = _period_bounds(days, start_at, end_at)
+    if start_at is not None or end_at is not None:
+        span_label = "custom range"
+    else:
+        span_label = f"{days}d" if days > 0 else "all time"
+    recorded = _usage_recorded_local(period_start, period_end)
+    month_start, _month_end = _month_bounds(time.time())
+    local_month = _budget_local_spend(month_start, month_start)
     for card in payload.get("providers", []):
         if card.get("account_extra"):
             continue
         provider = str(card.get("provider") or "")
-        card["recorded_7d"] = recorded.get(provider)
+        entry = recorded.get(provider)
+        card["recorded_local"] = {**entry, "label": span_label, "days": days} if entry else None
+        # A provider that reports its own month-to-date spend gets the local
+        # estimate for the same calendar month beside it, so the two numbers
+        # sit on one line with matching spans instead of a 7-day figure
+        # against a calendar week.
+        spend = card.get("account_spend")
+        monthly = _number(spend.get("monthly"), None) if isinstance(spend, Mapping) else None
+        if monthly is not None:
+            month = local_month.get(provider) or {}
+            card["month_reconciliation"] = {
+                "provider_usd": round(monthly, 2),
+                "local_usd": round(_number(month.get("month_cost")), 2),
+                "local_sessions": _integer(month.get("sessions")),
+            }
         _attach_usage_attribution(provider, card)
     return payload
 
@@ -4489,8 +4523,12 @@ _USAGE_BILLING_KEYS = _usage_billing_keys()
 
 
 def _usage_recorded_7d() -> Dict[str, Dict[str, Any]]:
-    """Trailing-7-day tokens/cost/sessions per quota provider from local records."""
-    start = time.time() - 7 * 86_400
+    """Trailing-7-day local records per quota provider (the digest's span)."""
+    return _usage_recorded_local(time.time() - 7 * 86_400, None)
+
+
+def _usage_recorded_local(start: float, end: Optional[float]) -> Dict[str, Dict[str, Any]]:
+    """Tokens/cost/sessions per quota provider from local records inside [start, end)."""
     try:
         with _database() as db:
             rows = _db_connection(db).execute(
@@ -4501,9 +4539,10 @@ def _usage_recorded_7d() -> Dict[str, Dict[str, Any]]:
                        COUNT(DISTINCT session_id)
                 FROM session_model_usage
                 WHERE COALESCE(last_seen, first_seen, 0) >= ?
+                  AND (? IS NULL OR COALESCE(last_seen, first_seen, 0) < ?)
                 GROUP BY LOWER(billing_provider)
                 """,
-                (start,),
+                (start, end, end),
             ).fetchall()
     except Exception:
         return {}
@@ -4567,9 +4606,13 @@ def _usage_attribution_rows(provider: str, since: float) -> List[Dict[str, Any]]
         return []
     placeholders = ",".join("?" for _ in billing_keys)
     with _database() as db:
+        # Several profiles share the sessions view in a multi-profile scope;
+        # the profile name lets the attribution answer "which bot".
+        profile_column = "s.__profile" if getattr(db, "union_profiles", None) else "NULL"
         rows = _db_connection(db).execute(
             f"""
             SELECT u.session_id, u.model, s.title, s.source, s.cwd, s.git_repo_root,
+                   {profile_column} AS profile,
                    MAX(COALESCE(u.last_seen, u.first_seen, s.last_activity_at, s.started_at, 0)) AS seen_at,
                    SUM(u.input_tokens + u.output_tokens + u.cache_read_tokens + u.cache_write_tokens) AS tokens,
                    SUM(CASE WHEN u.actual_cost_usd > 0 THEN u.actual_cost_usd ELSE u.estimated_cost_usd END) AS cost_usd
@@ -4611,11 +4654,21 @@ def _usage_window_attribution(
     sessions: Dict[str, Dict[str, Any]] = {}
     projects: Dict[str, Dict[str, Any]] = {}
     models: Dict[str, Dict[str, Any]] = {}
+    profiles: Dict[str, Dict[str, Any]] = {}
     for row in matched:
         session_id = str(row.get("session_id") or "")
         tokens = _integer(row.get("tokens"))
         cost = _number(row.get("cost_usd"))
         kind, label, path, search = _usage_project_key(row)
+        profile_name = str(row.get("profile") or "").strip()
+        if profile_name:
+            profile = profiles.setdefault(
+                profile_name,
+                {"label": profile_name, "tokens": 0, "cost_usd": 0.0, "sessions": set(), "search": None},
+            )
+            profile["tokens"] += tokens
+            profile["cost_usd"] += cost
+            profile["sessions"].add(session_id)
         session = sessions.setdefault(
             session_id,
             {
@@ -4687,6 +4740,7 @@ def _usage_window_attribution(
         "by_project": finish(list(projects.values())),
         "by_session": finish(list(sessions.values())),
         "by_model": finish(list(models.values())),
+        "by_profile": finish(list(profiles.values())) if profiles else [],
     }
     unit = str(window.get("unit") or "").strip().lower()
     used = _number(window.get("used"))
@@ -5145,8 +5199,13 @@ async def ai_usage(
     fresh: bool = False,
     provider: Optional[str] = None,
     profiles: str = Query(""),
+    days: int = Query(7, ge=0, le=3650),
+    start_at: Optional[float] = Query(None, ge=0),
+    end_at: Optional[float] = Query(None, ge=0),
 ) -> Dict[str, Any]:
-    return await asyncio.to_thread(_scoped_call, profiles, _ai_usage_sync, fresh, provider, budgeted=False)
+    return await asyncio.to_thread(
+        _scoped_call, profiles, _ai_usage_sync, fresh, provider, days, start_at, end_at, budgeted=False
+    )
 
 
 @router.get("/adapters")

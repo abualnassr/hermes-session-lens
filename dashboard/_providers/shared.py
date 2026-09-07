@@ -345,7 +345,7 @@ def _usage_card_rank(card: Mapping[str, Any]) -> Tuple[int, float]:
     if used:
         return (2, -max(used))
     if any(window.get("kind") == "balance" for window in windows):
-        recorded = card.get("recorded_7d") or {}
+        recorded = card.get("recorded_local") or {}
         return (3, -(_usage_number(recorded.get("cost_usd")) or 0.0))
     return (4, 0.0)
 

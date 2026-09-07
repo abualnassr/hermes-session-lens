@@ -725,11 +725,11 @@ class SessionLensApiTests(unittest.TestCase):
             self.assertIn(f"queryKey: [PLUGIN_ID, '{name}', activeProfilesParam", source, name)
         for name in ("budgets", "ai-usage"):
             self.assertIn(f"queryKey: [PLUGIN_ID, '{name}', activeProfilesParam", source, name)
-        self.assertIn("apiPath('/ai-usage', { fresh: true, provider })", source)
+        self.assertIn("apiPath('/ai-usage', { ...period, fresh: true, provider })", source)
         # Every scoped route is requested through apiPath, which appends the
         # profile scope; a bare path silently reads the serving profile.
-        self.assertIn("pluginRest(ctx, apiPath('/ai-usage'))", source)
-        self.assertIn("pluginRest(ctx, apiPath('/ai-usage', { fresh: true }))", source)
+        self.assertIn("pluginRest(ctx, apiPath('/ai-usage', period))", source)
+        self.assertIn("pluginRest(ctx, apiPath('/ai-usage', { ...period, fresh: true }))", source)
         self.assertIn("pluginRest(ctx, apiPath('/budgets'))", source)
         for path in ("/ai-usage", "/budgets", "/overview", "/ai-models", "/projects", "/tools", "/skills", "/rules/templates"):
             self.assertNotIn(f"pluginRest(ctx, '{path}'", source, path)
@@ -823,17 +823,17 @@ class SessionLensApiTests(unittest.TestCase):
         with _provider_collectors(collectors):
             default_only = api._scoped_call("", api._ai_usage_sync, True)
             self.assertFalse(default_only["cached"])
-            self.assertEqual(openrouter_card(default_only)["recorded_7d"]["sessions"], 1)
-            self.assertAlmostEqual(openrouter_card(default_only)["recorded_7d"]["cost_usd"], 0.5)
+            self.assertEqual(openrouter_card(default_only)["recorded_local"]["sessions"], 1)
+            self.assertAlmostEqual(openrouter_card(default_only)["recorded_local"]["cost_usd"], 0.5)
 
             # The cached account readings are reused, but the local records follow the new scope.
             both = api._scoped_call("all", api._ai_usage_sync, False)
             self.assertTrue(both["cached"])
-            self.assertEqual(openrouter_card(both)["recorded_7d"]["sessions"], 2)
-            self.assertAlmostEqual(openrouter_card(both)["recorded_7d"]["cost_usd"], 0.75)
+            self.assertEqual(openrouter_card(both)["recorded_local"]["sessions"], 2)
+            self.assertAlmostEqual(openrouter_card(both)["recorded_local"]["cost_usd"], 0.75)
 
             # And the cache itself never carries any scope's records.
-            self.assertNotIn("recorded_7d", next(
+            self.assertNotIn("recorded_local", next(
                 card for card in api._ai_usage_cache[1]["providers"] if card["provider"] == "openrouter"
             ))
 
@@ -1731,6 +1731,94 @@ process.stdout.write(JSON.stringify(out))
         self.assertIsNone(api._quota_exhaust_at("Weekly quota", reset_at, 15))
         self.assertIsNone(api._quota_exhaust_at("Balance", reset_at, 50))
 
+    def test_local_records_follow_the_period_and_reconcile_the_month(self):
+        import time as _time
+
+        now = _time.time()
+        connection = sqlite3.connect(self.db_path)
+        for session_id, model, age_days, cost in (("session-1", "openrouter/model-a", 2, 0.5), ("session-1", "openrouter/model-b", 20, 0.25)):
+            connection.execute(
+                """
+                INSERT INTO session_model_usage (session_id, model, billing_provider, api_call_count,
+                                                 input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                                                 reasoning_tokens, estimated_cost_usd, actual_cost_usd, cost_status,
+                                                 first_seen, last_seen)
+                VALUES (?, ?, 'openrouter', 5, 1000, 100, 0, 0, 0, ?, 0, 'estimated', ?, ?)
+                """,
+                (session_id, model, cost, now - age_days * 86400 - 60, now - age_days * 86400),
+            )
+        connection.commit()
+        connection.close()
+
+        def ok(provider):
+            card = api._provider_payload(provider, status="ok", windows=[])
+            if provider == "openrouter":
+                card["account_spend"] = {"monthly": 2.24, "weekly": 0.3, "daily": 0.3, "unit": "USD"}
+            return card
+
+        collectors = {name: Mock(return_value=ok(name.replace("_collect_", "").replace("_usage", "")))
+                      for name in ("_collect_codex_usage", "_collect_anthropic_usage", "_collect_nous_usage",
+                                   "_collect_openrouter_usage", "_collect_deepseek_usage", "_collect_grok_usage",
+                                   "_collect_kimi_usage", "_collect_zai_usage")}
+
+        def openrouter(payload):
+            return next(card for card in payload["providers"] if card["provider"] == "openrouter")
+
+        with _provider_collectors(collectors):
+            week = openrouter(api._ai_usage_sync(True, None, 7))
+            self.assertEqual(week["recorded_local"]["label"], "7d")
+            self.assertAlmostEqual(week["recorded_local"]["cost_usd"], 0.5)
+            month_payload = api._ai_usage_sync(False, None, 30)
+            month = openrouter(month_payload)
+            self.assertEqual(month["recorded_local"]["label"], "30d")
+            self.assertAlmostEqual(month["recorded_local"]["cost_usd"], 0.75)
+            everything = openrouter(api._ai_usage_sync(False, None, 0))
+            self.assertEqual(everything["recorded_local"]["label"], "all time")
+            custom = openrouter(api._ai_usage_sync(False, None, 0, now - 3 * 86400, now))
+            self.assertEqual(custom["recorded_local"]["label"], "custom range")
+            self.assertAlmostEqual(custom["recorded_local"]["cost_usd"], 0.5)
+            reconciliation = month["month_reconciliation"]
+            self.assertEqual(reconciliation["provider_usd"], 2.24)
+            self.assertGreaterEqual(reconciliation["local_usd"], 0.0)
+            self.assertNotIn("month_reconciliation", next(card for card in month_payload["providers"] if card["provider"] == "kimi"))
+
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("queryKey: [PLUGIN_ID, 'ai-usage', activeProfilesParam, period.days, period.start_at, period.end_at]", source)
+        self.assertIn("apiPath('/ai-usage', period)", source)
+        self.assertIn("apiPath('/ai-usage', { ...period, fresh: true, provider })", source)
+        self.assertIn("(${provider.recorded_local.label})", source)
+        self.assertIn("This month: provider ", source)
+        self.assertNotIn("recorded_7d", source)
+
+    def test_attribution_lists_profiles_when_several_are_in_scope(self):
+        import time as _time
+
+        now = _time.time()
+        beta_db = self._make_beta_profile()
+        for path, session_id in ((self.db_path, "session-1"), (beta_db, "beta-session-1")):
+            connection = sqlite3.connect(path)
+            connection.execute(
+                """
+                INSERT INTO session_model_usage (session_id, model, billing_provider, api_call_count,
+                                                 input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                                                 reasoning_tokens, estimated_cost_usd, actual_cost_usd, cost_status,
+                                                 first_seen, last_seen)
+                VALUES (?, 'deepseek-v4', 'deepseek', 5, 1000, 100, 0, 0, 0, 0.5, 0, 'estimated', ?, ?)
+                """,
+                (session_id, now - 120, now - 60),
+            )
+            connection.commit()
+            connection.close()
+        window = api._usage_window("USD balance", kind="balance", remaining=40, unit="USD")
+        single = api._scoped_call("", api._usage_window_attribution, window, api._usage_attribution_rows("deepseek", now - 3600))
+        self.assertEqual(single["by_profile"], [])
+        rows = api._scoped_call("all", api._usage_attribution_rows, "deepseek", now - 3600)
+        both = api._usage_window_attribution(window, rows)
+        self.assertEqual(sorted(item["label"] for item in both["by_profile"]), ["beta", "default"])
+        self.assertTrue(all(item["share_percent"] == 50.0 for item in both["by_profile"]))
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("{ id: 'profile', label: 'Profiles' }", source)
+
     def test_balance_ledger_feeds_budgets_as_the_providers_own_figure(self):
         import json
         import time as _time
@@ -1793,7 +1881,7 @@ process.stdout.write(JSON.stringify(out))
         week = 7 * 86400
         def card(provider, status="ok", windows=(), recorded=None, extra=False, base=None):
             item = api._provider_payload(provider, status=status, windows=list(windows))
-            item["recorded_7d"] = recorded
+            item["recorded_local"] = recorded
             if extra:
                 item["account_extra"] = True
                 item["base_provider"] = base
@@ -3016,9 +3104,9 @@ process.stdout.write(JSON.stringify(out))
         with _provider_collectors(collectors):
             payload = api._ai_usage_sync(True)
         kimi = next(item for item in payload["providers"] if item["provider"] == "kimi")
-        self.assertEqual(kimi["recorded_7d"]["tokens"], 1800)
+        self.assertEqual(kimi["recorded_local"]["tokens"], 1800)
         codex = next(item for item in payload["providers"] if item["provider"] == "codex")
-        self.assertIsNone(codex["recorded_7d"])
+        self.assertIsNone(codex["recorded_local"])
 
     def test_ai_usage_ui_orders_by_urgency_with_countdowns_and_local_line(self):
         source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
@@ -3027,7 +3115,7 @@ process.stdout.write(JSON.stringify(out))
         self.assertIn("function formatCountdown", source)
         self.assertIn("Recorded locally: ", source)
         self.assertIn("Refresh only ${provider.label}", source)
-        self.assertIn("apiPath('/ai-usage', { fresh: true, provider })", source)
+        self.assertIn("apiPath('/ai-usage', { ...period, fresh: true, provider })", source)
 
     def test_ai_usage_reports_configured_but_unsupported_registry_providers(self):
         # Outside Hermes the registry is unreachable and the list is empty.
