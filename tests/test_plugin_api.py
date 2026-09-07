@@ -723,7 +723,10 @@ class SessionLensApiTests(unittest.TestCase):
         for name in ("sessions", "trace", "attention", "projects", "tools", "skills", "compression", "telemetry",
                      "agent-runs", "rules", "rules-templates", "overview", "ai-models", "system", "tool-names"):
             self.assertIn(f"queryKey: [PLUGIN_ID, '{name}', activeProfilesParam", source, name)
-        for name in ("budgets", "ai-usage", "services", "gateway", "schedules", "health"):
+        for name in ("budgets", "ai-usage"):
+            self.assertIn(f"queryKey: [PLUGIN_ID, '{name}', activeProfilesParam", source, name)
+        self.assertIn("apiPath('/ai-usage', { fresh: true, provider })", source)
+        for name in ("services", "gateway", "schedules", "health"):
             self.assertNotIn(f"queryKey: [PLUGIN_ID, '{name}', activeProfilesParam", source, name)
 
     def test_session_accounting_takes_the_higher_of_hermes_two_records(self):
@@ -776,6 +779,63 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertIn("queryClient.getQueryCache().subscribe(update)", source)
         self.assertIn("children: aiManualRefreshing || pluginFetching", source)
         self.assertNotIn(": overviewQuery.isFetching)", source)
+
+    def test_ai_usage_local_records_follow_the_profile_scope(self):
+        import time
+
+        now = time.time()
+        beta_db = self._make_beta_profile()
+        for path, session_id, cost in ((self.db_path, "session-1", 0.5), (beta_db, "beta-session-1", 0.25)):
+            connection = sqlite3.connect(path)
+            connection.execute(
+                """
+                INSERT INTO session_model_usage (session_id, model, billing_provider, api_call_count,
+                                                 input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                                                 reasoning_tokens, estimated_cost_usd, actual_cost_usd, cost_status,
+                                                 first_seen, last_seen)
+                VALUES (?, 'openrouter/model', 'openrouter', 5, 1000, 100, 0, 0, 0, ?, 0, 'estimated', ?, ?)
+                """,
+                (session_id, cost, now - 60, now - 30),
+            )
+            connection.execute("UPDATE sessions SET last_activity_at = ? WHERE id = ?", (now - 30, session_id))
+            connection.commit()
+            connection.close()
+
+        def ok(provider):
+            return api._provider_payload(provider, status="ok", windows=[])
+
+        collectors = {name: Mock(return_value=ok(name.replace("_collect_", "").replace("_usage", "")))
+                      for name in ("_collect_codex_usage", "_collect_anthropic_usage", "_collect_nous_usage",
+                                   "_collect_openrouter_usage", "_collect_deepseek_usage", "_collect_grok_usage",
+                                   "_collect_kimi_usage", "_collect_zai_usage")}
+
+        def openrouter_card(payload):
+            return next(card for card in payload["providers"] if card["provider"] == "openrouter")
+
+        with _provider_collectors(collectors):
+            default_only = api._scoped_call("", api._ai_usage_sync, True)
+            self.assertFalse(default_only["cached"])
+            self.assertEqual(openrouter_card(default_only)["recorded_7d"]["sessions"], 1)
+            self.assertAlmostEqual(openrouter_card(default_only)["recorded_7d"]["cost_usd"], 0.5)
+
+            # The cached account readings are reused, but the local records follow the new scope.
+            both = api._scoped_call("all", api._ai_usage_sync, False)
+            self.assertTrue(both["cached"])
+            self.assertEqual(openrouter_card(both)["recorded_7d"]["sessions"], 2)
+            self.assertAlmostEqual(openrouter_card(both)["recorded_7d"]["cost_usd"], 0.75)
+
+            # And the cache itself never carries any scope's records.
+            self.assertNotIn("recorded_7d", next(
+                card for card in api._ai_usage_cache[1]["providers"] if card["provider"] == "openrouter"
+            ))
+
+        budgets_all = api._scoped_call("all", api._budgets_sync, {})
+        entry = next(item for item in budgets_all["entries"] if item["id"] == "openrouter")
+        self.assertEqual(entry["local_sessions"], 2)
+        self.assertAlmostEqual(entry["local_spend_usd"], 0.75, places=6)
+        budgets_default = api._scoped_call("", api._budgets_sync, {})
+        entry = next(item for item in budgets_default["entries"] if item["id"] == "openrouter")
+        self.assertEqual(entry["local_sessions"], 1)
 
     def test_profile_scope_search_and_query_syntax_span_profiles(self):
         self._make_beta_profile()
@@ -2740,7 +2800,7 @@ process.stdout.write(JSON.stringify(out))
         self.assertIn("function formatCountdown", source)
         self.assertIn("Recorded locally: ", source)
         self.assertIn("Refresh only ${provider.label}", source)
-        self.assertIn("provider=${encodeURIComponent(provider)}", source)
+        self.assertIn("apiPath('/ai-usage', { fresh: true, provider })", source)
 
     def test_ai_usage_reports_configured_but_unsupported_registry_providers(self):
         # Outside Hermes the registry is unreachable and the list is empty.

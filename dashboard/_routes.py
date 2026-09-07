@@ -52,11 +52,16 @@ def _route_budget_message(limit: float, elapsed: float, names: Optional[List[str
     )
 
 
-def _scoped_call(profiles_param: str, fn: Any, *args: Any, **kwargs: Any) -> Any:
-    """Run one payload builder under the requested profile scope and the route time budget."""
+def _scoped_call(profiles_param: str, fn: Any, *args: Any, budgeted: bool = True, **kwargs: Any) -> Any:
+    """Run one payload builder under the requested profile scope and the route time budget.
+
+    `budgeted=False` keeps the scope but skips the deadline: the usage route
+    spends most of its time waiting on providers, which the budget must not
+    cut short — its local reads are small.
+    """
     names = _parse_profiles_param(profiles_param)
     _set_profile_scope(names)
-    budget = _route_budget_seconds(_plugin_settings())
+    budget = _route_budget_seconds(_plugin_settings()) if budgeted else 0.0
     try:
         with _route_budget_scope(budget):
             try:
@@ -4244,7 +4249,7 @@ def _ai_usage_sync(fresh: bool = False, only_provider: Optional[str] = None) -> 
         if not fresh and _ai_usage_cache and now - _ai_usage_cache[0] < AI_USAGE_CACHE_TTL_SECONDS:
             cached = copy.deepcopy(_ai_usage_cache[1])
             cached["cached"] = True
-            return cached
+            return _attach_local_usage_records(cached)
 
     collectors = {provider: adapter.collect for provider, adapter in _provider_adapters().items()}
     if fresh and only_provider:
@@ -4252,7 +4257,7 @@ def _ai_usage_sync(fresh: bool = False, only_provider: Optional[str] = None) -> 
         if collector is not None:
             merged = _ai_usage_refresh_provider(only_provider, collector)
             if merged is not None:
-                return merged
+                return _attach_local_usage_records(merged)
         # Unknown provider name or no cached payload to merge into — a full
         # pass answers correctly either way.
     # Stage 1: local-only credential probes decide which collectors run at
@@ -4283,7 +4288,6 @@ def _ai_usage_sync(fresh: bool = False, only_provider: Optional[str] = None) -> 
         finally:
             _set_collect_fresh(False)
 
-    recorded = _usage_recorded_7d()
     with _ai_usage_cache_lock:
         account_cards: Dict[str, List[Dict[str, Any]]] = {}
         for provider in _provider_ids():
@@ -4300,8 +4304,6 @@ def _ai_usage_sync(fresh: bool = False, only_provider: Optional[str] = None) -> 
                 _fold_usage_last_success(str(extra.get("provider")), extra) for extra in extras
             ]
             result = _fold_usage_last_success(provider, result)
-            result["recorded_7d"] = recorded.get(provider)
-            _attach_usage_attribution(provider, result)
             results[provider] = result
 
         providers = []
@@ -4323,7 +4325,26 @@ def _ai_usage_sync(fresh: bool = False, only_provider: Optional[str] = None) -> 
             },
         }
         _ai_usage_cache = (time.time(), copy.deepcopy(payload))
-        return payload
+        return _attach_local_usage_records(payload)
+
+
+def _attach_local_usage_records(payload: Dict[str, Any]) -> Dict[str, Any]:
+    """Join the 7-day local records and each window's attribution to every base card.
+
+    Applied to every response and never to the cache. The provider readings
+    are account-level and identical for every profile scope, but "recorded
+    locally" and "what consumed this window" come from the profiles in
+    scope — a reading cached under one scope must never carry another
+    scope's records.
+    """
+    recorded = _usage_recorded_7d()
+    for card in payload.get("providers", []):
+        if card.get("account_extra"):
+            continue
+        provider = str(card.get("provider") or "")
+        card["recorded_7d"] = recorded.get(provider)
+        _attach_usage_attribution(provider, card)
+    return payload
 
 
 def _fold_usage_last_success(provider: str, result: Dict[str, Any]) -> Dict[str, Any]:
@@ -4897,8 +4918,8 @@ def _budget_attention_notes(raw: str) -> List[Dict[str, Any]]:
 
 
 @router.get("/budgets")
-async def budgets_route(budgets: str = Query("")) -> Dict[str, Any]:
-    return await asyncio.to_thread(_budgets_sync, _parse_budgets_param(budgets))
+async def budgets_route(budgets: str = Query(""), profiles: str = Query("")) -> Dict[str, Any]:
+    return await asyncio.to_thread(_scoped_call, profiles, _budgets_sync, _parse_budgets_param(budgets))
 
 
 def _ai_usage_refresh_provider(provider: str, collector: Any) -> Optional[Dict[str, Any]]:
@@ -4927,13 +4948,10 @@ def _ai_usage_refresh_provider(provider: str, collector: Any) -> Optional[Dict[s
             status="not_configured",
             message=_provider_not_configured_message(provider),
         )
-    recorded = _usage_recorded_7d()
     with _ai_usage_cache_lock:
         extras = result.pop("extra_accounts", None) or []
         extras = [_fold_usage_last_success(str(extra.get("provider")), extra) for extra in extras]
         result = _fold_usage_last_success(provider, result)
-        result["recorded_7d"] = recorded.get(provider)
-        _attach_usage_attribution(provider, result)
         providers = []
         for item in base.get("providers", []):
             if item.get("provider") == provider:
@@ -4955,8 +4973,12 @@ def _ai_usage_refresh_provider(provider: str, collector: Any) -> Optional[Dict[s
 
 
 @router.get("/ai-usage")
-async def ai_usage(fresh: bool = False, provider: Optional[str] = None) -> Dict[str, Any]:
-    return await asyncio.to_thread(_ai_usage_sync, fresh, provider)
+async def ai_usage(
+    fresh: bool = False,
+    provider: Optional[str] = None,
+    profiles: str = Query(""),
+) -> Dict[str, Any]:
+    return await asyncio.to_thread(_scoped_call, profiles, _ai_usage_sync, fresh, provider, budgeted=False)
 
 
 @router.get("/adapters")

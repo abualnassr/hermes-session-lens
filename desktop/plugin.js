@@ -3243,7 +3243,7 @@ function BudgetRow({ entry, month, onChange, narrow }) {
 
 function BudgetsSection({ ctx, budgets, onChange, narrow }) {
   const query = useQuery({
-    queryKey: [PLUGIN_ID, 'budgets'],
+    queryKey: [PLUGIN_ID, 'budgets', activeProfilesParam],
     queryFn: () => pluginRest(ctx, apiPath('/budgets')),
     refetchInterval: 300_000
   })
@@ -4404,7 +4404,7 @@ function SessionLensPage({ ctx }) {
     refetchInterval: 60_000
   })
   const aiUsageQuery = useQuery({
-    queryKey: [PLUGIN_ID, 'ai-usage'],
+    queryKey: [PLUGIN_ID, 'ai-usage', activeProfilesParam],
     queryFn: () => pluginRest(ctx, '/ai-usage'),
     enabled: tab === 'ai-usage' || tab === 'ai-models',
     refetchInterval: tab === 'ai-usage' || tab === 'ai-models' ? 300_000 : false
@@ -4632,7 +4632,7 @@ function SessionLensPage({ ctx }) {
   if (tab === 'system') content = jsx(SystemView, { ctx })
   const refreshProvider = async provider => {
     try {
-      const data = await pluginRest(ctx, `/ai-usage?fresh=true&provider=${encodeURIComponent(provider)}`)
+      const data = await pluginRest(ctx, apiPath('/ai-usage', { fresh: true, provider }))
       queryClient.setQueryData([PLUGIN_ID, 'ai-usage'], data)
     } catch (error) {
       setAiRefreshError(`${provider}: ${error?.message || String(error || 'refresh failed')}`)
