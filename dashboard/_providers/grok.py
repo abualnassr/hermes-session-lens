@@ -79,6 +79,52 @@ def _grok_windows_from_payloads(
     return windows
 
 
+GROK_USAGE_SETTINGS_URL = "https://grok.com/?_s=usage"
+
+
+def _grok_card_extras(
+    weekly_payload: Optional[Mapping[str, Any]],
+    topup_payload: Optional[Mapping[str, Any]],
+) -> Tuple[Optional[str], List[str], List[Dict[str, str]]]:
+    """(plan, details, links) for the Grok card beyond its usage windows.
+
+    xAI's CLI proxy reports the plan tier only for some accounts, so the
+    tier is shown when present and never guessed. The auto-top-up rule is
+    its own endpoint: an empty response means none is set up. Weekly limit
+    resets exist only on grok.com (xAI's own CLI opens the browser for
+    them), so the card says where they are instead of pretending.
+    """
+    plan = None
+    if isinstance(weekly_payload, Mapping):
+        tier = str(weekly_payload.get("subscription_tier") or "").strip()
+        plan = tier or None
+    details = ["Private xAI billing surface; response compatibility may change."]
+    rule = topup_payload.get("rule") if isinstance(topup_payload, Mapping) else None
+    if isinstance(rule, Mapping) and rule.get("enabled"):
+        def cents(key: str) -> Optional[float]:
+            raw = rule.get(key)
+            value = _usage_number(raw.get("val")) if isinstance(raw, Mapping) else _usage_number(raw)
+            return value / 100.0 if value is not None else None
+
+        amount, floor, cap = cents("topupAmount"), cents("minBeforeHittingSl"), cents("maxAmountPerMonth")
+        text = "Auto top-up: on"
+        if amount is not None:
+            text += f" — adds ${amount:,.2f}"
+            if floor is not None:
+                text += f" when the balance falls below ${floor:,.2f}"
+        if cap is not None:
+            text += f" (at most ${cap:,.2f} per month)"
+        details.append(text)
+    elif topup_payload is not None:
+        details.append("Auto top-up: not set up.")
+    details.append(
+        "Weekly limit resets are redeemed at grok.com → Settings → Usage; xAI exposes them only there, "
+        "so this card cannot show one."
+    )
+    links = [{"label": "Open grok.com usage settings", "url": GROK_USAGE_SETTINGS_URL}]
+    return plan, details, links
+
+
 def _collect_grok_usage() -> Dict[str, Any]:
     # Billing response mapping is informed by the MIT-licensed
     # bnogalski/hermes-llm-quota project; see UPSTREAM.md.
@@ -97,7 +143,7 @@ def _collect_grok_usage() -> Dict[str, Any]:
     except ImportError:
         return _provider_payload("grok", status="unavailable", message="Hermes HTTP client is unavailable.")
 
-    url = "https://cli-chat-proxy.grok.com/v1/billing"
+    base_url = "https://cli-chat-proxy.grok.com/v1"
     headers = {
         "Authorization": f"Bearer {token}",
         "Accept": "application/json",
@@ -109,22 +155,31 @@ def _collect_grok_usage() -> Dict[str, Any]:
     payloads: Dict[str, Mapping[str, Any]] = {}
     errors: List[str] = []
     statuses: List[int] = []
+    # The auto-top-up rule is a courtesy line: its failure never marks the
+    # card partial, so it keeps its own error list and stays out of statuses.
+    requests = (
+        ("weekly", "/billing", {"format": "credits"}, True),
+        ("monthly", "/billing", None, True),
+        ("topup", "/auto-topup-rule", None, False),
+    )
     try:
         with httpx.Client(timeout=AI_USAGE_PROVIDER_TIMEOUT_SECONDS) as client:
-            for name, params in (("weekly", {"format": "credits"}), ("monthly", None)):
+            for name, path, params, essential in requests:
                 try:
-                    response = client.get(url, params=params, headers=headers)
-                    statuses.append(response.status_code)
+                    response = client.get(base_url + path, params=params, headers=headers)
+                    if essential:
+                        statuses.append(response.status_code)
                     if response.status_code == 200:
                         payload = response.json()
                         if isinstance(payload, Mapping):
                             payloads[name] = payload
-                        else:
+                        elif essential:
                             errors.append(f"{name}: invalid response")
-                    else:
+                    elif essential:
                         errors.append(f"{name}: HTTP {response.status_code}")
                 except Exception as error:
-                    errors.append(f"{name}: {_provider_message(error)}")
+                    if essential:
+                        errors.append(f"{name}: {_provider_message(error)}")
     finally:
         token = ""
         headers.clear()
@@ -148,11 +203,14 @@ def _collect_grok_usage() -> Dict[str, Any]:
             message="Grok returned neither a usage percentage nor a weekly billing period; the billing response shape may have changed.",
             partial=bool(errors),
         )
+    plan, details, links = _grok_card_extras(payloads.get("weekly"), payloads.get("topup"))
     return _provider_payload(
         "grok",
         status="ok",
+        plan=plan,
         windows=windows,
-        details=["Private xAI billing surface; response compatibility may change."],
+        details=details,
+        links=links,
         message="; ".join(errors) if errors else None,
         partial=bool(errors),
     )

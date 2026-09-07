@@ -123,8 +123,17 @@ def _provider_payload(
     details: Optional[List[str]] = None,
     message: Optional[str] = None,
     partial: bool = False,
+    links: Optional[List[Mapping[str, Any]]] = None,
 ) -> Dict[str, Any]:
     meta = _provider_meta(provider)
+    safe_links: List[Dict[str, str]] = []
+    for link in links or []:
+        if not isinstance(link, Mapping):
+            continue
+        label = _clean_text(link.get("label"), 80)
+        url = str(link.get("url") or "").strip()
+        if label and url.startswith("https://"):
+            safe_links.append({"label": label, "url": url})
     return {
         "provider": provider,
         "label": meta["label"],
@@ -137,6 +146,7 @@ def _provider_payload(
         "partial": bool(partial),
         "stale": False,
         "fetched_at": time.time(),
+        "links": safe_links,
     }
 
 

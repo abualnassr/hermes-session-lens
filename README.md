@@ -6,7 +6,7 @@
 
 It installs as one Hermes plugin: a native Desktop page plus its namespaced Python API. No iframe, no separate server, no telemetry service, and no write path — the backend defines zero mutation routes and never touches a credential store.
 
-This documentation describes Hermes Session Lens `0.38.0`, verified on Hermes Agent and Desktop `0.21.0`. MIT licensed. A community plugin, not affiliated with or endorsed by Nous Research.
+This documentation describes Hermes Session Lens `0.39.0`, verified on Hermes Agent and Desktop `0.21.0`. MIT licensed. A community plugin, not affiliated with or endorsed by Nous Research.
 
 ![How Session Lens works: what it reads, what it answers, and what it never does](docs/how-it-works.svg)
 
@@ -162,7 +162,7 @@ Session Lens is meant to be inspected, not trusted on its word. This is what the
 | Nous Research Portal | `portal.nousresearch.com` | Hermes' own portal client with the Hermes Nous login |
 | OpenRouter | `openrouter.ai` | Hermes OpenRouter API key |
 | DeepSeek | `api.deepseek.com` | Hermes DeepSeek API key |
-| Grok | `cli-chat-proxy.grok.com` | Hermes xAI OAuth credentials |
+| Grok | `cli-chat-proxy.grok.com` | Hermes xAI OAuth credentials; also reads the account's auto-top-up rule (a billing setting, never changed) |
 | Kimi Code Plan | `api.kimi.com` | Hermes Kimi API key |
 | Z.AI GLM Coding Plan | `api.z.ai` | Hermes Z.AI API key |
 | Firecrawl | `api.firecrawl.dev` | `FIRECRAWL_API_KEY` from the Hermes `.env` (cloud only; a self-hosted URL is never called) |

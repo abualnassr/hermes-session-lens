@@ -2879,7 +2879,7 @@ function UsageWindow({ window, series, onDrill }) {
   })
 }
 
-function UsageProvider({ provider, history, onRefresh, onDrill }) {
+function UsageProvider({ ctx, provider, history, onRefresh, onDrill }) {
   const status = usageStatus(provider)
   const messageDanger = ['expired', 'forbidden', 'unavailable'].includes(provider.status)
   const [busy, setBusy] = useState(false)
@@ -2970,6 +2970,18 @@ function UsageProvider({ provider, history, onRefresh, onDrill }) {
             children: provider.details.map((detail, index) => jsx('li', { children: detail }, `${provider.provider}-detail-${index}`))
           })
         : null,
+      provider.links?.length
+        ? jsx('div', {
+            style: { display: 'flex', flexWrap: 'wrap', gap: '0.4rem', marginTop: '0.5rem' },
+            children: provider.links.map(link => jsx(Button, {
+              variant: 'outline',
+              size: 'sm',
+              onClick: () => openExternalLink(ctx, link.url),
+              title: link.url,
+              children: jsxs(Fragment, { children: [jsx(Codicon, { name: 'link-external', size: '0.7rem' }), ' ', link.label] })
+            }, `${provider.provider}-link-${link.url}`))
+          })
+        : null,
       provider.recorded_7d && (provider.recorded_7d.tokens || provider.recorded_7d.sessions)
         ? jsx('div', {
             title: 'What your local Hermes sessions recorded against this provider in the last 7 days. The account quota above may also include usage from other machines or tools on the same account.',
@@ -2987,7 +2999,7 @@ function UsageProvider({ provider, history, onRefresh, onDrill }) {
   })
 }
 
-function UsageProviderGroup({ title, description, providers, narrow, id, history, onRefresh, onDrill }) {
+function UsageProviderGroup({ ctx, title, description, providers, narrow, id, history, onRefresh, onDrill }) {
   if (!providers.length) return null
   return jsxs('section', {
     'aria-labelledby': id,
@@ -3008,7 +3020,7 @@ function UsageProviderGroup({ title, description, providers, narrow, id, history
       }),
       jsx('div', {
         style: { display: 'grid', gap: '0.85rem', gridTemplateColumns: narrow ? 'minmax(0, 1fr)' : 'repeat(2, minmax(0, 1fr))' },
-        children: providers.map(provider => jsx(UsageProvider, { provider, history, onRefresh, onDrill }, provider.provider))
+        children: providers.map(provider => jsx(UsageProvider, { ctx, provider, history, onRefresh, onDrill }, provider.provider))
       })
     ]
   })
@@ -3322,6 +3334,7 @@ function ServicesSection({ ctx, query, narrow, history, onRefresh }) {
           ? jsx(LoadingBlock, { rows: 4 })
           : cards.length
             ? jsx(UsageProviderGroup, {
+                ctx,
                 id: 'service-usage',
                 title: 'Services & tools',
                 description: 'Credits and balances for the non-model services Hermes holds keys for — search, scraping, mail, data marketplaces — read from each vendor’s own usage endpoint.',
@@ -3440,6 +3453,7 @@ function AIUsageView({ ctx, query, servicesQuery, narrow, refreshError, history,
           : null,
         configured.length
           ? jsx(UsageProviderGroup, {
+              ctx,
               id: 'supported-ai-usage',
               title: 'Your providers',
               description: 'Account limits and balances for the providers Hermes holds credentials for.',

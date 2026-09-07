@@ -2089,6 +2089,34 @@ process.stdout.write(JSON.stringify(out))
         self.assertEqual(windows[1]["remaining"], 37.5)
         self.assertEqual(windows[1]["unit"], "credits")
 
+    def test_grok_card_extras_name_tier_topup_and_where_resets_live(self):
+        plan, details, links = api._grok_card_extras({"config": {}}, {})
+        self.assertIsNone(plan)
+        self.assertIn("Auto top-up: not set up.", details)
+        self.assertTrue(any("grok.com → Settings → Usage" in item for item in details))
+        self.assertEqual(links, [{"label": "Open grok.com usage settings", "url": "https://grok.com/?_s=usage"}])
+
+        plan, details, _links = api._grok_card_extras(
+            {"config": {}, "subscription_tier": "SuperGrok"},
+            {"rule": {"enabled": True, "topupAmount": {"val": 2000}, "minBeforeHittingSl": {"val": 500}, "maxAmountPerMonth": {"val": 10000}}},
+        )
+        self.assertEqual(plan, "SuperGrok")
+        self.assertIn("Auto top-up: on — adds $20.00 when the balance falls below $5.00 (at most $100.00 per month)", details)
+
+        # No top-up response at all (request failed): no claim either way.
+        _plan, details, _links = api._grok_card_extras({"config": {}}, None)
+        self.assertFalse(any(item.startswith("Auto top-up") for item in details))
+
+        # Links are sanitised by the payload builder: only https, label required.
+        payload = api._provider_payload(
+            "grok", status="ok", links=[{"label": "ok", "url": "https://grok.com/?_s=usage"}, {"label": "", "url": "https://x"}, {"label": "bad", "url": "javascript:alert(1)"}]
+        )
+        self.assertEqual(payload["links"], [{"label": "ok", "url": "https://grok.com/?_s=usage"}])
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("provider.links?.length", source)
+        self.assertIn("openExternalLink(ctx, link.url)", source)
+        self.assertIn("function UsageProvider({ ctx, provider, history, onRefresh, onDrill })", source)
+
     def test_grok_missing_percent_in_a_confirmed_weekly_period_is_zero_used(self):
         # The exact shape xAI returned on 2026-09-04 for a unified-billing account:
         # protobuf JSON drops zero-valued fields, so creditUsagePercent is absent.
