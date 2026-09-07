@@ -239,7 +239,7 @@ def _list_sessions_sync(
         if not include_archived:
             where.append("coalesce(s.archived, 0) = 0")
         from_where = f"""
-            FROM sessions s
+            FROM ({_accounted_sessions_sql(_db_connection(db))}) s
             WHERE {' AND '.join(where)}
         """
         select_sql = """
@@ -421,7 +421,7 @@ def _session_detail_sync(session_id: str) -> Dict[str, Any]:
         if not sid:
             raise HTTPException(status_code=404, detail="Session not found")
         row = _db_connection(db).execute(
-            "SELECT s.* FROM sessions s WHERE s.id = ?",
+            f"SELECT s.* FROM ({_accounted_sessions_sql(_db_connection(db))}) s WHERE s.id = ?",
             (sid,),
         ).fetchone()
         if row is None:
@@ -956,7 +956,7 @@ def _digest_period_totals(
                    coalesce(SUM(CASE WHEN coalesce(actual_cost_usd,0) > 0 THEN actual_cost_usd
                                      WHEN coalesce(estimated_cost_usd,0) > 0 THEN estimated_cost_usd
                                      ELSE 0 END),0) AS recorded_cost_usd
-            FROM sessions
+            FROM ({_accounted_sessions_sql(connection)}) sessions
             WHERE {session_sql}
             """,
             tuple(session_params),
@@ -1556,7 +1556,7 @@ def _projects_sync(
                        last_activity_at, input_tokens, output_tokens,
                        cache_read_tokens, cache_write_tokens,
                        estimated_cost_usd, actual_cost_usd, cost_status{profile_column}
-                FROM sessions
+                FROM ({_accounted_sessions_sql(_db_connection(db))}) sessions
                 WHERE {session_sql}
                 """,
                 tuple(session_params),
@@ -1692,7 +1692,7 @@ def _agent_runs_sync(
                        end_reason, last_activity_at, input_tokens, output_tokens,
                        cache_read_tokens, cache_write_tokens,
                        estimated_cost_usd, actual_cost_usd, cost_status, cost_source
-                FROM sessions
+                FROM ({_accounted_sessions_sql(_db_connection(db))}) sessions
                 WHERE {session_sql} AND source='cron'
                 ORDER BY started_at DESC
                 """,
@@ -1978,7 +1978,7 @@ def _attention_sync(
                        input_tokens, output_tokens, cache_read_tokens,
                        cache_write_tokens, estimated_cost_usd, actual_cost_usd,
                        cost_status, cost_source
-                FROM sessions
+                FROM ({_accounted_sessions_sql(_db_connection(db))}) sessions
                   WHERE (
                     ended_at IS NULL
                     OR lower(coalesce(end_reason,'')) IN ({reaped_placeholders})
@@ -2140,7 +2140,7 @@ def _overview_sync(
                    coalesce(SUM(CASE WHEN coalesce(actual_cost_usd,0) <= 0 AND estimated_cost_usd > 0 THEN 1 ELSE 0 END),0) AS estimated_cost_sessions,
                    coalesce(SUM(CASE WHEN lower(coalesce(cost_status,'')) IN ('included','subscription','free') THEN 1 ELSE 0 END),0) AS included_cost_sessions,
                     coalesce(SUM(CASE WHEN coalesce(actual_cost_usd,0) <= 0 AND coalesce(estimated_cost_usd,0) <= 0 AND lower(coalesce(cost_status,'')) NOT IN ('included','subscription','free') THEN 1 ELSE 0 END),0) AS unpriced_sessions
-            FROM sessions
+            FROM ({_accounted_sessions_sql(_db_connection(db))}) sessions
             WHERE {session_period_sql}
             """,
             tuple(session_period_params),
@@ -2180,7 +2180,7 @@ def _overview_sync(
                            WHEN actual_cost_usd > 0 THEN actual_cost_usd
                            WHEN estimated_cost_usd > 0 THEN estimated_cost_usd
                            ELSE 0 END),0) AS cost_usd
-                FROM sessions
+                FROM ({_accounted_sessions_sql(_db_connection(db))}) sessions
                 WHERE {session_period_sql}
                 GROUP BY day ORDER BY day
                 """,
@@ -2223,7 +2223,7 @@ def _overview_sync(
                 SELECT coalesce(source,'unknown') AS source, COUNT(*) AS sessions,
                        SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens) AS total_tokens,
                        SUM(tool_call_count) AS tool_calls
-                FROM sessions
+                FROM ({_accounted_sessions_sql(_db_connection(db))}) sessions
                 WHERE {session_period_sql}
                 GROUP BY source ORDER BY sessions DESC
                 """,
@@ -2567,7 +2567,7 @@ def _ai_models_payload_sync(
                        s.billing_mode, s.estimated_cost_usd, s.actual_cost_usd,
                        s.cost_status, s.cost_source, s.message_count,
                        {rewind_expr} AS rewind_count
-                FROM sessions s
+                FROM ({_accounted_sessions_sql(_db_connection(db))}) s
                 WHERE {period_sql}
                 """,
                 tuple(period_params),
@@ -4021,7 +4021,7 @@ def _profile_summary(
                            WHEN estimated_cost_usd > 0 THEN estimated_cost_usd
                            ELSE 0 END),0) AS recorded_cost_usd,
                        MAX(coalesce(last_activity_at, started_at)) AS last_activity_at
-                FROM sessions WHERE {period_sql}
+                FROM ({_accounted_sessions_sql(_db_connection(db))}) sessions WHERE {period_sql}
                 """,
                 tuple(period_params),
             ).fetchone()
@@ -4030,7 +4030,7 @@ def _profile_summary(
         for row in connection.execute(
             f"""
             SELECT end_reason, ended_at, last_activity_at, started_at
-            FROM sessions WHERE {period_sql}
+            FROM ({_accounted_sessions_sql(_db_connection(db))}) sessions WHERE {period_sql}
             """,
             tuple(period_params),
         ).fetchall():

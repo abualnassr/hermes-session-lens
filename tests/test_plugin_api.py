@@ -718,6 +718,58 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertEqual(profiles, ["beta", "default"])
         self.assertTrue(all(group["label"].startswith(f"{group['profile']} · ") for group in merged["projects"]))
 
+    def test_scoped_queries_key_on_the_profile_scope(self):
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        for name in ("sessions", "trace", "attention", "projects", "tools", "skills", "compression", "telemetry",
+                     "agent-runs", "rules", "rules-templates", "overview", "ai-models", "system", "tool-names"):
+            self.assertIn(f"queryKey: [PLUGIN_ID, '{name}', activeProfilesParam", source, name)
+        for name in ("budgets", "ai-usage", "services", "gateway", "schedules", "health"):
+            self.assertNotIn(f"queryKey: [PLUGIN_ID, '{name}', activeProfilesParam", source, name)
+
+    def test_session_accounting_takes_the_higher_of_hermes_two_records(self):
+        connection = sqlite3.connect(self.db_path)
+        before = api._overview_sync(0)["totals"]
+        # A long session whose per-model rows ran ahead of its session row.
+        connection.execute(
+            """
+            INSERT INTO sessions (id, source, model, started_at, last_activity_at, ended_at,
+                                  input_tokens, output_tokens, estimated_cost_usd, message_count, cwd)
+            VALUES ('lagging-bot', 'desktop', 'provider/model-a', 1800000700, 1800000900, NULL, 1000, 100, 0.5, 30, 'C:/bots/lead')
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO session_model_usage (session_id, model, billing_provider, api_call_count,
+                                             input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                                             reasoning_tokens, estimated_cost_usd, actual_cost_usd, cost_status)
+            VALUES ('lagging-bot', 'provider/model-a', 'provider', 40, 3000, 300, 0, 0, 0, 1.5, 0, 'estimated'),
+                   ('lagging-bot', 'provider/model-b', 'provider', 10, 500, 50, 0, 0, 0, 0.25, 0, 'estimated')
+            """
+        )
+        connection.commit()
+        connection.close()
+
+        after = api._overview_sync(0)["totals"]
+        self.assertEqual(after["input_tokens"] - before["input_tokens"], 3500)
+        self.assertEqual(after["output_tokens"] - before["output_tokens"], 350)
+        self.assertAlmostEqual(after["display_cost_usd"] - before["display_cost_usd"], 1.75, places=6)
+
+        listing = api._list_sessions_sync(
+            days=0, query="lagging-bot", sort="recent", failures_only=False,
+            include_archived=False, limit=50, offset=0,
+        )
+        row = next(item for item in listing["sessions"] if item["id"] == "lagging-bot")
+        self.assertEqual(row["total_tokens"], 3850)
+        detail = api._session_detail_sync("lagging-bot")["session"]
+        self.assertEqual(detail["input_tokens"], 3500)
+        self.assertAlmostEqual(detail["estimated_cost_usd"], 1.75, places=6)
+        project = next(group for group in api._projects_sync(0)["projects"] if group["label"] == "lead")
+        self.assertAlmostEqual(project["recorded_cost_usd"], 1.75, places=6)
+
+        # A session row that is already ahead keeps its own figures.
+        session_one = api._session_detail_sync("session-1")["session"]
+        self.assertEqual(session_one["input_tokens"], 1000)
+
     def test_profile_scope_search_and_query_syntax_span_profiles(self):
         self._make_beta_profile()
         list_kwargs = dict(

@@ -1295,7 +1295,7 @@ function TraceView({ ctx, sessionId, period }) {
   const [limit, setLimit] = useState(100)
   useEffect(() => setLimit(100), [sessionId])
   const traceQuery = useQuery({
-    queryKey: [PLUGIN_ID, 'trace', sessionId, limit],
+    queryKey: [PLUGIN_ID, 'trace', activeProfilesParam, sessionId, limit],
     queryFn: () => pluginRest(ctx, apiPath(`/sessions/${encodeURIComponent(sessionId)}/trace`, { limit })),
     enabled: Boolean(sessionId),
     placeholderData: previous => previous
@@ -1626,12 +1626,12 @@ function SessionsView({ ctx, period, narrow, drill }) {
     ctx.storage.set('attentionDismissed', dismissedAttention)
   }, [ctx, dismissedAttention])
   const attentionQuery = useQuery({
-    queryKey: [PLUGIN_ID, 'attention', period.days, period.start_at, period.end_at],
+    queryKey: [PLUGIN_ID, 'attention', activeProfilesParam, period.days, period.start_at, period.end_at],
     queryFn: () => pluginRest(ctx, apiPath('/attention', period)),
     refetchInterval: 120_000
   })
   const listQuery = useQuery({
-    queryKey: [PLUGIN_ID, 'sessions', period.days, period.start_at, period.end_at, debouncedSearch, sort, failuresOnly, limit],
+    queryKey: [PLUGIN_ID, 'sessions', activeProfilesParam, period.days, period.start_at, period.end_at, debouncedSearch, sort, failuresOnly, limit],
     queryFn: () =>
       pluginRest(ctx, apiPath('/sessions', {
         ...period,
@@ -1874,7 +1874,7 @@ function formatDurationShort(seconds) {
 
 function ProjectsSection({ ctx, period }) {
   const query = useQuery({
-    queryKey: [PLUGIN_ID, 'projects', period.days, period.start_at, period.end_at],
+    queryKey: [PLUGIN_ID, 'projects', activeProfilesParam, period.days, period.start_at, period.end_at],
     queryFn: () => pluginRest(ctx, apiPath('/projects', period)),
     refetchInterval: 120_000
   })
@@ -2082,12 +2082,12 @@ function ContextWeightCell({ row }) {
 
 function ToolsView({ ctx, period }) {
   const query = useQuery({
-    queryKey: [PLUGIN_ID, 'tools', period.days, period.start_at, period.end_at],
+    queryKey: [PLUGIN_ID, 'tools', activeProfilesParam, period.days, period.start_at, period.end_at],
     queryFn: () => pluginRest(ctx, apiPath('/tools', period)),
     refetchInterval: 60_000
   })
   const skillsQuery = useQuery({
-    queryKey: [PLUGIN_ID, 'skills', period.days, period.start_at, period.end_at],
+    queryKey: [PLUGIN_ID, 'skills', activeProfilesParam, period.days, period.start_at, period.end_at],
     queryFn: () => pluginRest(ctx, apiPath('/skills', period)),
     refetchInterval: 60_000
   })
@@ -2255,7 +2255,7 @@ function ToolsView({ ctx, period }) {
 
 function CompressionStrip({ ctx }) {
   const query = useQuery({
-    queryKey: [PLUGIN_ID, 'compression'],
+    queryKey: [PLUGIN_ID, 'compression', activeProfilesParam],
     queryFn: () => pluginRest(ctx, apiPath('/compression')),
     refetchInterval: 300_000
   })
@@ -2300,7 +2300,7 @@ function CompressionStrip({ ctx }) {
 
 function RuntimeHealth({ ctx, period }) {
   const telemetryQuery = useQuery({
-    queryKey: [PLUGIN_ID, 'telemetry', period.days, period.start_at, period.end_at],
+    queryKey: [PLUGIN_ID, 'telemetry', activeProfilesParam, period.days, period.start_at, period.end_at],
     queryFn: () => pluginRest(ctx, apiPath('/telemetry', period)),
     refetchInterval: 60_000
   })
@@ -2444,7 +2444,7 @@ function AgentRunStrip({ runs }) {
 
 function AgentScoreboard({ ctx, period, onSelectJob }) {
   const query = useQuery({
-    queryKey: [PLUGIN_ID, 'agent-runs', period.days, period.start_at, period.end_at],
+    queryKey: [PLUGIN_ID, 'agent-runs', activeProfilesParam, period.days, period.start_at, period.end_at],
     queryFn: () => pluginRest(ctx, apiPath('/agent-runs', period)),
     refetchInterval: 120_000
   })
@@ -3513,7 +3513,7 @@ function DefinitionList({ rows }) {
 
 function SystemView({ ctx }) {
   const query = useQuery({
-    queryKey: [PLUGIN_ID, 'system'],
+    queryKey: [PLUGIN_ID, 'system', activeProfilesParam],
     queryFn: () => pluginRest(ctx, apiPath('/system')),
     refetchInterval: 60_000
   })
@@ -4141,7 +4141,7 @@ function RulesView({ ctx, period, onDrill, rules, onRulesChange, availableProfil
   })
   useEffect(() => { ctx.storage.set(RULES_MIN_SAMPLES_KEY, minSamples) }, [ctx, minSamples])
   const templatesQuery = useQuery({
-    queryKey: [PLUGIN_ID, 'rules-templates'],
+    queryKey: [PLUGIN_ID, 'rules-templates', activeProfilesParam],
     queryFn: () => pluginRest(ctx, '/rules/templates'),
     staleTime: Infinity
   })
@@ -4159,7 +4159,7 @@ function RulesView({ ctx, period, onDrill, rules, onRulesChange, availableProfil
   }, [catalog, rules, onRulesChange])
   const rulesParam = enabledRulesParam(rules)
   const evalQuery = useQuery({
-    queryKey: [PLUGIN_ID, 'rules', period.days, period.start_at, period.end_at, rulesParam, minSamples],
+    queryKey: [PLUGIN_ID, 'rules', activeProfilesParam, period.days, period.start_at, period.end_at, rulesParam, minSamples],
     queryFn: () => pluginRest(ctx, apiPath('/rules', { ...period, rules: rulesParam, min_samples: minSamples })),
     enabled: Boolean(rulesParam),
     placeholderData: previous => previous,
@@ -4386,7 +4386,7 @@ function SessionLensPage({ ctx }) {
   const [customEnd, setCustomEnd] = useState(() => normaliseDateInput(ctx.storage.get('customEnd'), dateDaysAgo(0)))
   const period = useMemo(() => periodParams(daysText, customStart, customEnd), [daysText, customStart, customEnd])
   const overviewQuery = useQuery({
-    queryKey: [PLUGIN_ID, 'overview', period.days, period.start_at, period.end_at],
+    queryKey: [PLUGIN_ID, 'overview', activeProfilesParam, period.days, period.start_at, period.end_at],
     queryFn: () => pluginRest(ctx, apiPath('/overview', period)),
     refetchInterval: 60_000
   })
@@ -4403,7 +4403,7 @@ function SessionLensPage({ ctx }) {
     refetchInterval: tab === 'ai-usage' ? 300_000 : false
   })
   const aiModelsQuery = useQuery({
-    queryKey: [PLUGIN_ID, 'ai-models', period.days, period.start_at, period.end_at],
+    queryKey: [PLUGIN_ID, 'ai-models', activeProfilesParam, period.days, period.start_at, period.end_at],
     queryFn: () => pluginRest(ctx, apiPath('/ai-models', period)),
     enabled: tab === 'ai-models',
     refetchInterval: tab === 'ai-models' ? 300_000 : false
@@ -4535,7 +4535,9 @@ function SessionLensPage({ ctx }) {
     ? 'all'
     : Array.isArray(profileScope) && profileScope.length ? profileScope.join(',') : ''
   // Assigned during render so every queryFn issued this pass already carries
-  // the scope; the effect below only has to invalidate stale results.
+  // the scope. Every scoped query also keys on it, so each scope keeps its
+  // own cache: switching back shows that scope's data at once, and a scope
+  // never flashes another scope's numbers while its own are fetched.
   activeProfilesParam = profilesParam
   const profileListQuery = useQuery({
     queryKey: [PLUGIN_ID, 'profile-names'],
@@ -4557,7 +4559,7 @@ function SessionLensPage({ ctx }) {
   // Same query key as SessionsView's attention banner, so the two share one
   // request; this page-level copy keeps quota notes visible on every tab.
   const pageAttentionQuery = useQuery({
-    queryKey: [PLUGIN_ID, 'attention', period.days, period.start_at, period.end_at],
+    queryKey: [PLUGIN_ID, 'attention', activeProfilesParam, period.days, period.start_at, period.end_at],
     queryFn: () => pluginRest(ctx, apiPath('/attention', period)),
     refetchInterval: 120_000
   })
@@ -4593,7 +4595,7 @@ function SessionLensPage({ ctx }) {
       budgetsInitRef.current = true
       return
     }
-    queryClient.invalidateQueries({ queryKey: [PLUGIN_ID, 'attention'] })
+    queryClient.invalidateQueries({ queryKey: [PLUGIN_ID, 'attention', activeProfilesParam] })
     queryClient.invalidateQueries({ queryKey: [PLUGIN_ID, 'budgets'] })
   }, [budgetsParam])
   const updateBudget = (id, cap) => {

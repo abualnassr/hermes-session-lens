@@ -356,6 +356,67 @@ def _database(db_path: Optional[Path] = None) -> Iterator[Any]:
         db.close()
 
 
+_ACCOUNTED_TOKEN_COLUMNS = (
+    "input_tokens",
+    "output_tokens",
+    "cache_read_tokens",
+    "cache_write_tokens",
+    "reasoning_tokens",
+)
+
+
+def _accounted_sessions_sql(connection: Any) -> str:
+    """A SELECT over `sessions` whose token, call and cost columns are the
+    higher of Hermes' two records per session.
+
+    Hermes keeps a running total on the session row and one row per model in
+    session_model_usage. On long sessions the session row lags — a bot
+    session read $1.38 there and $1.98 in its usage rows — so every view
+    that reads session-level accounting takes the larger figure, column by
+    column. All other columns pass through unchanged, so a query can swap
+    `FROM sessions` for `FROM (<this>) alias` and keep its SQL. Read-only.
+    """
+    try:
+        columns = [str(row[1]) for row in connection.execute("PRAGMA table_info(sessions)").fetchall()]
+    except Exception:
+        columns = []
+    if not columns:
+        return "SELECT * FROM sessions"
+    has_usage = True
+    try:
+        has_usage = bool(connection.execute("PRAGMA table_info(session_model_usage)").fetchall())
+    except Exception:
+        has_usage = False
+    overridden = set(_ACCOUNTED_TOKEN_COLUMNS) | {"api_call_count", "actual_cost_usd", "estimated_cost_usd"}
+    passthrough = ", ".join(f's."{column}"' for column in columns if column not in overridden)
+    if not has_usage:
+        return "SELECT * FROM sessions"
+    computed = []
+    for column in _ACCOUNTED_TOKEN_COLUMNS:
+        if column in columns:
+            computed.append(f'max(coalesce(s."{column}",0), coalesce(u."{column}",0)) AS "{column}"')
+    if "api_call_count" in columns:
+        computed.append('max(coalesce(s."api_call_count",0), coalesce(u."api_call_count",0)) AS "api_call_count"')
+    for column in ("actual_cost_usd", "estimated_cost_usd"):
+        if column in columns:
+            computed.append(
+                f'CASE WHEN coalesce(u."{column}",0) > coalesce(s."{column}",0) THEN u."{column}" '
+                f'ELSE s."{column}" END AS "{column}"'
+            )
+    usage_totals = (
+        "SELECT session_id, "
+        + ", ".join(f'SUM(coalesce("{column}",0)) AS "{column}"' for column in _ACCOUNTED_TOKEN_COLUMNS)
+        + ', SUM(coalesce("api_call_count",0)) AS "api_call_count"'
+        + ', SUM(CASE WHEN "actual_cost_usd" > 0 THEN "actual_cost_usd" ELSE 0 END) AS "actual_cost_usd"'
+        + ', SUM(CASE WHEN "estimated_cost_usd" > 0 THEN "estimated_cost_usd" ELSE 0 END) AS "estimated_cost_usd"'
+        + " FROM session_model_usage GROUP BY session_id"
+    )
+    return (
+        f"SELECT {passthrough}, {', '.join(computed)} FROM sessions s "
+        f"LEFT JOIN ({usage_totals}) u ON u.session_id = s.id"
+    )
+
+
 def _db_connection(db: Any) -> Any:
     connection = getattr(db, "_conn", None)
     if connection is None:

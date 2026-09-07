@@ -6,7 +6,7 @@
 
 It installs as one Hermes plugin: a native Desktop page plus its namespaced Python API. No iframe, no separate server, no telemetry service, and no write path — the backend defines zero mutation routes and never touches a credential store.
 
-This documentation describes Hermes Session Lens `0.36.0`, verified on Hermes Agent and Desktop `0.21.0`. MIT licensed. A community plugin, not affiliated with or endorsed by Nous Research.
+This documentation describes Hermes Session Lens `0.37.0`, verified on Hermes Agent and Desktop `0.21.0`. MIT licensed. A community plugin, not affiliated with or endorsed by Nous Research.
 
 ![How Session Lens works: what it reads, what it answers, and what it never does](docs/how-it-works.svg)
 
@@ -37,7 +37,7 @@ Hermes plugins and telemetry are per-profile. The header chip ("data: default pr
 
 ## What you get
 
-Every view honours the same period selector (7/30/90 days, all time, or a custom range) and the same profile scope. A period holds every session that was active in it — a bot session that began days earlier and is still running counts in each period it touches — and, because Hermes records usage per session rather than per day, a session that straddles a boundary counts whole; the daily bars place a session on the day it was last active. Sessions hidden from the Hermes sidebar are counted everywhere and labelled in their detail view: hiding is a listing preference, and their spend is real. Numbers carry their denominators, samples that are too small render as fractions rather than percentages, and anything Session Lens cannot know — an unpriced route, a window without a span, a failure in a language its signatures do not read — says so instead of showing a comforting zero.
+Every view honours the same period selector (7/30/90 days, all time, or a custom range) and the same profile scope. A period holds every session that was active in it — a bot session that began days earlier and is still running counts in each period it touches — and, because Hermes records usage per session rather than per day, a session that straddles a boundary counts whole; the daily bars place a session on the day it was last active. Sessions hidden from the Hermes sidebar are counted everywhere and labelled in their detail view: hiding is a listing preference, and their spend is real. Hermes keeps two accounting records per session — a running total on the session row and one row per model — and the session row lags on long sessions, so every view reads the higher of the two, column by column. Numbers carry their denominators, samples that are too small render as fractions rather than percentages, and anything Session Lens cannot know — an unpriced route, a window without a span, a failure in a language its signatures do not read — says so instead of showing a comforting zero.
 
 ### Sessions — failure-first, with the full trace
 
