@@ -657,6 +657,26 @@ def _hermes_configured_provider_ids() -> List[str]:
     return configured
 
 
+def _hermes_provider_credential_keys() -> Dict[str, str]:
+    """provider id -> the credential it reads (its env-var names, or its own id).
+
+    Several registry entries can read one key — Hermes lists six Alibaba
+    and Dashscope endpoints on one DASHSCOPE key — and a list of providers
+    "configured in Hermes" should count that once. Returns {} outside Hermes.
+    """
+    keys: Dict[str, str] = {}
+    try:
+        from hermes_cli import auth as hermes_auth
+
+        registry = getattr(hermes_auth, "PROVIDER_REGISTRY", None) or {}
+        for provider_id, pconfig in registry.items():
+            env_vars = tuple(str(name) for name in (getattr(pconfig, "api_key_env_vars", None) or ()))
+            keys[str(provider_id)] = ",".join(sorted(env_vars)) if env_vars else str(provider_id)
+    except Exception:
+        return {}
+    return keys
+
+
 def _compat_capabilities() -> Dict[str, str]:
     return dict(_CAPABILITIES)
 

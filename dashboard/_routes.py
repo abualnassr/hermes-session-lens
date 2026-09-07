@@ -4380,7 +4380,8 @@ def _finish_usage_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
     """Everything a usage response carries beyond the cached provider readings."""
     _attach_local_usage_records(payload)
     _attach_window_forecasts(payload)
-    payload["summary"] = _ai_usage_summary(payload.get("providers", []))
+    payload["providers"] = _order_usage_cards(payload.get("providers", []))
+    payload["summary"] = _ai_usage_summary(payload["providers"])
     return payload
 
 
@@ -4441,20 +4442,35 @@ def _usage_unsupported_configured() -> List[Dict[str, str]]:
     plugins appear here too. Distinguishes "cannot monitor" from "nothing to
     monitor" on the AI Usage page.
     """
+    credential_keys = _hermes_provider_credential_keys()
     entries: List[Dict[str, str]] = []
     for provider_id in _hermes_configured_provider_ids():
         key = str(provider_id).strip().lower()
         if not key or key in _USAGE_COVERED_PROVIDER_IDS:
             continue
         meta = _MODEL_ROUTE_META.get(key) or {}
-        entries.append({"id": key, "label": str(meta.get("provider") or _humanize_identifier(key))})
-    seen: set[str] = set()
-    unique: List[Dict[str, str]] = []
+        entries.append({
+            "id": key,
+            "label": str(meta.get("provider") or _humanize_identifier(key)),
+            "credential": credential_keys.get(str(provider_id)) or credential_keys.get(key) or key,
+        })
+    # One credential, one entry: the first label alphabetically carries the
+    # count of the other registry endpoints that read the same key.
+    by_credential: Dict[str, List[Dict[str, str]]] = {}
     for entry in sorted(entries, key=lambda item: item["label"].lower()):
-        if entry["label"].lower() in seen:
+        by_credential.setdefault(entry["credential"], []).append(entry)
+    unique: List[Dict[str, str]] = []
+    seen: set[str] = set()
+    for group in sorted(by_credential.values(), key=lambda items: items[0]["label"].lower()):
+        first = group[0]
+        label = first["label"]
+        others = len(group) - 1
+        if others:
+            label = f"{label} (+{others} endpoint{'s' if others != 1 else ''} on the same key)"
+        if label.lower() in seen:
             continue
-        seen.add(entry["label"].lower())
-        unique.append(entry)
+        seen.add(label.lower())
+        unique.append({"id": first["id"], "label": label, "ids": [item["id"] for item in group]})
     return unique
 
 

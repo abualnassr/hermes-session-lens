@@ -2722,7 +2722,7 @@ function UsageAttribution({ window, onDrill }) {
         : 'No local Hermes sessions recorded in this window — the account usage came from elsewhere.'
     })
   }
-  const lead = (attribution.by_project || []).filter(row => !row.other).slice(0, 2)
+  const lead = (attribution.by_project || []).filter(row => !row.other && Number(row.share_percent) >= 0.5).slice(0, 2)
   const headline = lead.map(row => `${row.label} ${Math.round(Number(row.share_percent) || 0)}%`).join(' · ')
   const totals = [
     `${formatCount(attribution.tokens)} tok`,
@@ -2850,6 +2850,41 @@ function UsageWindow({ window, series, onDrill }) {
   })
 }
 
+// A window earns a bar only when something is happening in it. Untouched
+// quota windows and per-minute rate limits each collapse to one sentence, so
+// a card is as tall as its news and no taller.
+function ProviderWindows({ provider, history, onDrill }) {
+  const windows = provider.windows || []
+  const rateLimits = windows.filter(window => window.kind === 'rate_limit')
+  const idle = windows.filter(window => window.kind === 'quota' && !(Number(window.percentage_used) > 0) && !window.forecast?.exhaust_at)
+  const live = windows.filter(window => !rateLimits.includes(window) && !idle.includes(window))
+  const compactStyle = { borderTop: border, color: color.quaternary, fontSize: '0.6875rem', lineHeight: 1.45, padding: '0.6rem 0' }
+  return jsxs('div', {
+    style: { marginTop: '0.65rem' },
+    children: [
+      ...live.map(window => jsx(UsageWindow, { window, series: history?.[`${provider.provider}:${window.id}`], onDrill }, `${provider.provider}-${window.id}`)),
+      idle.length
+        ? jsx('div', {
+            title: 'Quota windows with nothing used yet; each shows its size and when it resets.',
+            style: compactStyle,
+            children: `Untouched: ${idle.map(window => {
+              const size = formatUsageAmount(window.limit, window.unit)
+              const countdown = formatCountdown(window.reset_at)
+              return `${window.label}${size ? ` (${size})` : ''}${countdown ? ` · resets ${countdown}` : ''}`
+            }).join(' · ')}`
+          }, `${provider.provider}-idle`)
+        : null,
+      rateLimits.length
+        ? jsx('div', {
+            title: 'Per-minute rate limits reported by the provider. They reset every minute and say nothing about spend; the ceilings are listed so you know them.',
+            style: compactStyle,
+            children: `Rate limits per minute: ${rateLimits.map(window => `${formatCount(window.limit)} ${String(window.label || '').replace(/\s+per minute$/i, '').toLowerCase()}`).join(' · ')}`
+          }, `${provider.provider}-rate-limits`)
+        : null
+    ]
+  })
+}
+
 function UsageProvider({ ctx, provider, history, onRefresh, onDrill }) {
   const status = usageStatus(provider)
   const messageDanger = ['expired', 'forbidden', 'unavailable'].includes(provider.status)
@@ -2928,7 +2963,7 @@ function UsageProvider({ ctx, provider, history, onRefresh, onDrill }) {
           })
         : null,
       provider.windows?.length
-        ? jsx('div', { style: { marginTop: '0.65rem' }, children: provider.windows.map(window => jsx(UsageWindow, { window, series: history?.[`${provider.provider}:${window.id}`], onDrill }, `${provider.provider}-${window.id}`)) })
+        ? jsx(ProviderWindows, { provider, history, onDrill })
         : jsx('div', {
             style: { borderTop: border, color: color.quaternary, fontSize: '0.75rem', marginTop: '0.75rem', paddingTop: '0.75rem' },
             children: provider.status === 'not_configured'
@@ -3024,7 +3059,7 @@ function AIUsageStatStrip({ data }) {
         value: summary.next_reset_at
           ? (formatCountdown(summary.next_reset_at) || formatShortDate(summary.next_reset_at))
           : '—',
-        detail: summary.next_reset_at ? formatDate(summary.next_reset_at) : 'No timed window reported'
+        detail: summary.next_reset_at ? `${formatDate(summary.next_reset_at)}${summary.next_reset_provider ? ` · ${summary.next_reset_provider} ${summary.next_reset_window || ''}`.trimEnd() : ''}${summary.next_reset_in_use ? '' : ' · nothing used yet'}` : 'No timed window reported'
       }, 'reset'),
       jsx(Metric, {
         label: 'Last refresh',

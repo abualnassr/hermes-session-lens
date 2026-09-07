@@ -1731,6 +1731,104 @@ process.stdout.write(JSON.stringify(out))
         self.assertIsNone(api._quota_exhaust_at("Weekly quota", reset_at, 15))
         self.assertIsNone(api._quota_exhaust_at("Balance", reset_at, 50))
 
+    def test_vendor_noise_is_muted_not_dropped(self):
+        card = api._provider_payload(
+            "grok", status="ok",
+            details=["credit: 0.00", "prepayment: 0.00", "pending costs: 0.00", "Account balance: $7.00",
+                     "Update available: 0.1.6 → 0.1.7. Run `npm update -g @monid-ai/cli`", "Top up: https://portal.example/billing",
+                     "Subscription credits: $0.00", "Month to date: 0.00 USD across 0 runs"],
+        )
+        # "0.00 across 0 runs" is information (nothing ran), not a zero-valued magnitude line.
+        self.assertEqual(card["details"], ["Account balance: $7.00", "Month to date: 0.00 USD across 0 runs"])
+        self.assertEqual(len(card["details_muted"]), 6)
+        service = api._service_payload("brightdata", status="ok", details=["credit: 0.00", "spent: 3.20"])
+        self.assertEqual(service["details"], ["spent: 3.20"])
+        self.assertEqual(service["details_muted"], ["credit: 0.00"])
+
+    def test_usage_cards_are_ordered_by_what_needs_a_look(self):
+        import time as _time
+
+        now = _time.time()
+        week = 7 * 86400
+        def card(provider, status="ok", windows=(), recorded=None, extra=False, base=None):
+            item = api._provider_payload(provider, status=status, windows=list(windows))
+            item["recorded_7d"] = recorded
+            if extra:
+                item["account_extra"] = True
+                item["base_provider"] = base
+                item["provider"] = f"{base}:1"
+            return item
+
+        forecast_window = api._usage_window("Weekly", used_percent=60, reset_at=now + 0.5 * week)
+        forecast_window["forecast"] = {"exhaust_at": now + 86400}
+        cards = [
+            card("kimi", windows=[api._usage_window("Weekly quota", used_percent=0, reset_at=now + week)]),
+            card("deepseek", windows=[api._usage_window("USD balance", kind="balance", remaining=41.98, unit="USD")], recorded={"cost_usd": 3.5}),
+            card("anthropic", windows=[api._usage_window("Current week", used_percent=7, reset_at=now + week)]),
+            card("anthropic", extra=True, base="anthropic", windows=[api._usage_window("Requests per minute", kind="rate_limit", limit=10000, unit="requests")]),
+            card("codex", windows=[forecast_window]),
+            card("grok", status="expired"),
+            card("zai", status="not_configured"),
+            card("openrouter", windows=[api._usage_window("Account credits", kind="balance", remaining=116, unit="USD")], recorded={"cost_usd": 3.1}),
+        ]
+        ordered = [item["provider"] for item in api._order_usage_cards(cards)]
+        self.assertEqual(ordered, ["grok", "codex", "anthropic", "anthropic:1", "deepseek", "openrouter", "kimi", "zai"])
+
+    def test_next_reset_prefers_windows_in_use_and_names_them(self):
+        import time as _time
+
+        now = _time.time()
+        providers = [
+            api._provider_payload("kimi", status="ok", windows=[api._usage_window("5-hour rolling", used_percent=0, reset_at=now + 2700)]),
+            api._provider_payload("codex", status="ok", windows=[api._usage_window("Session", used_percent=7, reset_at=now + 4 * 3600)]),
+        ]
+        summary = api._ai_usage_summary(providers)
+        self.assertEqual(summary["next_reset_provider"], "OpenAI Codex")
+        self.assertEqual(summary["next_reset_window"], "Session")
+        self.assertTrue(summary["next_reset_in_use"])
+        idle_only = api._ai_usage_summary(providers[:1])
+        self.assertEqual(idle_only["next_reset_window"], "5-hour rolling")
+        self.assertFalse(idle_only["next_reset_in_use"])
+
+    def test_unsupported_providers_collapse_on_a_shared_credential(self):
+        ids = ["alibaba", "alibaba-cn", "dashscope", "dashscope-cn", "nvidia"]
+        keys = {"alibaba": "DASHSCOPE_API_KEY", "alibaba-cn": "DASHSCOPE_API_KEY", "dashscope": "DASHSCOPE_API_KEY",
+                "dashscope-cn": "DASHSCOPE_API_KEY", "nvidia": "NVIDIA_API_KEY"}
+        with patch.object(api, "_hermes_configured_provider_ids", return_value=ids), \
+             patch.object(api, "_hermes_provider_credential_keys", return_value=keys):
+            entries = api._usage_unsupported_configured()
+        self.assertEqual(len(entries), 2)
+        grouped = next(entry for entry in entries if len(entry["ids"]) == 4)
+        self.assertIn("(+3 endpoints on the same key)", grouped["label"])
+        self.assertEqual(sorted(grouped["ids"]), ["alibaba", "alibaba-cn", "dashscope", "dashscope-cn"])
+
+    def test_nous_card_leads_with_a_usable_credits_balance(self):
+        from types import SimpleNamespace
+
+        account = SimpleNamespace(
+            logged_in=True,
+            paid_service_access_info=SimpleNamespace(total_usable_credits=7.89, subscription_credits_remaining=0.0, purchased_credits_remaining=7.89),
+            subscription=SimpleNamespace(current_period_end="2026-09-23T09:39:46.000Z", plan="Free"),
+        )
+        base = api._provider_payload(
+            "nous", status="ok",
+            details=["Subscription credits: $0.00", "Top-up credits: $7.89", "Total usable: $7.89",
+                     "Renews: 2026-09-23T09:39:46.000Z", "Top up: https://portal.nousresearch.com/orgs/x/billing", "(or run /topup)"],
+        )
+        card = api._nous_with_balance(base, account)
+        self.assertEqual(card["windows"][0]["label"], "Usable credits")
+        self.assertEqual(card["windows"][0]["kind"], "balance")
+        self.assertEqual(card["windows"][0]["remaining"], 7.89)
+        self.assertIn("$7.89 top-up", card["windows"][0]["detail"])
+        self.assertIn("renews Sep 23, 2026", card["windows"][0]["detail"])
+        self.assertEqual(card["details"], ["(or run /topup)"])
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("function ProviderWindows({ provider, history, onDrill })", source)
+        self.assertIn("Rate limits per minute: ", source)
+        self.assertIn("Untouched: ", source)
+        self.assertIn("Number(row.share_percent) >= 0.5", source)
+        self.assertIn("summary.next_reset_provider", source)
+
     def test_quota_forecast_needs_a_margin_and_names_its_basis(self):
         now = time.time()
         week = 7 * 86400
@@ -2914,7 +3012,7 @@ process.stdout.write(JSON.stringify(out))
         with patch.object(api, "_hermes_configured_provider_ids", return_value=["nvidia"]):
             with _provider_collectors(collectors):
                 payload = api._ai_usage_sync(True)
-        self.assertEqual(payload["hermes_configured_unsupported"], [{"id": "nvidia", "label": "NVIDIA"}])
+        self.assertEqual(payload["hermes_configured_unsupported"], [{"id": "nvidia", "label": "NVIDIA", "ids": ["nvidia"]}])
 
     def test_ai_usage_ui_names_unmonitorable_configured_providers(self):
         source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
@@ -4137,7 +4235,9 @@ process.stdout.write(JSON.stringify(out))
         self.assertEqual(monid["account_spend"]["daily"], 0.5)
         self.assertIn("Month to date: 2.50 USD across 2 runs", monid["details"][0])
         self.assertIn("Top: Apify 2.00 · Exa 0.50", monid["details"][1])
-        self.assertIn("Update available", monid["details"][-1])
+        # Vendor update nags are muted on the card and kept in the export.
+        self.assertFalse(any("Update available" in item for item in monid["details"]))
+        self.assertIn("Update available", monid["details_muted"][-1])
 
     def test_services_sync_flattens_accounts_and_keeps_unreadable_rows(self):
         self._write_services_home()

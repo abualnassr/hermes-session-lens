@@ -63,7 +63,7 @@ def _plugin_version() -> str:
             return match.group(1)
     except OSError:
         pass
-    return "0.40.0"
+    return "0.41.0"
 
 
 PLUGIN_VERSION = _plugin_version()
@@ -253,6 +253,26 @@ _FILE_EXTENSION_RE = re.compile(
     r"markdown|md|mjs|pdf|pptx|ps1|py|rs|rtf|scss|sh|sql|svelte|swift|toml|ts|tsx|txt|"
     r"vue|xls|xlsx|xml|yaml|yml)\b"
 )
+
+
+# Detail lines a card should not spend a row on: zero-valued magnitudes
+# ("credit: 0.00"), vendor update nags, and raw URLs. They stay in the
+# payload under details_muted, so the JSON export keeps every line the
+# vendor sent; only the card hides them.
+_NOISE_DETAIL_PATTERNS = (
+    re.compile(r"^[A-Za-z][\w /.\-]*:\s*(?:\$|USD\s*)?0(?:[.,]0+)?(?:\s*(?:USD|credits?|runs?))?\s*$", re.I),
+    re.compile(r"update available|npm (?:update|install)|new version|please upgrade", re.I),
+    re.compile(r"https?://", re.I),
+)
+
+
+def _split_noise_details(details: List[str]) -> Tuple[List[str], List[str]]:
+    kept: List[str] = []
+    muted: List[str] = []
+    for item in details:
+        text = str(item)
+        (muted if any(pattern.search(text) for pattern in _NOISE_DETAIL_PATTERNS) else kept).append(text)
+    return kept, muted
 
 
 def _file_references(text: str) -> List[str]:

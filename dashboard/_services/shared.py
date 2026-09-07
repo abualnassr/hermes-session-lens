@@ -73,6 +73,9 @@ def _service_payload(
     adapter = _service_adapters().get(service)
     label = adapter.label if adapter else _service_label_from_id(service)
     auth_source = adapter.auth_source if adapter else "Hermes .env key"
+    kept_details, muted_details = _split_noise_details(
+        [_clean_text(item, 320) for item in (details or []) if _clean_text(item, 320)]
+    )
     return {
         "provider": f"{service}:{account}" if account else service,
         "base_provider": service,
@@ -84,7 +87,8 @@ def _service_payload(
         "auth_source": auth_source,
         "plan": _clean_text(plan, 120) or None,
         "windows": windows or [],
-        "details": [_clean_text(item, 320) for item in (details or []) if _clean_text(item, 320)],
+        "details": kept_details,
+        "details_muted": muted_details,
         "message": _clean_text(message, 240) or None,
         "partial": bool(partial),
         "stale": False,
