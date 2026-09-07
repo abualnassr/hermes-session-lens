@@ -1456,7 +1456,7 @@ function SessionDetail({ query, detailTab, setDetailTab, ctx, period, profile, o
                   }),
                   jsx('div', {
                     style: { color: color.tertiary, fontSize: '0.6875rem', marginTop: '0.2rem' },
-                    children: `${formatDate(session.started_at)} · ${session.model || 'model not recorded'}`
+                    children: `${formatDate(session.started_at)} · ${session.model || 'model not recorded'}${session.hidden ? ' · hidden from the Hermes sidebar' : ''}`
                   })
                 ]
               })
@@ -1841,14 +1841,14 @@ function useDebounced(value, delay) {
 // ============================================================================
 
 function DailyBars({ rows }) {
-  if (!rows?.length) return jsx(EmptyState, { title: 'No daily activity', description: 'No sessions were recorded in this period.' })
+  if (!rows?.length) return jsx(EmptyState, { title: 'No daily activity', description: 'No session was active in this period.' })
   const max = Math.max(...rows.map(row => Number(row.total_tokens) || 0), 1)
   return jsx('div', {
     style: { alignItems: 'end', borderBottom: border, display: 'flex', gap: '0.25rem', height: '11rem', overflowX: 'auto', padding: '0.75rem 0.25rem 0' },
     children: rows.map(row => {
       const height = Math.max(3, ((Number(row.total_tokens) || 0) / max) * 100)
       return jsxs('div', {
-        title: `${row.day}: ${formatCount(row.total_tokens)} tokens · ${row.sessions} sessions · ${formatCost(row.cost_usd, 'estimated')}`,
+        title: `${row.day}: ${formatCount(row.total_tokens)} tokens · ${row.sessions} sessions last active this day · ${formatCost(row.cost_usd, 'estimated')}`,
         style: { alignItems: 'center', display: 'flex', flex: '1 0 0.8rem', flexDirection: 'column', height: '100%', justifyContent: 'end', minWidth: '0.55rem' },
         children: [
           jsx('div', {
@@ -1886,7 +1886,7 @@ function ProjectsSection({ ctx, period }) {
     children: [
       jsx(SectionHeading, {
         title: 'Where the spend goes',
-        description: `Sessions rolled up by git repository, then working directory, then source. ${formatCount(totals.sessions_without_directory)} of ${formatCount(totals.sessions)} sessions record no directory and group by source.`
+        description: `Sessions active in the period, rolled up by git repository, then working directory, then source; with several profiles in scope, each profile keeps its own rows. ${formatCount(totals.sessions_without_directory)} of ${formatCount(totals.sessions)} sessions record no directory and group by source. Sessions hidden from the Hermes sidebar count too — hiding is a listing preference, not a refund.`
       }),
       jsx(SimpleTable, {
         columns: [

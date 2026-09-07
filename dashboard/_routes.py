@@ -235,7 +235,7 @@ def _list_sessions_sync(
     with _database() as db:
         snippets = _search_hits(db, free_text) if free_text else {}
         params: List[Any] = list(period_params)
-        where = [period_sql, "coalesce(s.hidden, 0) = 0"]
+        where = [period_sql]
         if not include_archived:
             where.append("coalesce(s.archived, 0) = 0")
         from_where = f"""
@@ -251,7 +251,7 @@ def _list_sessions_sync(
                    s.billing_mode, s.estimated_cost_usd, s.actual_cost_usd,
                    s.cost_status, s.cost_source, s.title, s.last_activity_at,
                    s.last_activity_description, s.api_call_count, s.profile_name,
-                   s.archived, s.pinned
+                   s.archived, s.pinned, s.hidden
             """
         if getattr(db, "union_profiles", None):
             select_sql = select_sql.rstrip() + ", s.__profile "
@@ -957,7 +957,7 @@ def _digest_period_totals(
                                      WHEN coalesce(estimated_cost_usd,0) > 0 THEN estimated_cost_usd
                                      ELSE 0 END),0) AS recorded_cost_usd
             FROM sessions
-            WHERE {session_sql} AND coalesce(hidden,0)=0
+            WHERE {session_sql}
             """,
             tuple(session_params),
         ).fetchone()
@@ -966,13 +966,13 @@ def _digest_period_totals(
     tool_calls = connection.execute(
         f"""
         SELECT COUNT(*) FROM messages m JOIN sessions s ON s.id=m.session_id
-        WHERE {joined_sql} AND coalesce(s.hidden,0)=0
+        WHERE {joined_sql}
           AND coalesce(m.active,1)=1 AND m.role='tool'
         """,
         tuple(joined_params),
     ).fetchone()[0]
     failure_rows = _confirmed_failure_rows(
-        connection, joined_sql + " AND coalesce(s.hidden,0)=0", joined_params
+        connection, joined_sql, joined_params
     )
     tool_failures = sum(1 for item in failure_rows if str(item.get("role") or "").lower() == "tool")
     return {
@@ -1255,7 +1255,7 @@ def _digest_sync(
                 f"""
                 SELECT u.model, coalesce(SUM(u.api_call_count),0) AS requests
                 FROM session_model_usage u JOIN sessions s ON s.id=u.session_id
-                WHERE {prev_sql} AND coalesce(s.hidden,0)=0
+                WHERE {prev_sql}
                 GROUP BY u.model
                 """,
                 tuple(prev_params),
@@ -1544,6 +1544,10 @@ def _projects_sync(
     joined_sql, joined_params = _period_sql("s.started_at", period_start, period_end)
     with _database() as db:
         connection = _db_connection(db)
+        # Several profiles share one table here, and a bot profile's sessions
+        # would otherwise merge into another profile's "desktop · no recorded
+        # directory" row; name the profile so each keeps its own rows.
+        profile_column = ", __profile AS profile" if getattr(db, "union_profiles", None) else ""
         rows = [
             _row_dict(row)
             for row in connection.execute(
@@ -1551,15 +1555,15 @@ def _projects_sync(
                 SELECT id, source, model, git_repo_root, cwd, started_at,
                        last_activity_at, input_tokens, output_tokens,
                        cache_read_tokens, cache_write_tokens,
-                       estimated_cost_usd, actual_cost_usd, cost_status
+                       estimated_cost_usd, actual_cost_usd, cost_status{profile_column}
                 FROM sessions
-                WHERE {session_sql} AND coalesce(hidden,0)=0
+                WHERE {session_sql}
                 """,
                 tuple(session_params),
             ).fetchall()
         ]
         failure_counts = _confirmed_failure_counts(
-            connection, joined_sql + " AND coalesce(s.hidden,0)=0", joined_params
+            connection, joined_sql, joined_params
         )
 
     groups: Dict[str, Dict[str, Any]] = {}
@@ -1579,13 +1583,17 @@ def _projects_sync(
             label = f"{source} · no recorded directory"
         if kind != "source":
             with_directory += 1
-        key = f"{kind}|{(path or label).lower()}"
+        profile = str(session.get("profile") or "").strip()
+        if profile:
+            label = f"{profile} · {label}"
+        key = f"{profile.lower()}|{kind}|{(path or label).lower()}"
         group = groups.setdefault(
             key,
             {
                 "kind": kind,
                 "label": label,
                 "path": path or None,
+                "profile": profile or None,
                 "sessions": 0,
                 "total_tokens": 0,
                 "recorded_cost_usd": 0.0,
@@ -1685,7 +1693,7 @@ def _agent_runs_sync(
                        cache_read_tokens, cache_write_tokens,
                        estimated_cost_usd, actual_cost_usd, cost_status, cost_source
                 FROM sessions
-                WHERE {session_sql} AND coalesce(hidden,0)=0 AND source='cron'
+                WHERE {session_sql} AND source='cron'
                 ORDER BY started_at DESC
                 """,
                 tuple(session_params),
@@ -1833,7 +1841,6 @@ def _compression_sync() -> Dict[str, Any]:
                        SUM(CASE WHEN {error_expr} IS NOT NULL THEN 1 ELSE 0 END) AS failed_sessions,
                        SUM(CASE WHEN {cooldown_expr} > ? THEN 1 ELSE 0 END) AS cooldown_sessions
                 FROM sessions
-                WHERE coalesce(hidden,0)=0
                 """,
                 (now,),
             ).fetchone()
@@ -1848,8 +1855,7 @@ def _compression_sync() -> Dict[str, Any]:
                        {error_expr} AS failure_error,
                        {cooldown_expr} AS cooldown_until
                 FROM sessions
-                WHERE coalesce(hidden,0)=0
-                  AND ({streak_expr} > 0 OR {ineffective_expr} > 0 OR {error_expr} IS NOT NULL)
+                  WHERE ({streak_expr} > 0 OR {ineffective_expr} > 0 OR {error_expr} IS NOT NULL)
                 ORDER BY {streak_expr} + {ineffective_expr} DESC
                 LIMIT 5
                 """
@@ -1973,8 +1979,7 @@ def _attention_sync(
                        cache_write_tokens, estimated_cost_usd, actual_cost_usd,
                        cost_status, cost_source
                 FROM sessions
-                WHERE coalesce(hidden,0)=0
-                  AND (
+                  WHERE (
                     ended_at IS NULL
                     OR lower(coalesce(end_reason,'')) IN ({reaped_placeholders})
                   )
@@ -2136,7 +2141,7 @@ def _overview_sync(
                    coalesce(SUM(CASE WHEN lower(coalesce(cost_status,'')) IN ('included','subscription','free') THEN 1 ELSE 0 END),0) AS included_cost_sessions,
                     coalesce(SUM(CASE WHEN coalesce(actual_cost_usd,0) <= 0 AND coalesce(estimated_cost_usd,0) <= 0 AND lower(coalesce(cost_status,'')) NOT IN ('included','subscription','free') THEN 1 ELSE 0 END),0) AS unpriced_sessions
             FROM sessions
-            WHERE {session_period_sql} AND coalesce(hidden,0)=0
+            WHERE {session_period_sql}
             """,
             tuple(session_period_params),
         ).fetchone()
@@ -2144,7 +2149,7 @@ def _overview_sync(
         totals["failures"] = sum(
             _confirmed_failure_counts(
                 _db_connection(db),
-                joined_period_sql + " AND coalesce(s.hidden,0)=0",
+                joined_period_sql,
                 joined_period_params,
             ).values()
         )
@@ -2167,7 +2172,7 @@ def _overview_sync(
             _row_dict(row)
             for row in _db_connection(db).execute(
                 f"""
-                SELECT date(started_at, 'unixepoch', 'localtime') AS day,
+                SELECT date(coalesce(last_activity_at, ended_at, started_at), 'unixepoch', 'localtime') AS day,
                        COUNT(*) AS sessions,
                        coalesce(SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens),0) AS total_tokens,
                        coalesce(SUM(tool_call_count),0) AS tool_calls,
@@ -2176,7 +2181,7 @@ def _overview_sync(
                            WHEN estimated_cost_usd > 0 THEN estimated_cost_usd
                            ELSE 0 END),0) AS cost_usd
                 FROM sessions
-                WHERE {session_period_sql} AND coalesce(hidden,0)=0
+                WHERE {session_period_sql}
                 GROUP BY day ORDER BY day
                 """,
                 tuple(session_period_params),
@@ -2198,7 +2203,7 @@ def _overview_sync(
                        SUM(CASE WHEN lower(coalesce(u.cost_status,'')) IN ('included','subscription','free') THEN 1 ELSE 0 END) AS included_rows
                 FROM session_model_usage u
                 JOIN sessions s ON s.id = u.session_id
-                WHERE {joined_period_sql} AND coalesce(s.hidden,0)=0
+                WHERE {joined_period_sql}
                 GROUP BY u.model, u.billing_provider
                 ORDER BY total_tokens DESC LIMIT 30
                 """,
@@ -2219,7 +2224,7 @@ def _overview_sync(
                        SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens) AS total_tokens,
                        SUM(tool_call_count) AS tool_calls
                 FROM sessions
-                WHERE {session_period_sql} AND coalesce(hidden,0)=0
+                WHERE {session_period_sql}
                 GROUP BY source ORDER BY sessions DESC
                 """,
                 tuple(session_period_params),
@@ -2230,7 +2235,7 @@ def _overview_sync(
             f"""
             SELECT end_reason, ended_at, last_activity_at, started_at
             FROM sessions
-            WHERE {session_period_sql} AND coalesce(hidden,0)=0
+            WHERE {session_period_sql}
             """,
             tuple(session_period_params),
         ).fetchall():
@@ -2563,7 +2568,7 @@ def _ai_models_payload_sync(
                        s.cost_status, s.cost_source, s.message_count,
                        {rewind_expr} AS rewind_count
                 FROM sessions s
-                WHERE {period_sql} AND coalesce(s.hidden,0)=0
+                WHERE {period_sql}
                 """,
                 tuple(period_params),
             ).fetchall()
@@ -2587,7 +2592,7 @@ def _ai_models_payload_sync(
                            u.cost_status, u.cost_source, u.first_seen, u.last_seen
                     FROM session_model_usage u
                     JOIN sessions s ON s.id=u.session_id
-                    WHERE {period_sql} AND coalesce(s.hidden,0)=0
+                    WHERE {period_sql}
                     """,
                     tuple(period_params),
                 ).fetchall()
@@ -2601,7 +2606,6 @@ def _ai_models_payload_sync(
                            MAX(coalesce(u.last_seen, s.last_activity_at, s.started_at)) AS last_seen
                     FROM session_model_usage u
                     JOIN sessions s ON s.id=u.session_id
-                    WHERE coalesce(s.hidden,0)=0
                     GROUP BY u.model, u.billing_provider, {base_url_expr}, u.billing_mode
                     """
                 ).fetchall()
@@ -2615,7 +2619,7 @@ def _ai_models_payload_sync(
                 SELECT model, billing_provider, billing_base_url, billing_mode,
                        MAX(coalesce(last_activity_at, started_at)) AS last_seen
                 FROM sessions
-                WHERE coalesce(hidden,0)=0 AND model IS NOT NULL AND trim(model) != ''
+                WHERE model IS NOT NULL AND trim(model) != ''
                 GROUP BY model, billing_provider, billing_base_url, billing_mode
                 """
             ).fetchall()
@@ -2667,7 +2671,7 @@ def _ai_models_payload_sync(
         confirmed_failure_rows = (
             _confirmed_failure_rows(
                 connection,
-                period_sql + " AND coalesce(s.hidden,0)=0",
+                period_sql,
                 period_params,
             )
             if session_rows
@@ -2691,7 +2695,7 @@ def _ai_models_payload_sync(
                     SELECT m.session_id, m.timestamp
                     FROM messages m
                     JOIN sessions s ON s.id=m.session_id
-                    WHERE {period_sql} AND coalesce(s.hidden,0)=0
+                    WHERE {period_sql}
                       AND coalesce(m.active,1)=1 AND m.role='tool'
                     """,
                     tuple(period_params),
@@ -3566,7 +3570,7 @@ def _context_weight_by_tool(
         f"""
         SELECT m.session_id, m.id
         FROM messages m JOIN sessions s ON s.id=m.session_id
-        WHERE {period_sql} AND coalesce(s.hidden,0)=0 AND m.role='assistant'
+        WHERE {period_sql} AND m.role='assistant'
         ORDER BY m.id DESC LIMIT {_CONTEXT_SCAN_ROW_CAP + 1}
         """,
         tuple(period_params),
@@ -3576,7 +3580,7 @@ def _context_weight_by_tool(
         SELECT m.session_id, m.id, m.tool_name, length(m.content) AS chars,
                s.model, s.billing_provider, s.billing_base_url, s.billing_mode, s.cost_status
         FROM messages m JOIN sessions s ON s.id=m.session_id
-        WHERE {period_sql} AND coalesce(s.hidden,0)=0 AND m.role='tool'
+        WHERE {period_sql} AND m.role='tool'
           AND m.tool_name IS NOT NULL AND m.content IS NOT NULL
         ORDER BY m.id DESC LIMIT {_CONTEXT_SCAN_ROW_CAP + 1}
         """,
@@ -3691,7 +3695,7 @@ def _tools_sync(
             SELECT m.session_id, m.tool_calls, m.timestamp
             FROM messages m
             JOIN sessions s ON s.id=m.session_id
-            WHERE {period_sql} AND coalesce(s.hidden,0)=0
+            WHERE {period_sql}
               AND coalesce(m.active,1)=1 AND m.role='assistant'
               AND m.tool_calls IS NOT NULL
             ORDER BY m.id DESC LIMIT 50001
@@ -3727,7 +3731,7 @@ def _tools_sync(
                    MAX(m.timestamp) AS last_used_at
             FROM messages m
             JOIN sessions s ON s.id=m.session_id
-            WHERE {period_sql} AND coalesce(s.hidden,0)=0
+            WHERE {period_sql}
               AND coalesce(m.active,1)=1 AND m.role='tool'
               AND m.tool_name IS NOT NULL
             GROUP BY m.tool_name
@@ -3738,7 +3742,7 @@ def _tools_sync(
         failures_by_tool: Counter[str] = Counter()
         for failure in _confirmed_failure_rows(
             _db_connection(db),
-            period_sql + " AND coalesce(s.hidden,0)=0",
+            period_sql,
             period_params,
         ):
             tool_name = str(failure.get("tool_name") or "").strip()
@@ -3920,7 +3924,7 @@ def _skills_sync(
             SELECT m.session_id, m.tool_calls, m.timestamp
             FROM messages m
             JOIN sessions s ON s.id=m.session_id
-            WHERE {period_sql} AND coalesce(s.hidden,0)=0
+            WHERE {period_sql}
               AND m.role='assistant' AND m.tool_calls IS NOT NULL
               AND (instr(m.tool_calls,'skill_view') > 0 OR instr(m.tool_calls,'skill_manage') > 0)
             ORDER BY m.timestamp DESC
@@ -4017,7 +4021,7 @@ def _profile_summary(
                            WHEN estimated_cost_usd > 0 THEN estimated_cost_usd
                            ELSE 0 END),0) AS recorded_cost_usd,
                        MAX(coalesce(last_activity_at, started_at)) AS last_activity_at
-                FROM sessions WHERE {period_sql} AND coalesce(hidden,0)=0
+                FROM sessions WHERE {period_sql}
                 """,
                 tuple(period_params),
             ).fetchone()
@@ -4026,7 +4030,7 @@ def _profile_summary(
         for row in connection.execute(
             f"""
             SELECT end_reason, ended_at, last_activity_at, started_at
-            FROM sessions WHERE {period_sql} AND coalesce(hidden,0)=0
+            FROM sessions WHERE {period_sql}
             """,
             tuple(period_params),
         ).fetchall():
@@ -4036,7 +4040,7 @@ def _profile_summary(
             for row in connection.execute(
                 f"""
                 SELECT model, COUNT(*) AS sessions FROM sessions
-                WHERE {period_sql} AND coalesce(hidden,0)=0
+                WHERE {period_sql}
                 GROUP BY model ORDER BY sessions DESC LIMIT 5
                 """,
                 tuple(period_params),
@@ -4468,7 +4472,6 @@ def _usage_attribution_rows(provider: str, since: float) -> List[Dict[str, Any]]
                    SUM(CASE WHEN u.actual_cost_usd > 0 THEN u.actual_cost_usd ELSE u.estimated_cost_usd END) AS cost_usd
             FROM session_model_usage u JOIN sessions s ON s.id = u.session_id
             WHERE LOWER(u.billing_provider) IN ({placeholders})
-              AND coalesce(s.hidden, 0) = 0
               AND COALESCE(u.last_seen, u.first_seen, s.last_activity_at, s.started_at, 0) >= ?
             GROUP BY u.session_id, u.model
             """,

@@ -63,7 +63,7 @@ def _plugin_version() -> str:
             return match.group(1)
     except OSError:
         pass
-    return "0.35.0"
+    return "0.36.0"
 
 
 PLUGIN_VERSION = _plugin_version()
@@ -342,7 +342,19 @@ def _period_sql(
     start_at: float,
     end_at: Optional[float],
 ) -> Tuple[str, List[float]]:
-    clauses = [f"{column} >= ?"]
+    """SQL for the sessions active in a period.
+
+    `column` names the session start column (`started_at` or `s.started_at`);
+    the same alias reaches last_activity_at and ended_at. A session counts
+    when it was last active at or after the period start and started before
+    the period end — so a bot session that began days ago and is still
+    running lands in every period it touches. Hermes records usage per
+    session, not per day, so a session that straddles a boundary counts
+    whole; the views say "sessions active in the period" for that reason.
+    """
+    prefix = column[: len(column) - len("started_at")] if column.endswith("started_at") else ""
+    last_active = f"coalesce({prefix}last_activity_at, {prefix}ended_at, {prefix}started_at)"
+    clauses = [f"{last_active} >= ?"]
     params = [start_at]
     if end_at is not None:
         clauses.append(f"{column} < ?")

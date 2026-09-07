@@ -659,6 +659,65 @@ class SessionLensApiTests(unittest.TestCase):
         payload = api._system_sync()
         self.assertEqual(payload["privacy"]["route_budget_seconds"], 30.0)
 
+    def test_hidden_sessions_count_and_are_labelled(self):
+        connection = sqlite3.connect(self.db_path)
+        connection.execute("UPDATE sessions SET hidden=1 WHERE id='session-1'")
+        connection.commit()
+        connection.close()
+        overview = api._overview_sync(0)
+        self.assertEqual(overview["totals"]["sessions"], 1)
+        self.assertEqual(sum(row["sessions"] for row in overview["daily"]), 1)
+        listing = api._list_sessions_sync(
+            days=0, query="", sort="recent", failures_only=False,
+            include_archived=False, limit=50, offset=0,
+        )
+        self.assertEqual([item["id"] for item in listing["sessions"]], ["session-1"])
+        self.assertTrue(listing["sessions"][0]["hidden"])
+        projects = api._projects_sync(0)
+        self.assertEqual(sum(group["sessions"] for group in projects["projects"]), 1)
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("hidden from the Hermes sidebar", source)
+
+    def test_period_holds_the_sessions_active_in_it(self):
+        import time
+
+        now = time.time()
+        connection = sqlite3.connect(self.db_path)
+        connection.execute(
+            """
+            INSERT INTO sessions (id, source, model, started_at, last_activity_at, ended_at, input_tokens, output_tokens, message_count)
+            VALUES ('long-bot', 'desktop', 'provider/model-a', ?, ?, NULL, 5000, 500, 40),
+                   ('old-done', 'desktop', 'provider/model-a', ?, ?, ?, 7000, 700, 12)
+            """,
+            (now - 40 * 86400, now - 5 * 86400, now - 45 * 86400, now - 44 * 86400, now - 44 * 86400),
+        )
+        connection.commit()
+        connection.close()
+        overview = api._overview_sync(30)
+        ids_in_period = {
+            item["id"]
+            for item in api._list_sessions_sync(
+                days=30, query="", sort="recent", failures_only=False,
+                include_archived=False, limit=50, offset=0,
+            )["sessions"]
+        }
+        self.assertIn("long-bot", ids_in_period)
+        self.assertNotIn("old-done", ids_in_period)
+        self.assertEqual(overview["totals"]["sessions"], len(ids_in_period))
+        period_start_day = time.strftime("%Y-%m-%d", time.localtime(now - 30 * 86400))
+        self.assertTrue(all(row["day"] >= period_start_day for row in overview["daily"]))
+        self.assertEqual(sum(row["sessions"] for row in overview["daily"]), overview["totals"]["sessions"])
+
+    def test_all_profiles_rollup_keeps_each_profiles_rows(self):
+        self._make_beta_profile()
+        single = api._projects_sync(0)
+        self.assertTrue(all(" · " not in group["label"] or "no recorded directory" in group["label"] for group in single["projects"]))
+        self.assertTrue(all(group.get("profile") is None for group in single["projects"]))
+        merged = api._scoped_call("all", api._projects_sync, 0)
+        profiles = sorted(group["profile"] for group in merged["projects"])
+        self.assertEqual(profiles, ["beta", "default"])
+        self.assertTrue(all(group["label"].startswith(f"{group['profile']} · ") for group in merged["projects"]))
+
     def test_profile_scope_search_and_query_syntax_span_profiles(self):
         self._make_beta_profile()
         list_kwargs = dict(
@@ -3454,7 +3513,9 @@ process.stdout.write(JSON.stringify(out))
         self.assertEqual(len(api._skills_sync(0, start, end)["skills"]), 1)
         self.assertEqual(api._profiles_sync(0, start, end)["totals"]["sessions"], 1)
 
-        outside_start = 1_800_000_001
+        # session-1 was last active at 1_800_000_120; a window that opens
+        # after that moment holds no active session.
+        outside_start = 1_800_000_121
         outside_end = 1_800_001_000
         self.assertEqual(api._overview_sync(0, outside_start, outside_end)["totals"]["sessions"], 0)
         self.assertEqual(api._tools_sync(0, outside_start, outside_end)["tools"], [])
