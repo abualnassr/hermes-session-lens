@@ -4155,7 +4155,7 @@ function RulesView({ ctx, period, onDrill, rules, onRulesChange, availableProfil
   useEffect(() => { ctx.storage.set(RULES_MIN_SAMPLES_KEY, minSamples) }, [ctx, minSamples])
   const templatesQuery = useQuery({
     queryKey: [PLUGIN_ID, 'rules-templates', activeProfilesParam],
-    queryFn: () => pluginRest(ctx, '/rules/templates'),
+    queryFn: () => pluginRest(ctx, apiPath('/rules/templates')),
     staleTime: Infinity
   })
   const catalog = templatesQuery.data?.conditions ? templatesQuery.data : null
@@ -4405,7 +4405,7 @@ function SessionLensPage({ ctx }) {
   })
   const aiUsageQuery = useQuery({
     queryKey: [PLUGIN_ID, 'ai-usage', activeProfilesParam],
-    queryFn: () => pluginRest(ctx, '/ai-usage'),
+    queryFn: () => pluginRest(ctx, apiPath('/ai-usage')),
     enabled: tab === 'ai-usage' || tab === 'ai-models',
     refetchInterval: tab === 'ai-usage' || tab === 'ai-models' ? 300_000 : false
   })
@@ -4503,7 +4503,7 @@ function SessionLensPage({ ctx }) {
       }
     }
     try {
-      const data = await pluginRest(ctx, '/ai-usage?fresh=true')
+      const data = await pluginRest(ctx, apiPath('/ai-usage', { fresh: true }))
       queryClient.setQueryData([PLUGIN_ID, 'ai-usage'], data)
     } catch (error) {
       refreshErrors.push(`OAuth quotas: ${error?.message || String(error || 'the backend did not return data')}`)

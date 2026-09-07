@@ -726,6 +726,14 @@ class SessionLensApiTests(unittest.TestCase):
         for name in ("budgets", "ai-usage"):
             self.assertIn(f"queryKey: [PLUGIN_ID, '{name}', activeProfilesParam", source, name)
         self.assertIn("apiPath('/ai-usage', { fresh: true, provider })", source)
+        # Every scoped route is requested through apiPath, which appends the
+        # profile scope; a bare path silently reads the serving profile.
+        self.assertIn("pluginRest(ctx, apiPath('/ai-usage'))", source)
+        self.assertIn("pluginRest(ctx, apiPath('/ai-usage', { fresh: true }))", source)
+        self.assertIn("pluginRest(ctx, apiPath('/budgets'))", source)
+        for path in ("/ai-usage", "/budgets", "/overview", "/ai-models", "/projects", "/tools", "/skills", "/rules/templates"):
+            self.assertNotIn(f"pluginRest(ctx, '{path}'", source, path)
+            self.assertNotIn(f"pluginRest(ctx, '{path}?", source, path)
         for name in ("services", "gateway", "schedules", "health"):
             self.assertNotIn(f"queryKey: [PLUGIN_ID, '{name}', activeProfilesParam", source, name)
 
