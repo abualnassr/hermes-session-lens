@@ -1205,7 +1205,7 @@ class SessionLensApiTests(unittest.TestCase):
              patch.object(api, "_budgets_sync", return_value=budgets_payload) as budgets_sync:
             payload = api._digest_sync(7, budgets="openrouter:150, all:300")
         services_sync.assert_called_once_with()
-        budgets_sync.assert_called_once_with({"openrouter": 150.0, "all": 300.0})
+        budgets_sync.assert_called_once_with({"openrouter": 150.0, "all": 300.0}, {})
         markdown = payload["markdown"]
 
         # Budgets: one line per entry plus the total, cap status in words, before quota windows.
@@ -1281,7 +1281,7 @@ class SessionLensApiTests(unittest.TestCase):
         # The definition plus the Overview and AI Usage call sites.
         self.assertEqual(source.count("digestExportItem(ctx, period)"), 3)
         # The views that gained a period-stamped filename receive the period from the page.
-        self.assertIn("function AIUsageView({ ctx, query, servicesQuery, narrow, refreshError, history, onRefreshProvider, onRefreshService, onDrill, budgets, onBudgetsChange, period })", source)
+        self.assertIn("function AIUsageView({ ctx, query, servicesQuery, narrow, refreshError, history, ledger, onRefreshProvider, onRefreshService, onDrill, budgets, onBudgetsChange, period })", source)
         self.assertIn("function AIModelsView({ query, quotaQuery, narrow, refreshError, onDrill, period })", source)
         self.assertEqual(source.count("jsx(AIUsageView, {\n    period,"), 1)
         self.assertEqual(source.count("jsx(AIModelsView, {\n    period,"), 1)
@@ -1731,6 +1731,47 @@ process.stdout.write(JSON.stringify(out))
         self.assertIsNone(api._quota_exhaust_at("Weekly quota", reset_at, 15))
         self.assertIsNone(api._quota_exhaust_at("Balance", reset_at, 50))
 
+    def test_balance_ledger_feeds_budgets_as_the_providers_own_figure(self):
+        import json
+        import time as _time
+
+        now = _time.time()
+        raw = json.dumps([
+            {"p": "deepseek", "s": 3.51, "t": 0, "a": now - 3 * 86400, "l": now - 600},
+            {"p": "nous", "s": 0.4, "t": 10.0, "a": now - 10 * 3600, "l": now - 60},
+            {"p": "bad provider!", "s": 1, "a": now, "l": now},
+            {"p": "monid", "s": -2, "a": now, "l": now},
+            {"p": "brightdata", "s": 1, "a": now, "l": now - 10},
+        ])
+        ledger = api._parse_balances_param(raw)
+        self.assertEqual(sorted(ledger), ["deepseek", "nous"])
+        self.assertEqual(ledger["nous"]["topped_up"], 10.0)
+        self.assertEqual(api._parse_balances_param("not json"), {})
+        self.assertEqual(api._parse_balances_param(""), {})
+
+        payload = api._budgets_sync({}, ledger)
+        deepseek = next(item for item in payload["entries"] if item["id"] == "deepseek")
+        self.assertEqual(deepseek["spend_source"], "balance")
+        self.assertAlmostEqual(deepseek["spend_usd"], 3.51, places=2)
+        # Pace is the drawdown over the span the ledger covers: ~3 days here.
+        self.assertAlmostEqual(deepseek["pace_daily_usd"], 3.51 / 3, delta=0.02)
+        self.assertGreater(deepseek["projected_usd"], deepseek["spend_usd"])
+        nous = next(item for item in payload["entries"] if item["id"] == "nous")
+        self.assertEqual(nous["balance_topped_up_usd"], 10.0)
+        # A span under a day paces as one day, never as one afternoon.
+        self.assertAlmostEqual(nous["pace_daily_usd"], 0.4, places=4)
+        self.assertEqual(payload["total"]["spend_source"], "mixed")
+
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("function recordBalanceReading(ledger, provider, unit, value, t)", source)
+        self.assertIn("ctx.storage.get('balanceLedger')", source)
+        self.assertIn("merged.balances = activeBalancesParam", source)
+        self.assertIn("'balance drawdown'", source)
+        self.assertIn("function balanceLedgerLine(entry)", source)
+        # The backend orders the cards; the desktop no longer re-sorts them.
+        self.assertIn("const orderedProviders = configured", source)
+        self.assertNotIn("[...configured].sort(", source)
+
     def test_vendor_noise_is_muted_not_dropped(self):
         card = api._provider_payload(
             "grok", status="ok",
@@ -1823,7 +1864,7 @@ process.stdout.write(JSON.stringify(out))
         self.assertIn("renews Sep 23, 2026", card["windows"][0]["detail"])
         self.assertEqual(card["details"], ["(or run /topup)"])
         source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
-        self.assertIn("function ProviderWindows({ provider, history, onDrill })", source)
+        self.assertIn("function ProviderWindows({ provider, history, ledger, onDrill })", source)
         self.assertIn("Rate limits per minute: ", source)
         self.assertIn("Untouched: ", source)
         self.assertIn("Number(row.share_percent) >= 0.5", source)
@@ -2265,7 +2306,7 @@ process.stdout.write(JSON.stringify(out))
         source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
         self.assertIn("provider.links?.length", source)
         self.assertIn("openExternalLink(ctx, link.url)", source)
-        self.assertIn("function UsageProvider({ ctx, provider, history, onRefresh, onDrill })", source)
+        self.assertIn("function UsageProvider({ ctx, provider, history, ledger, onRefresh, onDrill })", source)
 
     def test_grok_missing_percent_in_a_confirmed_weekly_period_is_zero_used(self):
         # The exact shape xAI returned on 2026-09-04 for a unified-billing account:
@@ -4105,7 +4146,7 @@ process.stdout.write(JSON.stringify(out))
     def test_attention_payload_carries_budget_notes(self):
         with patch.object(api, "_budget_attention_notes", return_value=[{"id": "budget:all:2026-09"}]) as notes:
             payload = api._attention_sync(0, budgets="all:1")
-        notes.assert_called_once_with("all:1")
+        notes.assert_called_once_with("all:1", "")
         self.assertEqual(payload["budgets"], [{"id": "budget:all:2026-09"}])
         routes = {route.path for route in api.router.routes}
         self.assertIn("/budgets", routes)

@@ -79,6 +79,7 @@ const pageTabs = [
 // profile) wins over the page-wide scope.
 let activeProfilesParam = ''
 let activeBudgetsParam = ''
+let activeBalancesParam = ''
 
 // Enabled instruction rules as JSON, sent only with /digest so the weekly
 // digest can grade them; the Rules tab sends its own copy to /rules.
@@ -88,6 +89,7 @@ function apiPath(path, params = {}) {
   const merged = { ...params }
   if (activeProfilesParam) merged.profiles = activeProfilesParam
   if (activeBudgetsParam) merged.budgets = activeBudgetsParam
+  if (activeBalancesParam && (path === '/budgets' || path === '/attention' || path === '/digest')) merged.balances = activeBalancesParam
   if (activeRulesParam && path === '/digest') merged.rules = activeRulesParam
   const query = Object.entries(merged)
     .filter(([, value]) => value !== undefined && value !== null && value !== '')
@@ -112,6 +114,54 @@ async function pluginRest(ctx, path, options) {
 // A query that is neither loading nor failed can still have no data: React
 // Query pauses fetches while the app believes it is offline, and a reset
 // query sits idle until its next fetch. Treat both as "still waiting".
+// Balance ledger: providers that report a balance rather than spend reveal
+// what they cost only by how far the balance falls between readings. One
+// entry per provider per month: the first and last reading, the sum of the
+// falls (spent) and of the rises (topped up). Stored in this desktop's plugin
+// storage next to the budget caps, sent to the backend as `balances`.
+function currentMonthKey(t) {
+  const date = new Date(t)
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`
+}
+
+function recordBalanceReading(ledger, provider, unit, value, t) {
+  if (!Number.isFinite(value) || !provider) return ledger
+  const month = currentMonthKey(t)
+  const previous = ledger[provider]
+  if (!previous || previous.month !== month || previous.unit !== unit) {
+    return { ...ledger, [provider]: { month, unit, first_at: t, first: value, last_at: t, last: value, spent: 0, topped_up: 0, readings: 1 } }
+  }
+  if (t - previous.last_at < 60_000) return ledger
+  const delta = previous.last - value
+  return {
+    ...ledger,
+    [provider]: {
+      ...previous,
+      last_at: t,
+      last: value,
+      spent: previous.spent + (delta > 0 ? delta : 0),
+      topped_up: previous.topped_up + (delta < 0 ? -delta : 0),
+      readings: previous.readings + 1
+    }
+  }
+}
+
+function balancesParamFrom(ledger) {
+  const month = currentMonthKey(Date.now())
+  const items = Object.entries(ledger || {})
+    .filter(([, entry]) => entry && entry.month === month && entry.unit === 'USD' && entry.readings > 1)
+    .map(([provider, entry]) => ({ p: provider, s: Number(entry.spent.toFixed(4)), t: Number(entry.topped_up.toFixed(4)), a: Math.round(entry.first_at / 1000), l: Math.round(entry.last_at / 1000) }))
+  return items.length ? JSON.stringify(items) : ''
+}
+
+function balanceLedgerLine(entry) {
+  if (!entry || entry.readings < 2) return null
+  const parts = [`Down ${formatUsageAmount(entry.spent, entry.unit)} this month`]
+  if (entry.topped_up > 0) parts.push(`topped up ${formatUsageAmount(entry.topped_up, entry.unit)}`)
+  parts.push(`since ${formatShortDate(entry.first_at / 1000)}`)
+  return parts.join(' · ')
+}
+
 function queryPending(query) {
   return Boolean(query?.isLoading || (query?.data === undefined && !query?.isError))
 }
@@ -2777,7 +2827,7 @@ function UsageAttribution({ window, onDrill }) {
   })
 }
 
-function UsageWindow({ window, series, onDrill }) {
+function UsageWindow({ window, series, ledgerEntry, onDrill }) {
   const rawUsed = window.percentage_used
   const rawRemaining = window.percentage_remaining
   const hasPercent = rawUsed !== null && rawUsed !== undefined && Number.isFinite(Number(rawUsed))
@@ -2845,6 +2895,13 @@ function UsageWindow({ window, series, onDrill }) {
             children: detailParts.join(' · ')
           })
         : null,
+      balanceLedgerLine(ledgerEntry)
+        ? jsx('div', {
+            title: 'How far this balance has fallen between this desktop\'s readings this month, and how much was added. Readings are stored in this desktop\'s plugin storage only.',
+            style: { color: color.quaternary, fontSize: '0.6875rem', lineHeight: 1.45 },
+            children: balanceLedgerLine(ledgerEntry)
+          })
+        : null,
       jsx(UsageAttribution, { window, onDrill })
     ]
   })
@@ -2853,7 +2910,7 @@ function UsageWindow({ window, series, onDrill }) {
 // A window earns a bar only when something is happening in it. Untouched
 // quota windows and per-minute rate limits each collapse to one sentence, so
 // a card is as tall as its news and no taller.
-function ProviderWindows({ provider, history, onDrill }) {
+function ProviderWindows({ provider, history, ledger, onDrill }) {
   const windows = provider.windows || []
   const rateLimits = windows.filter(window => window.kind === 'rate_limit')
   const idle = windows.filter(window => window.kind === 'quota' && !(Number(window.percentage_used) > 0) && !window.forecast?.exhaust_at)
@@ -2862,7 +2919,7 @@ function ProviderWindows({ provider, history, onDrill }) {
   return jsxs('div', {
     style: { marginTop: '0.65rem' },
     children: [
-      ...live.map(window => jsx(UsageWindow, { window, series: history?.[`${provider.provider}:${window.id}`], onDrill }, `${provider.provider}-${window.id}`)),
+      ...live.map(window => jsx(UsageWindow, { window, series: history?.[`${provider.provider}:${window.id}`], ledgerEntry: window.kind === 'balance' ? ledger?.[provider.provider] : null, onDrill }, `${provider.provider}-${window.id}`)),
       idle.length
         ? jsx('div', {
             title: 'Quota windows with nothing used yet; each shows its size and when it resets.',
@@ -2885,7 +2942,7 @@ function ProviderWindows({ provider, history, onDrill }) {
   })
 }
 
-function UsageProvider({ ctx, provider, history, onRefresh, onDrill }) {
+function UsageProvider({ ctx, provider, history, ledger, onRefresh, onDrill }) {
   const status = usageStatus(provider)
   const messageDanger = ['expired', 'forbidden', 'unavailable'].includes(provider.status)
   const [busy, setBusy] = useState(false)
@@ -2963,7 +3020,7 @@ function UsageProvider({ ctx, provider, history, onRefresh, onDrill }) {
           })
         : null,
       provider.windows?.length
-        ? jsx(ProviderWindows, { provider, history, onDrill })
+        ? jsx(ProviderWindows, { provider, history, ledger, onDrill })
         : jsx('div', {
             style: { borderTop: border, color: color.quaternary, fontSize: '0.75rem', marginTop: '0.75rem', paddingTop: '0.75rem' },
             children: provider.status === 'not_configured'
@@ -3005,7 +3062,7 @@ function UsageProvider({ ctx, provider, history, onRefresh, onDrill }) {
   })
 }
 
-function UsageProviderGroup({ ctx, title, description, providers, narrow, id, history, onRefresh, onDrill }) {
+function UsageProviderGroup({ ctx, title, description, providers, narrow, id, history, ledger, onRefresh, onDrill }) {
   if (!providers.length) return null
   return jsxs('section', {
     'aria-labelledby': id,
@@ -3026,7 +3083,7 @@ function UsageProviderGroup({ ctx, title, description, providers, narrow, id, hi
       }),
       jsx('div', {
         style: { display: 'grid', gap: '0.85rem', gridTemplateColumns: narrow ? 'minmax(0, 1fr)' : 'repeat(2, minmax(0, 1fr))' },
-        children: providers.map(provider => jsx(UsageProvider, { ctx, provider, history, onRefresh, onDrill }, provider.provider))
+        children: providers.map(provider => jsx(UsageProvider, { ctx, provider, history, ledger, onRefresh, onDrill }, provider.provider))
       })
     ]
   })
@@ -3189,11 +3246,15 @@ function BudgetRow({ entry, month, onChange, narrow }) {
   const barTone = entry.status === 'over' ? color.danger : entry.status === 'at_risk' ? color.warning : color.accent
   const sourceLabel = entry.spend_source === 'account'
     ? 'account'
-    : entry.spend_source === 'mixed' ? 'account + local' : 'local records'
+    : entry.spend_source === 'balance'
+      ? 'balance drawdown'
+      : entry.spend_source === 'mixed' ? 'account + local' : 'local records'
   const sourceTitle = entry.spend_source === 'account'
     ? `Reported by the provider for this account${entry.account_as_of ? ` as of ${formatDate(entry.account_as_of)}` : ''}${entry.account_stale ? ' (last known reading)' : ''}. Local sessions recorded ${formatUsageAmount(entry.local_spend_usd, 'USD')} of it.`
+    : entry.spend_source === 'balance'
+      ? `How far the provider's balance fell between this desktop's readings since ${formatShortDate(entry.balance_since)}${Number(entry.balance_topped_up_usd) > 0 ? `, after ${formatUsageAmount(entry.balance_topped_up_usd, 'USD')} topped up` : ''}. Spend elsewhere on the same account is included; readings between this desktop's sessions are not.`
     : entry.spend_source === 'mixed'
-      ? 'Sum of each provider’s best figure: the account number where the provider reports one, local session records otherwise.'
+      ? 'Sum of each provider’s best figure: the account number where the provider reports one, its balance drawdown where it reports only a balance, local session records otherwise.'
       : `Recorded locally by ${formatCount(entry.local_sessions)} Hermes session${Number(entry.local_sessions) === 1 ? '' : 's'} this month. Usage from other machines or tools on the same account is not included.`
   const projectionTitle = entry.projection_basis === 'linear'
     ? 'No spend in the last seven days; projected by extending the month-to-date average.'
@@ -3326,7 +3387,7 @@ async function openExternalLink(ctx, url) {
   }
 }
 
-function ServicesSection({ ctx, query, narrow, history, onRefresh }) {
+function ServicesSection({ ctx, query, narrow, history, ledger, onRefresh }) {
   const data = query.data
   const cards = data?.cards || []
   const inventory = data?.inventory || []
@@ -3347,6 +3408,7 @@ function ServicesSection({ ctx, query, narrow, history, onRefresh }) {
                 providers: [...cards].sort((a, b) => usageUrgency(b) - usageUrgency(a)),
                 narrow,
                 history,
+                ledger,
                 onRefresh
               })
             : null,
@@ -3425,14 +3487,15 @@ function ServicesSection({ ctx, query, narrow, history, onRefresh }) {
   })
 }
 
-function AIUsageView({ ctx, query, servicesQuery, narrow, refreshError, history, onRefreshProvider, onRefreshService, onDrill, budgets, onBudgetsChange, period }) {
+function AIUsageView({ ctx, query, servicesQuery, narrow, refreshError, history, ledger, onRefreshProvider, onRefreshService, onDrill, budgets, onBudgetsChange, period }) {
   if (queryPending(query)) return jsx(LoadingBlock, { rows: 8 })
   if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'AI usage is unavailable' })
   const data = query.data
   const providers = data?.providers || []
   const configured = providers.filter(provider => provider.status !== 'not_configured')
   const unconfigured = providers.filter(provider => provider.status === 'not_configured')
-  const orderedProviders = [...configured].sort((a, b) => usageUrgency(b) - usageUrgency(a))
+  // The backend orders the cards (_order_usage_cards); re-sorting here would undo it.
+  const orderedProviders = configured
   return jsx('div', {
     style: { flex: 1, minHeight: 0, overflow: 'auto', padding: '1rem' },
     children: jsxs('div', {
@@ -3466,6 +3529,7 @@ function AIUsageView({ ctx, query, servicesQuery, narrow, refreshError, history,
               providers: orderedProviders,
               narrow,
               history,
+              ledger,
               onRefresh: onRefreshProvider,
               onDrill
             })
@@ -4445,6 +4509,40 @@ function SessionLensPage({ ctx }) {
   // per quota window, persisted in ctx.storage. Cached responses repeat the
   // same reading, so they are never recorded — duplicates would flatten the
   // burn slope the sparkline and forecast are computed from.
+  const [balanceLedger, setBalanceLedger] = useState(() => {
+    const stored = ctx.storage.get('balanceLedger')
+    return stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : {}
+  })
+  const recordBalances = payload => {
+    if (!payload || payload.cached) return
+    setBalanceLedger(current => {
+      let next = current
+      for (const card of payload.providers || payload.cards || []) {
+        if (card.status !== 'ok' || card.account_extra) continue
+        const t = Math.round(Number(card.fetched_at) * 1000) || Math.round(Number(payload.generated_at) * 1000) || Date.now()
+        for (const window of card.windows || []) {
+          if (window.kind !== 'balance' || !window.unit) continue
+          next = recordBalanceReading(next, card.provider, window.unit, Number(window.remaining), t)
+        }
+      }
+      return next
+    })
+  }
+  useEffect(() => { recordBalances(aiUsageQuery.data) }, [aiUsageQuery.data])
+  useEffect(() => { recordBalances(servicesQuery.data) }, [servicesQuery.data])
+  useEffect(() => {
+    ctx.storage.set('balanceLedger', balanceLedger)
+  }, [ctx, balanceLedger])
+  const balancesParam = balancesParamFrom(balanceLedger)
+  activeBalancesParam = balancesParam
+  const balancesInitRef = useRef(false)
+  useEffect(() => {
+    if (!balancesInitRef.current) {
+      balancesInitRef.current = true
+      return
+    }
+    queryClient.invalidateQueries({ queryKey: [PLUGIN_ID, 'budgets'] })
+  }, [balancesParam])
   const [usageHistory, setUsageHistory] = useState(() => {
     const stored = ctx.storage.get('usageHistory')
     return stored && typeof stored === 'object' && !Array.isArray(stored) ? stored : {}
@@ -4677,6 +4775,7 @@ function SessionLensPage({ ctx }) {
     narrow: Boolean(viewport?.narrow),
     refreshError: aiRefreshError,
     history: usageHistory,
+    ledger: balanceLedger,
     onRefreshProvider: refreshProvider,
     onRefreshService: refreshService,
     onDrill: drillToSessions

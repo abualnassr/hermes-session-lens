@@ -1263,6 +1263,7 @@ def _digest_sync(
     end_at: Optional[float] = None,
     budgets: str = "",
     rules: str = "",
+    balances: str = "",
 ) -> Dict[str, Any]:
     period_start, period_end = _period_bounds(days, start_at, end_at)
     now = time.time()
@@ -1388,7 +1389,9 @@ def _digest_sync(
     service_rows = _digest_service_rows(services_payload)
     services_summary = (services_payload or {}).get("summary") if isinstance(services_payload, Mapping) else None
     try:
-        budgets_payload: Optional[Dict[str, Any]] = _budgets_sync(_parse_budgets_param(budgets))
+        budgets_payload: Optional[Dict[str, Any]] = _budgets_sync(
+            _parse_budgets_param(budgets), _parse_balances_param(balances)
+        )
     except Exception:
         budgets_payload = None
     rules_payload: Optional[Dict[str, Any]] = None
@@ -1532,8 +1535,11 @@ async def digest(
     profiles: str = Query(""),
     budgets: str = Query(""),
     rules: str = Query("", max_length=RULES_MAX_PARAM_CHARS),
+    balances: str = Query("", max_length=8000),
 ) -> Dict[str, Any]:
-    return await asyncio.to_thread(_scoped_call, profiles, _digest_sync, days, start_at, end_at, budgets=budgets, rules=rules)
+    return await asyncio.to_thread(
+        _scoped_call, profiles, _digest_sync, days, start_at, end_at, budgets=budgets, rules=rules, balances=balances
+    )
 
 
 @router.get("/rules/templates")
@@ -1993,6 +1999,7 @@ def _attention_sync(
     start_at: Optional[float] = None,
     end_at: Optional[float] = None,
     budgets: str = "",
+    balances: str = "",
 ) -> Dict[str, Any]:
     """Flag sessions that look like runaway or orphaned work.
 
@@ -2096,7 +2103,7 @@ def _attention_sync(
     return {
         "sessions": flagged[:_ATTENTION_MAX_SESSIONS],
         "quotas": _quota_attention_notes(),
-        "budgets": _budget_attention_notes(budgets),
+        "budgets": _budget_attention_notes(budgets, balances),
         "totals": {
             "flagged": len(flagged),
             "open_sessions": open_flagged,
@@ -2119,8 +2126,11 @@ async def attention(
     end_at: Optional[float] = Query(None, ge=0),
     profiles: str = Query(""),
     budgets: str = Query(""),
+    balances: str = Query("", max_length=8000),
 ) -> Dict[str, Any]:
-    return await asyncio.to_thread(_scoped_call, profiles, _attention_sync, days, start_at, end_at, budgets=budgets)
+    return await asyncio.to_thread(
+        _scoped_call, profiles, _attention_sync, days, start_at, end_at, budgets=budgets, balances=balances
+    )
 
 
 @router.get("/telemetry")
@@ -4756,6 +4766,73 @@ def _budget_provider_label(provider_id: str) -> str:
     return str(route.get("provider") or _humanize_identifier(provider_id))
 
 
+_BALANCE_LEDGER_MAX_ENTRIES = 40
+
+
+def _parse_balances_param(raw: str) -> Dict[str, Dict[str, float]]:
+    """The desktop's balance ledger for the current month, one entry per provider.
+
+    Providers that report a balance rather than spend (DeepSeek, Nous, Bright
+    Data, Monid) reveal what they cost only by how far the balance falls
+    between readings. The desktop keeps that ledger in its plugin storage,
+    next to the budget caps, and sends the USD part with every request as
+    `balances`: a JSON list of {p: provider, s: spent, t: topped_up,
+    a: first reading epoch, l: last reading epoch}. Anything malformed is
+    ignored; nothing here is stored by the backend.
+    """
+    try:
+        items = json.loads(raw) if raw else []
+    except (TypeError, ValueError):
+        return {}
+    if not isinstance(items, list):
+        return {}
+    ledger: Dict[str, Dict[str, float]] = {}
+    for item in items:
+        if not isinstance(item, Mapping):
+            continue
+        provider = str(item.get("p") or "").strip().lower()
+        if not re.fullmatch(r"[a-z0-9_.:-]{1,40}", provider):
+            continue
+        spent = _number(item.get("s"), None)
+        first_at = _number(item.get("a"), None)
+        last_at = _number(item.get("l"), None)
+        if spent is None or first_at is None or last_at is None or not (0 <= spent < 1e9) or last_at < first_at:
+            continue
+        ledger[provider] = {
+            "spent": round(spent, 4),
+            "topped_up": round(max(0.0, _number(item.get("t"), 0.0) or 0.0), 4),
+            "first_at": first_at,
+            "last_at": last_at,
+        }
+        if len(ledger) >= _BALANCE_LEDGER_MAX_ENTRIES:
+            break
+    return ledger
+
+
+def _budget_balance_spend(ledger: Mapping[str, Mapping[str, float]]) -> Dict[str, Dict[str, Any]]:
+    """Ledger entries in the shape _budget_entry reads for a provider's account figure.
+
+    Pace is the drawdown over the span the ledger covers, never shorter
+    than a day, so a balance read twice an hour apart does not project a
+    month from one afternoon.
+    """
+    account: Dict[str, Dict[str, Any]] = {}
+    for provider, entry in ledger.items():
+        span_days = max(1.0, (entry["last_at"] - entry["first_at"]) / 86400.0)
+        account[provider] = {
+            "monthly": entry["spent"],
+            "weekly": None,
+            "unit": "USD",
+            "as_of": entry["last_at"],
+            "stale": False,
+            "source": "balance",
+            "pace_daily": entry["spent"] / span_days,
+            "topped_up": entry["topped_up"],
+            "since": entry["first_at"],
+        }
+    return account
+
+
 def _budget_local_spend(month_start: float, pace_start: float) -> Dict[str, Dict[str, Any]]:
     """Month-to-date and trailing-pace recorded cost per budget provider id."""
     since = min(month_start, pace_start)
@@ -4835,9 +4912,14 @@ def _budget_entry(
     local_pace = _number(local.get("pace_cost"))
     if account is not None:
         spend = _number(account.get("monthly"))
-        source = "account"
+        source = str(account.get("source") or "account")
         weekly = account.get("weekly")
-        pace_daily = _number(weekly) / _BUDGET_PACE_DAYS if weekly is not None else local_pace / _BUDGET_PACE_DAYS
+        if account.get("pace_daily") is not None:
+            pace_daily = _number(account.get("pace_daily"))
+        elif weekly is not None:
+            pace_daily = _number(weekly) / _BUDGET_PACE_DAYS
+        else:
+            pace_daily = local_pace / _BUDGET_PACE_DAYS
     else:
         spend = local_month
         source = "local"
@@ -4878,14 +4960,20 @@ def _budget_entry(
         "cross_at": cross_at,
         "account_as_of": account.get("as_of") if account else None,
         "account_stale": bool(account.get("stale")) if account else False,
+        "balance_topped_up_usd": round(_number(account.get("topped_up")), 2) if account and account.get("source") == "balance" else None,
+        "balance_since": account.get("since") if account and account.get("source") == "balance" else None,
     }
 
 
-def _budgets_sync(budgets: Mapping[str, float]) -> Dict[str, Any]:
+def _budgets_sync(budgets: Mapping[str, float], balances: Optional[Mapping[str, Mapping[str, float]]] = None) -> Dict[str, Any]:
     now = time.time()
     month_start, month_end = _month_bounds(now)
     local = _budget_local_spend(month_start, now - _BUDGET_PACE_DAYS * 86400.0)
     account = _budget_account_spend()
+    # A provider that reports spend keeps its own figure; one that reports
+    # only a balance gets the desktop's drawdown ledger instead.
+    for provider, entry in _budget_balance_spend(balances or {}).items():
+        account.setdefault(provider, entry)
     provider_ids = set(local) | set(account) | {key for key in budgets if key != _BUDGET_ALL_KEY}
     entries: List[Dict[str, Any]] = []
     for provider_id in sorted(provider_ids):
@@ -4919,7 +5007,7 @@ def _budgets_sync(budgets: Mapping[str, float]) -> Dict[str, Any]:
         month_start=month_start,
         month_end=month_end,
     )
-    total["spend_source"] = "mixed" if any(item["spend_source"] == "account" for item in entries) else "local"
+    total["spend_source"] = "mixed" if any(item["spend_source"] in {"account", "balance"} for item in entries) else "local"
     total["account_as_of"] = None
     severity = {"over": 0, "at_risk": 1, "ok": 2, "no_cap": 3}
     entries.sort(key=lambda item: (severity[item["status"]], -item["spend_usd"], item["label"]))
@@ -4935,9 +5023,11 @@ def _budgets_sync(budgets: Mapping[str, float]) -> Dict[str, Any]:
         "notes": _budget_attention_notes_from(entries + [total], month_start),
         "generated_at": now,
         "definition": (
-            "Month-to-date spend uses the provider's own account figure where it reports one and "
+            "Month-to-date spend uses the provider's own account figure where it reports one, the "
+            "drawdown of its balance between this desktop's readings where it reports only a balance, and "
             "locally recorded session cost otherwise; the projection extends the last seven days' pace "
-            "to month end. Caps are stored in this desktop's plugin storage only."
+            "(or the drawdown's own pace) to month end. Caps and balance readings are stored in this "
+            "desktop's plugin storage only."
         ),
     }
 
@@ -4979,19 +5069,25 @@ def _budget_attention_notes_from(entries: List[Mapping[str, Any]], month_start: 
     return notes
 
 
-def _budget_attention_notes(raw: str) -> List[Dict[str, Any]]:
+def _budget_attention_notes(raw: str, balances: str = "") -> List[Dict[str, Any]]:
     budgets = _parse_budgets_param(raw)
     if not budgets:
         return []
     try:
-        return _budgets_sync(budgets)["notes"]
+        return _budgets_sync(budgets, _parse_balances_param(balances))["notes"]
     except Exception:
         return []
 
 
 @router.get("/budgets")
-async def budgets_route(budgets: str = Query(""), profiles: str = Query("")) -> Dict[str, Any]:
-    return await asyncio.to_thread(_scoped_call, profiles, _budgets_sync, _parse_budgets_param(budgets))
+async def budgets_route(
+    budgets: str = Query(""),
+    profiles: str = Query(""),
+    balances: str = Query("", max_length=8000),
+) -> Dict[str, Any]:
+    return await asyncio.to_thread(
+        _scoped_call, profiles, _budgets_sync, _parse_budgets_param(budgets), _parse_balances_param(balances)
+    )
 
 
 def _ai_usage_refresh_provider(provider: str, collector: Any) -> Optional[Dict[str, Any]]:
