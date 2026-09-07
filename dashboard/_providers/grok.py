@@ -79,9 +79,6 @@ def _grok_windows_from_payloads(
     return windows
 
 
-GROK_USAGE_SETTINGS_URL = "https://grok.com/?_s=usage"
-
-
 def _grok_card_extras(
     weekly_payload: Optional[Mapping[str, Any]],
     topup_payload: Optional[Mapping[str, Any]],
@@ -92,7 +89,7 @@ def _grok_card_extras(
     tier is shown when present and never guessed. The auto-top-up rule is
     its own endpoint: an empty response means none is set up. Weekly limit
     resets exist only on grok.com (xAI's own CLI opens the browser for
-    them), so the card says where they are instead of pretending.
+    them) and are deliberately not mentioned on the card.
     """
     plan = None
     if isinstance(weekly_payload, Mapping):
@@ -117,12 +114,7 @@ def _grok_card_extras(
         details.append(text)
     elif topup_payload is not None:
         details.append("Auto top-up: not set up.")
-    details.append(
-        "Weekly limit resets are redeemed at grok.com → Settings → Usage; xAI exposes them only there, "
-        "so this card cannot show one."
-    )
-    links = [{"label": "Open grok.com usage settings", "url": GROK_USAGE_SETTINGS_URL}]
-    return plan, details, links
+    return plan, details, []
 
 
 def _collect_grok_usage() -> Dict[str, Any]:

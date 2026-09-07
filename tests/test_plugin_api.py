@@ -2093,8 +2093,8 @@ process.stdout.write(JSON.stringify(out))
         plan, details, links = api._grok_card_extras({"config": {}}, {})
         self.assertIsNone(plan)
         self.assertIn("Auto top-up: not set up.", details)
-        self.assertTrue(any("grok.com → Settings → Usage" in item for item in details))
-        self.assertEqual(links, [{"label": "Open grok.com usage settings", "url": "https://grok.com/?_s=usage"}])
+        self.assertFalse(any("reset" in item.lower() for item in details))
+        self.assertEqual(links, [])
 
         plan, details, _links = api._grok_card_extras(
             {"config": {}, "subscription_tier": "SuperGrok"},
