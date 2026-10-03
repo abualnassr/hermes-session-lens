@@ -4164,14 +4164,21 @@ def _recurring_signature(tool: Any, content: Any) -> Tuple[str, str]:
     return f"{name.lower()}|{text}", headline
 
 
-def _recurring_failures_sync(
+def _recurring_collect(
     days: int,
     start_at: Optional[float] = None,
     end_at: Optional[float] = None,
+    *,
+    with_samples: bool = False,
 ) -> Dict[str, Any]:
+    """Group the scope's confirmed failures by signature.
+
+    With with_samples, each group also keeps references to the latest failure
+    of every distinct error line and of every session, which the
+    investigation prompt draws its examples from.
+    """
     period_start, period_end = _period_bounds(days, start_at, end_at)
     period_sql, period_params = _period_sql("s.started_at", period_start, period_end)
-    now = time.time()
     with _database() as db:
         connection = _db_connection(db)
         failures = _confirmed_failure_rows(connection, period_sql, period_params)
@@ -4210,6 +4217,8 @@ def _recurring_failures_sync(
                 "first_at": timestamp,
                 "last_at": timestamp,
                 "example": None,
+                "variants": {},
+                "latest_by_session": {},
             }
         group["count"] += 1
         if session_id:
@@ -4226,29 +4235,64 @@ def _recurring_failures_sync(
             if group["last_at"] is None or timestamp >= group["last_at"]:
                 group["last_at"] = timestamp
                 group["example"] = {"session_id": session_id, "snippet": _clean_text(failure.get("content"), 280)}
-    total = sum(group["count"] for group in groups.values())
+        if with_samples:
+            stamp = timestamp or 0
+            for bucket, bucket_key in ((group["variants"], headline), (group["latest_by_session"], session_id)):
+                current = bucket.get(bucket_key)
+                if current is None or stamp >= (_number(current.get("timestamp"), 0) or 0):
+                    bucket[bucket_key] = failure
     ordered = sorted(groups.values(), key=lambda item: (-item["count"], -(item["last_at"] or 0), item["key"]))
+    return {
+        "groups": ordered,
+        "titles": titles,
+        "profiles": profiles,
+        "total": sum(group["count"] for group in ordered),
+        "period_start": period_start,
+        "period_end": period_end,
+    }
+
+
+def _recurring_pattern(group: Mapping[str, Any]) -> str:
+    if len(group["days"]) >= 3:
+        return "recurring"
+    if group["count"] >= 5:
+        return "burst"
+    if group["count"] == 1:
+        return "once"
+    return "occasional"
+
+
+def _recurring_affected(group: Mapping[str, Any], limit: int = RECURRING_MAX_SESSIONS) -> List[Tuple[str, List[Any]]]:
+    """(session id, [failures, last at]) pairs, most recent first."""
+    return sorted(group["sessions"].items(), key=lambda item: (-(item[1][1] or 0), -item[1][0], item[0]))[:limit]
+
+
+def _recurring_day_keys(period_end: Optional[float], now: float) -> List[str]:
     trend_end = period_end or now
-    day_keys = [dt.datetime.fromtimestamp(trend_end - offset * 86400).strftime("%Y-%m-%d") for offset in range(13, -1, -1)]
+    return [dt.datetime.fromtimestamp(trend_end - offset * 86400).strftime("%Y-%m-%d") for offset in range(13, -1, -1)]
+
+
+def _recurring_failures_sync(
+    days: int,
+    start_at: Optional[float] = None,
+    end_at: Optional[float] = None,
+) -> Dict[str, Any]:
+    now = time.time()
+    collected = _recurring_collect(days, start_at, end_at)
+    ordered = collected["groups"]
+    titles = collected["titles"]
+    profiles = collected["profiles"]
+    total = collected["total"]
+    period_start, period_end = collected["period_start"], collected["period_end"]
+    day_keys = _recurring_day_keys(period_end, now)
     rows = []
     cumulative = 0
     for rank, group in enumerate(ordered[:RECURRING_MAX_GROUPS], start=1):
         cumulative += group["count"]
-        days_seen = len(group["days"])
-        if days_seen >= 3:
-            pattern = "recurring"
-        elif group["count"] >= 5:
-            pattern = "burst"
-        elif group["count"] == 1:
-            pattern = "once"
-        else:
-            pattern = "occasional"
-        affected = sorted(
-            group["sessions"].items(), key=lambda item: (-(item[1][1] or 0), -item[1][0], item[0])
-        )[:RECURRING_MAX_SESSIONS]
         rows.append(
             {
                 "rank": rank,
+                "key": group["key"],
                 "tool": group["tool"],
                 "headline": group["headline"],
                 "signature": group["key"].split("|", 1)[1],
@@ -4264,11 +4308,11 @@ def _recurring_failures_sync(
                         "count": seen[0],
                         "last_at": seen[1],
                     }
-                    for session_id, seen in affected
+                    for session_id, seen in _recurring_affected(group)
                 ],
                 "profiles": sorted(group["profiles"]),
-                "days_seen": days_seen,
-                "pattern": pattern,
+                "days_seen": len(group["days"]),
+                "pattern": _recurring_pattern(group),
                 "still_happening": bool(group["last_at"] and now - group["last_at"] <= 86400),
                 "first_at": group["first_at"],
                 "last_at": group["last_at"],
@@ -4281,7 +4325,7 @@ def _recurring_failures_sync(
         "groups": rows,
         "totals": {
             "failures": total,
-            "signatures": len(groups),
+            "signatures": len(ordered),
             "top5_share": round(top_five / total, 4) if total else 0.0,
             "recurring": sum(1 for row in rows if row["pattern"] == "recurring"),
             "still_happening": sum(1 for row in rows if row["still_happening"]),
@@ -4305,6 +4349,252 @@ async def recurring_failures(
     profiles: str = Query(""),
 ) -> Dict[str, Any]:
     return await asyncio.to_thread(_scoped_call, profiles, _recurring_failures_sync, days, start_at, end_at)
+
+
+# ── Investigate a recurring failure ──────────────────────────────────────────
+# The same "prepare and hand over" contract as a session's Ask Hermes prompt:
+# a bounded, secret-redacted prompt the user pastes into a Hermes chat
+# themselves. Examples are the most recent distinct error lines, each with the
+# tool call that produced it, since the arguments usually carry the cause.
+RECURRING_PROMPT_ARGUMENT_CHARS = 500
+# (examples, characters per result, sessions listed), tried in order until the
+# rendered prompt fits _ANALYSIS_PROMPT_MAX_CHARS.
+RECURRING_PROMPT_BUDGET_STEPS = ((5, 900, 15), (4, 600, 12), (3, 400, 10), (2, 300, 8), (1, 200, 5), (1, 120, 3))
+# Hermes appends its own loop-guard advice to repeated failures; it is not evidence.
+_RECURRING_LOOP_WARNING_RE = re.compile(r"\s*\[Tool loop warning:[^\]]*\]")
+
+
+def _recurring_pick_examples(group: Mapping[str, Any], limit: int) -> List[Mapping[str, Any]]:
+    """Up to limit failures: distinct error lines first, from different sessions where possible."""
+
+    def stamp(failure: Mapping[str, Any]) -> float:
+        return _number(failure.get("timestamp"), 0) or 0
+
+    variants = sorted(group.get("variants", {}).values(), key=stamp, reverse=True)
+    by_session = sorted(group.get("latest_by_session", {}).values(), key=stamp, reverse=True)
+    picked: List[Mapping[str, Any]] = []
+    used = set()
+    sessions = set()
+    passes = (
+        (variants, True),  # a new error line in a session not yet shown
+        (variants, False),  # a new error line anywhere
+        (by_session, True),  # the same line, in another session's call
+    )
+    for candidates, new_session_only in passes:
+        for failure in candidates:
+            if len(picked) >= limit:
+                break
+            marker = (str(failure.get("session_id")), failure.get("id"))
+            if marker in used or (new_session_only and marker[0] in sessions):
+                continue
+            picked.append(failure)
+            used.add(marker)
+            sessions.add(marker[0])
+    return sorted(picked, key=stamp, reverse=True)
+
+
+def _recurring_call_arguments(connection: sqlite3.Connection, failure: Mapping[str, Any]) -> str:
+    """The recorded arguments of the tool call whose result is this failure."""
+    session_id = failure.get("session_id")
+    message_id = failure.get("id")
+    tool_name = str(failure.get("tool_name") or "")
+    if session_id is None or message_id is None:
+        return "Arguments not recorded"
+    row = connection.execute(
+        "SELECT tool_call_id FROM messages WHERE session_id=? AND id=?", (session_id, message_id)
+    ).fetchone()
+    call_id = str(row[0] or "") if row else ""
+    candidates = connection.execute(
+        """
+        SELECT tool_calls FROM messages
+        WHERE session_id=? AND id<? AND role='assistant' AND coalesce(tool_calls,'')!=''
+        ORDER BY id DESC LIMIT 12
+        """,
+        (session_id, message_id),
+    ).fetchall()
+    by_id = None
+    by_name = None
+    for (raw,) in candidates:
+        for call in _iter_tool_calls(raw):
+            same_id = bool(call_id) and str(call.get("call_id") or "") == call_id
+            if same_id and call["name"] == tool_name:
+                return _argument_summary(call["arguments"])
+            if same_id and by_id is None:
+                by_id = call
+            if not call_id and by_name is None and call["name"] == tool_name:
+                by_name = call
+    match = by_id or by_name
+    return _argument_summary(match["arguments"]) if match else "Arguments not recorded"
+
+
+def _recurring_period_phrase(days: int, period_start: Optional[float], period_end: Optional[float]) -> str:
+    if period_end is not None:
+        return f"{_analysis_stamp(period_start)} to {_analysis_stamp(period_end)}"
+    if not days:
+        return "all recorded history"
+    return f"the last {days} day{'s' if days != 1 else ''}"
+
+
+def _render_recurring_prompt(
+    group: Mapping[str, Any],
+    examples: List[Mapping[str, Any]],
+    affected: List[Tuple[str, List[Any]]],
+    context: Mapping[str, Any],
+    snippet_chars: int,
+) -> str:
+    titles = context["titles"]
+    profiles = context["profiles"]
+    days_seen = len(group["days"])
+    pattern = _recurring_pattern(group)
+    pattern_text = {
+        "recurring": f"recurring — seen on {days_seen} different days",
+        "burst": f"a burst — {group['count']} times on {days_seen} day{'s' if days_seen != 1 else ''}",
+        "once": "a single occurrence",
+        "occasional": f"occasional — {days_seen} day{'s' if days_seen != 1 else ''}",
+    }[pattern]
+    still = bool(group["last_at"] and context["now"] - group["last_at"] <= 86400)
+    trend = " ".join(str(group["days"].get(day, 0)) for day in context["day_keys"])
+
+    def session_label(session_id: str) -> str:
+        title = _clean_text(titles.get(session_id), 120)
+        profile = profiles.get(session_id)
+        where = f"{session_id}{', profile ' + profile if profile else ''}"
+        return f"\"{title}\" ({where})" if title else f"session {where}"
+
+    lines: List[str] = [
+        "You are helping a Hermes Agent user find out why one tool failure keeps happening across their sessions, "
+        "and how to stop it.",
+        "The evidence below was extracted by the Session Lens plugin from Hermes' own records, then bounded and "
+        "secret-redacted, so some detail is missing on purpose. Do not invent tool behaviour, file contents, or "
+        "error text that is not shown. You may use your session search tool to read the listed sessions for more "
+        "context.",
+        "Investigate only: do not change files, settings, memory, skills or configuration while answering. Propose "
+        "each change and wait for the user to approve it.",
+        "",
+        "Answer in this order, briefly:",
+        "1. What is going wrong and the most likely root cause, quoting the evidence line that supports it, with "
+        "your confidence. Say whether it comes from how the agent calls the tool (a habit), the environment (a "
+        "missing path, program, permission or network), configuration (a timeout, a tool or MCP setting), or the "
+        "tool itself.",
+        "2. The fix most likely to stop it, concrete enough to apply today — for example a memory or skill note, a "
+        "config value, an install step, or a change to how the tool is called — and exactly where it goes. If the "
+        "cause is uncertain, give at most two alternatives, most likely first.",
+        "3. How the user can confirm the fix worked: what should stop appearing, and where.",
+        "4. What this evidence cannot settle, and which extra evidence would.",
+        "If the failure looks harmless or expected (a search that found nothing, a file that did not exist yet), "
+        "say so instead of inventing a problem.",
+        "",
+        "## The failure",
+        f"- Tool: {group['tool']}",
+        f"- Error: {group['headline']}",
+        f"- Signature (paths, URLs, quoted values, ids and numbers neutralised): {group['key'].split('|', 1)[1]}",
+        f"- Seen {group['count']:,} time{'s' if group['count'] != 1 else ''} in {len(group['sessions']):,} "
+        f"session{'s' if len(group['sessions']) != 1 else ''} during {context['period_phrase']}; "
+        f"{len(group['variants']):,} distinct error line{'s' if len(group['variants']) != 1 else ''} before neutralising.",
+        f"- First {_analysis_stamp(group['first_at'])} · last {_analysis_stamp(group['last_at'])}"
+        f" · {'still happening (within the last 24 hours)' if still else 'not seen in the last 24 hours'}",
+        f"- Pattern: {pattern_text}",
+        f"- Daily count, last 14 days (oldest first): {trend}",
+    ]
+    if group["profiles"]:
+        lines.append(f"- Profiles: {', '.join(sorted(group['profiles']))}")
+
+    lines += ["", "## Examples (most recent distinct cases, each with the call that produced it)"]
+    if not examples:
+        lines.append("Examples omitted to keep this prompt short.")
+    for index, failure in enumerate(examples, start=1):
+        session_id = str(failure.get("session_id") or "")
+        lines += [
+            "",
+            f"### Example {index} — {_analysis_stamp(failure.get('timestamp'))} in {session_label(session_id)}",
+            f"Call: {failure.get('_arguments') or 'Arguments not recorded'}",
+        ]
+        full = _clean_content(_RECURRING_LOOP_WARNING_RE.sub("", str(failure.get("content") or "")))
+        snippet = full[:snippet_chars].rstrip()
+        if snippet:
+            fence = _analysis_fence(snippet)
+            lines += ["Result:", fence, snippet + (" …" if len(full) > snippet_chars else ""), fence]
+
+    lines += ["", "## Sessions affected (most recent first)"]
+    for session_id, seen in affected:
+        lines.append(
+            f"- {session_label(session_id)} — {seen[0]:,} time{'s' if seen[0] != 1 else ''}, last {_analysis_stamp(seen[1])}"
+        )
+    hidden = len(group["sessions"]) - len(affected)
+    if hidden > 0:
+        lines.append(f"- … and {hidden:,} more session{'s' if hidden != 1 else ''}")
+
+    lines += [
+        "",
+        "## How this evidence was produced",
+        "- Failure detection: recorded Hermes error state plus conservative tool-result signatures; the signatures "
+        "match English error text only, so failures reported in other languages may be under-counted.",
+        "- Failures are grouped by tool and the telling error line with paths, URLs, quoted values, ids and numbers "
+        "neutralised, so the same fault on different paths is one group.",
+        "- Call arguments and results are bounded and secret-redacted; user and assistant message text is "
+        "deliberately not included.",
+    ]
+    return "\n".join(lines).strip() + "\n"
+
+
+def _recurring_prompt_sync(
+    key: str,
+    days: int,
+    start_at: Optional[float] = None,
+    end_at: Optional[float] = None,
+) -> Dict[str, Any]:
+    now = time.time()
+    collected = _recurring_collect(days, start_at, end_at, with_samples=True)
+    group = next((item for item in collected["groups"] if item["key"] == key), None)
+    if group is None:
+        raise HTTPException(status_code=404, detail="That failure is not in the selected period any more")
+    most_examples = RECURRING_PROMPT_BUDGET_STEPS[0][0]
+    examples = [dict(failure) for failure in _recurring_pick_examples(group, most_examples)]
+    with _database() as db:
+        connection = _db_connection(db)
+        for failure in examples:
+            failure["_arguments"] = _clean_text(
+                _recurring_call_arguments(connection, failure), RECURRING_PROMPT_ARGUMENT_CHARS
+            )
+    context = {
+        "titles": collected["titles"],
+        "profiles": collected["profiles"],
+        "now": now,
+        "day_keys": _recurring_day_keys(collected["period_end"], now),
+        "period_phrase": _recurring_period_phrase(days, collected["period_start"], collected["period_end"]),
+    }
+    text = ""
+    example_limit = session_limit = 0
+    for example_limit, snippet_chars, session_limit in RECURRING_PROMPT_BUDGET_STEPS:
+        text = _render_recurring_prompt(
+            group, examples[:example_limit], _recurring_affected(group, session_limit), context, snippet_chars
+        )
+        if len(text) <= _ANALYSIS_PROMPT_MAX_CHARS:
+            break
+    return {
+        "key": key,
+        "tool": group["tool"],
+        "headline": group["headline"],
+        "prompt": text,
+        "characters": len(text),
+        "examples_included": min(example_limit, len(examples)),
+        "sessions_listed": min(session_limit, len(group["sessions"])),
+        "sessions_total": len(group["sessions"]),
+        "max_chars": _ANALYSIS_PROMPT_MAX_CHARS,
+        "generated_at": now,
+    }
+
+
+@router.get("/failures/recurring/prompt")
+async def recurring_failure_prompt(
+    key: str = Query(..., min_length=1, max_length=400),
+    days: int = Query(30, ge=0, le=3650),
+    start_at: Optional[float] = Query(None, ge=0),
+    end_at: Optional[float] = Query(None, ge=0),
+    profiles: str = Query(""),
+) -> Dict[str, Any]:
+    """A bounded, secret-redacted prompt to investigate one recurring failure in a Hermes chat."""
+    return await asyncio.to_thread(_scoped_call, profiles, _recurring_prompt_sync, key, days, start_at, end_at)
 
 
 @router.get("/tools")

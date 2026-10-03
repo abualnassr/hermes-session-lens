@@ -1167,7 +1167,52 @@ class SessionLensApiTests(unittest.TestCase):
         source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
         self.assertIn("function RecurringFailuresSection({ ctx, period, onOpenSession })", source)
         self.assertIn("function RecurringSessionsList({ row, onOpenSession })", source)
+        self.assertIn("apiPath('/failures/recurring/prompt', { ...period, key: row.key })", source)
         self.assertIn("pluginRest(ctx, apiPath('/failures/recurring', period))", source)
+
+    def test_recurring_failure_prompt_carries_distinct_cases_with_their_calls(self):
+        base = 1_800_000_000
+        connection = sqlite3.connect(self.db_path)
+        connection.execute(
+            "INSERT INTO sessions (id, source, model, started_at, title, message_count) VALUES ('session-2', 'cli', 'm', ?, 'Second', 0)",
+            (base,),
+        )
+        cases = [
+            ("session-1", "C:/work/alpha", base + 10),
+            ("session-1", "C:/work/beta", base + 86400),
+            ("session-2", "C:/work/gamma", base + 2 * 86400),
+            ("session-2", "C:/work/gamma", base + 3 * 86400),
+        ]
+        for index, (session_id, path, stamp) in enumerate(cases):
+            call_id = f"call-{index}"
+            arguments = json.dumps({"path": path, "api_key": "sk-live-abcdef1234567890abcdef"})
+            connection.execute(
+                "INSERT INTO messages (session_id, role, content, tool_calls, timestamp) VALUES (?,?,?,?,?)",
+                (session_id, "assistant", "", json.dumps([{"id": call_id, "function": {"name": "search_files", "arguments": arguments}}]), stamp - 1),
+            )
+            connection.execute(
+                "INSERT INTO messages (session_id, role, content, tool_name, tool_call_id, timestamp) VALUES (?,?,?,?,?,?)",
+                (session_id, "tool", f"Error: no such file or directory: {path} (access_token=sk-live-abcdef1234567890abcdef)", "search_files", call_id, stamp),
+            )
+        connection.execute("UPDATE sessions SET message_count = message_count + 4")
+        connection.commit()
+        connection.close()
+        data = api._recurring_failures_sync(0)
+        group = next(item for item in data["groups"] if item["tool"] == "search_files")
+        self.assertEqual((group["count"], group["sessions"]), (4, 2))
+        payload = api._recurring_prompt_sync(group["key"], 0)
+        prompt = payload["prompt"]
+        self.assertLessEqual(payload["characters"], payload["max_chars"])
+        self.assertEqual(payload["examples_included"], 3)  # gamma twice is one distinct case
+        for path in ("C:/work/alpha", "C:/work/beta", "C:/work/gamma"):
+            self.assertIn(f"path: {path}", prompt)
+        self.assertNotIn("abcdef1234567890", prompt)
+        self.assertIn("Investigate only", prompt)
+        self.assertIn('"Second" (session-2)', prompt)
+        self.assertEqual(api._RECURRING_LOOP_WARNING_RE.sub("", "boom\n\n[Tool loop warning: same_tool_failure_warning; count=3]"), "boom")
+        self.assertIn("Seen 4 times in 2 sessions", prompt)
+        with self.assertRaises(api.HTTPException):
+            api._recurring_prompt_sync("search_files|no such fault", 0)
 
     def test_conversation_chains_sum_a_conversation_across_its_sessions(self):
         connection = sqlite3.connect(self.db_path)

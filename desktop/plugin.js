@@ -821,7 +821,11 @@ function notifyHost(kind, message) {
 // read-only and the user sees exactly what the model will read before any
 // tokens are spent.
 async function askHermesAboutFailures({ ctx, sessionId, profile }) {
-  const payload = await pluginRest(ctx, apiPath(`/sessions/${encodeURIComponent(sessionId)}/analysis-prompt`, profile ? { profiles: profile } : {}))
+  return handOverPrompt({ ctx, path: apiPath(`/sessions/${encodeURIComponent(sessionId)}/analysis-prompt`, profile ? { profiles: profile } : {}), profile })
+}
+
+async function handOverPrompt({ ctx, path, profile }) {
+  const payload = await pluginRest(ctx, path)
   const prompt = payload?.prompt
   if (typeof prompt !== 'string' || !prompt.trim()) throw new Error('the analysis prompt came back empty')
   await copyText(prompt)
@@ -861,6 +865,38 @@ function AskHermesButton({ ctx, session, profile, failuresShown }) {
     disabled: busy,
     onClick: run,
     title: "Copy a failure-analysis prompt built from this session's recorded failures (bounded, secret-redacted) and open a new Hermes chat to paste it into. Nothing is sent until you press send.",
+    children: jsxs(Fragment, { children: [busy ? jsx(SpinIcon, { size: '0.7rem' }) : jsx(Codicon, { name: 'comment-discussion' }), 'Ask Hermes'] })
+  })
+}
+// One recurring failure across every session it hit: the prompt carries the
+// most recent distinct cases with the calls that produced them.
+function singleProfileScope() {
+  return activeProfilesParam && activeProfilesParam !== 'all' && !activeProfilesParam.includes(',') ? activeProfilesParam : undefined
+}
+
+function AskHermesAboutFaultButton({ ctx, row, period }) {
+  const [busy, setBusy] = useState(false)
+  const run = async () => {
+    setBusy(true)
+    try {
+      const profile = row.profiles?.length === 1 ? row.profiles[0] : singleProfileScope()
+      const result = await handOverPrompt({ ctx, path: apiPath('/failures/recurring/prompt', { ...period, key: row.key }), profile })
+      const size = `${formatCount(result.characters)} characters · ${formatCount(result.examples_included)} example${Number(result.examples_included) === 1 ? '' : 's'} · ${formatCount(result.sessions_total)} session${Number(result.sessions_total) === 1 ? '' : 's'}`
+      notifyHost('success', result.opened
+        ? `Investigation prompt copied (${size}). Paste it into the new chat and send.`
+        : `Investigation prompt copied (${size}). Open a new Hermes chat, paste it, and send.`)
+    } catch (error) {
+      notifyHost('error', `Could not prepare the investigation prompt: ${error?.message || error}`)
+    } finally {
+      setBusy(false)
+    }
+  }
+  return jsx(Button, {
+    variant: 'outline',
+    size: 'xs',
+    disabled: busy || !row.key,
+    onClick: run,
+    title: 'Copy a prompt to investigate this failure — its pattern, the most recent distinct cases with the calls that caused them, and the sessions it hit (bounded, secret-redacted) — and open a new Hermes chat to paste it into. Nothing is sent until you press send.',
     children: jsxs(Fragment, { children: [busy ? jsx(SpinIcon, { size: '0.7rem' }) : jsx(Codicon, { name: 'comment-discussion' }), 'Ask Hermes'] })
   })
 }
@@ -2704,7 +2740,8 @@ function RecurringFailuresSection({ ctx, period, onOpenSession }) {
               ? jsx(Pill, { tone: 'danger', children: 'last 24 h' })
               : formatShortDate(row.last_at)
           },
-          { key: 'trend', label: 'Trend (14d)', align: 'right', render: row => jsx(TrendBars, { rows: row.trend }) }
+          { key: 'trend', label: 'Trend (14d)', align: 'right', render: row => jsx(TrendBars, { rows: row.trend }) },
+          { key: 'investigate', label: 'Investigate', sortValue: () => null, render: row => jsx(AskHermesAboutFaultButton, { ctx, row, period }) }
         ],
         rows: data.groups || [],
         rowDetail: row => open.has(recurringRowId(row)) ? jsx(RecurringSessionsList, { row, onOpenSession }) : null,
