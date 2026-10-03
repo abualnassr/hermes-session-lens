@@ -29,9 +29,11 @@ from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 try:
     from ._common import *
     from ._reliability import _wilson_upper_bound
+    from ._services import _mcp_inventory, _sanitize_mcp_component
 except ImportError:  # pragma: no cover - direct Hermes file loading
     from _common import *
     from _reliability import _wilson_upper_bound
+    from _services import _mcp_inventory, _sanitize_mcp_component
 
 RULES_MAX_RULES = 40
 RULES_MAX_CLAUSES = 12
@@ -417,12 +419,20 @@ def _tool_calls_from_row(raw: Any) -> List[Dict[str, str]]:
         if not name:
             continue
         arguments = function.get("arguments", item.get("arguments", ""))
+        call_id = str(item.get("call_id") or item.get("id") or "")
+        # A tool_call bridge runs other tools; rules judge the tools it ran.
+        entries = _bridge_entries(name, _parse_json(arguments, {}) if isinstance(arguments, str) else arguments)
+        if entries:
+            for inner, inner_args in entries:
+                text = json.dumps(inner_args, ensure_ascii=False)
+                calls.append({"name": inner, "arguments": text[:RULES_TEXT_CAP], "call_id": call_id})
+            continue
         if not isinstance(arguments, str):
             try:
                 arguments = json.dumps(arguments, ensure_ascii=False)
             except (TypeError, ValueError):
                 arguments = str(arguments)
-        calls.append({"name": name, "arguments": arguments[:RULES_TEXT_CAP], "call_id": str(item.get("call_id") or item.get("id") or "")})
+        calls.append({"name": name, "arguments": arguments[:RULES_TEXT_CAP], "call_id": call_id})
     return calls
 
 
@@ -1247,6 +1257,14 @@ def _tool_names_sync() -> Dict[str, Any]:
             name = str(material.get("tool_name") or "").strip()
             if name:
                 recorded[name] = {"calls": _integer(material.get("calls")), "last_used_at": material.get("last_used_at")}
+    catalog_names: set = set()
+    try:
+        for key, info in _mcp_inventory().items():
+            if info.get("enabled"):
+                catalog_names.update(f"mcp__{key}__{_sanitize_mcp_component(tool)}" for tool in info.get("tool_names") or ())
+    except Exception:
+        catalog_names = set()
+    registry_names = set(registry_names) | catalog_names
     entries: List[Dict[str, Any]] = []
     for name in sorted(set(registry_names) | set(recorded)):
         record = recorded.get(name)

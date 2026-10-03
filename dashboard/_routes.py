@@ -3541,7 +3541,9 @@ async def ai_models(
 def _tool_group(name: str) -> Tuple[str, str, str]:
     """(kind, group, short_name) for a recorded tool name.
 
-    Hermes names MCP tools mcp__<server>__<tool>; everything else is a
+    Hermes names MCP tools mcp__<server>__<tool> and connector tools (apps
+    linked through the Nous portal) connectors__<app>__<tool>; the three
+    tool-search bridge tools form their own group; everything else is a
     built-in agent tool.
     """
     text = str(name or "")
@@ -3551,6 +3553,14 @@ def _tool_group(name: str) -> Tuple[str, str, str]:
         if sep and server:
             return ("mcp", server, short or rest)
         return ("mcp", rest or "mcp", rest or text)
+    if text.startswith("connectors__"):
+        rest = text[len("connectors__"):]
+        app, sep, short = rest.partition("__")
+        if sep and app:
+            return ("connector", app, short)
+        return ("connector", rest or "connectors", rest or text)
+    if text in TOOL_BRIDGE_NAMES:
+        return ("builtin", "tool search", text)
     return ("builtin", "built-in", text)
 
 
@@ -3925,7 +3935,10 @@ def _tools_sync(
                     ],
                 }
             )
-        groups.sort(key=lambda item: (item["failures"], item["calls"], item["name"]), reverse=True)
+        _merge_mcp_inventory(groups, day_keys)
+        groups.sort(
+            key=lambda item: (item["calls"] > 0, item["failures"], item["calls"], item["name"]), reverse=True
+        )
 
         return {
             "period_days": days,
@@ -3937,6 +3950,7 @@ def _tools_sync(
                 "failures": sum(item["failures"] for item in tools),
                 "distinct_tools": len(tools),
                 "mcp_servers": sum(1 for item in groups if item["kind"] == "mcp"),
+                "mcp_servers_unused": sum(1 for item in groups if item["kind"] == "mcp" and not item["calls"]),
                 "context_chars": sum(item["context_chars"] for item in groups),
                 "context_cost_usd": round(sum(item["context_cost_usd"] for item in groups), 4),
                 "carried_cost_usd": round(sum(item["carried_cost_usd"] for item in groups), 4),
@@ -3945,6 +3959,54 @@ def _tools_sync(
             "context_truncated": context_truncated,
             "generated_at": time.time(),
         }
+
+
+def _merge_mcp_inventory(groups: List[Dict[str, Any]], day_keys: List[str]) -> None:
+    """Give MCP groups their configuration, and list configured servers with no calls.
+
+    status: "used" (called in the period), "unused" (configured and on, no
+    calls), "disabled" (configured but switched off), "removed" (called in
+    the period, no longer in any scoped config.yaml).
+    """
+    try:
+        inventory = _mcp_inventory()
+    except Exception:
+        inventory = {}
+    for group in groups:
+        if group.get("kind") != "mcp":
+            continue
+        info = inventory.pop(str(group.get("name")), None)
+        group["status"] = "used" if info else "removed"
+        group["label"] = (info or {}).get("label") or group.get("name")
+        group["enabled"] = info.get("enabled") if info else None
+        group["available_tools"] = info.get("available_tools") if info else None
+        group["transport"] = info.get("transport") if info else None
+        group["host"] = info.get("host") if info else None
+    for key, info in sorted(inventory.items()):
+        groups.append(
+            {
+                "kind": "mcp",
+                "name": key,
+                "label": info.get("label") or key,
+                "status": "unused" if info.get("enabled") else "disabled",
+                "enabled": info.get("enabled"),
+                "available_tools": info.get("available_tools"),
+                "transport": info.get("transport"),
+                "host": info.get("host"),
+                "tool_count": 0,
+                "calls": 0,
+                "failures": 0,
+                "failure_rate": 0,
+                "sessions": 0,
+                "latency_p50_seconds": None,
+                "latency_p95_seconds": None,
+                "log_calls": 0,
+                "log_failures": 0,
+                **_context_weight_payload(None),
+                "last_used_at": None,
+                "trend": [{"day": day, "requests": 0} for day in day_keys],
+            }
+        )
 
 
 @router.get("/tools")

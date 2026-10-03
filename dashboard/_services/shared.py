@@ -145,6 +145,33 @@ def _service_get(url: str, headers: Mapping[str, str]) -> Tuple[int, Any, Option
     return response.status_code, body, None
 
 
+def _service_post(
+    url: str,
+    headers: Mapping[str, str],
+    *,
+    json_body: Any = None,
+    form: Optional[Mapping[str, str]] = None,
+) -> Tuple[int, Any, Optional[str]]:
+    """POST twin of _service_get, for vendors whose read-only queries are POSTs
+    (Vapi analytics, Voximplant's platform API). Never used to change anything."""
+    try:
+        import httpx
+    except ImportError:
+        return 0, None, "Hermes HTTP client is unavailable."
+    try:
+        response = httpx.post(
+            url, headers=dict(headers), json=json_body, data=dict(form) if form else None,
+            timeout=AI_USAGE_PROVIDER_TIMEOUT_SECONDS,
+        )
+    except Exception as error:
+        return 0, None, _provider_message(error)
+    try:
+        body = response.json()
+    except Exception:
+        body = None
+    return response.status_code, body, None
+
+
 def _credential_status(service: str, code: int, error: Optional[str], account: Optional[str] = None) -> Optional[Dict[str, Any]]:
     """Common credential outcomes; None when the response should be parsed."""
     label = _service_label_from_id(service)

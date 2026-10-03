@@ -983,10 +983,26 @@ const TOOL_EXPORT_COLUMNS = [
   { key: 'last_used_at', label: 'Last used (UTC)', value: row => isoStamp(row.last_used_at) }
 ]
 
+// The line under a tool source's name: how much of what it offers was used,
+// or why it has no calls. MCP servers come from config.yaml and Hermes'
+// schema cache, so a connected server shows before its first call.
+function toolSourceNote(row) {
+  const used = Number(row.tool_count) || 0
+  const available = row.available_tools == null ? null : Number(row.available_tools)
+  const offered = available == null ? '' : `${formatCount(available)} tool${available === 1 ? '' : 's'}`
+  if (row.status === 'disabled') return offered ? `${offered} · switched off` : 'switched off'
+  if (row.status === 'unused') return offered ? `${offered} · no calls in this period` : 'no calls in this period'
+  if (row.status === 'removed') return `${formatCount(used)} used · no longer configured`
+  if (available != null) return `${formatCount(used)} of ${offered} used`
+  return `${formatCount(used)} tool${used === 1 ? '' : 's'}`
+}
+
 const TOOL_GROUP_EXPORT_COLUMNS = [
-  { key: 'name', label: 'Source' },
+  { key: 'name', label: 'Source', value: row => row.label || row.name },
   { key: 'kind', label: 'Kind' },
-  { key: 'tool_count', label: 'Tools' },
+  { key: 'status', label: 'Status' },
+  { key: 'tool_count', label: 'Tools used' },
+  { key: 'available_tools', label: 'Tools available' },
   { key: 'calls', label: 'Calls' },
   { key: 'sessions', label: 'Sessions' },
   { key: 'failures', label: 'Failures' },
@@ -2173,7 +2189,7 @@ function ToolsView({ ctx, period }) {
       children: [
         jsx(SectionHeading, {
           title: 'Tools & MCP servers',
-          description: `${formatCount(data.totals.calls)} recorded calls across ${formatCount(data.totals.distinct_tools)} tools${data.totals.mcp_servers ? ` · ${formatCount(data.totals.mcp_servers)} MCP server${data.totals.mcp_servers === 1 ? '' : 's'}` : ''}. Latency comes from bounded local agent logs. Context weight estimates the tokens tool results push into model context (recorded result length ÷ 4) and prices them at each session's billing route via Hermes' pricing tables — hover a value for the direct and carried figures.`,
+          description: `${formatCount(data.totals.calls)} recorded calls across ${formatCount(data.totals.distinct_tools)} tools${data.totals.mcp_servers ? ` · ${formatCount(data.totals.mcp_servers)} MCP server${data.totals.mcp_servers === 1 ? '' : 's'}${data.totals.mcp_servers_unused ? ` (${formatCount(data.totals.mcp_servers_unused)} with no calls in this period)` : ''}` : ''}. Latency comes from bounded local agent logs. Context weight estimates the tokens tool results push into model context (recorded result length ÷ 4) and prices them at each session's billing route via Hermes' pricing tables — hover a value for the direct and carried figures.`,
           action: jsx(ExportMenu, {
             title: 'Export tool and MCP-server analytics for the selected period',
             items: [
@@ -2205,9 +2221,15 @@ function ToolsView({ ctx, period }) {
               render: row => jsxs('div', {
                 style: { alignItems: 'center', display: 'flex', gap: '0.4rem', minWidth: 0 },
                 children: [
-                  jsx('span', { style: { fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis' }, children: row.name }),
+                  jsx('span', {
+                    title: row.host ? `${row.transport || 'http'} · ${row.host}` : row.transport || undefined,
+                    style: { color: row.calls ? color.primary : color.tertiary, fontWeight: 600, overflow: 'hidden', textOverflow: 'ellipsis' },
+                    children: row.label || row.name
+                  }),
                   row.kind === 'mcp' ? jsx(Pill, { tone: 'accent', children: 'MCP' }) : null,
-                  jsx('span', { style: { color: color.quaternary, fontSize: '0.625rem', whiteSpace: 'nowrap' }, children: `${formatCount(row.tool_count)} tool${row.tool_count === 1 ? '' : 's'}` })
+                  row.kind === 'connector' ? jsx(Pill, { tone: 'accent', title: 'An app linked through Hermes connectors', children: 'Connector' }) : null,
+                  row.status === 'disabled' ? jsx(Pill, { title: 'enabled: false in config.yaml', children: 'Off' }) : null,
+                  jsx('span', { style: { color: color.quaternary, fontSize: '0.625rem', whiteSpace: 'nowrap' }, children: toolSourceNote(row) })
                 ]
               })
             },
@@ -2261,7 +2283,7 @@ function ToolsView({ ctx, period }) {
             {
               key: 'name',
               label: 'Tool',
-              render: row => row.kind === 'mcp'
+              render: row => row.kind === 'mcp' || row.kind === 'connector'
                 ? jsxs('span', { children: [jsx('span', { style: { color: color.quaternary }, children: `${row.group} · ` }), row.short_name] })
                 : row.name
             },

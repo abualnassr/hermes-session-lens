@@ -129,11 +129,130 @@ def _mcp_server_entries() -> List[Dict[str, Any]]:
     return entries
 
 
-def _service_for_mcp_name(name: str) -> Optional[str]:
+# ── MCP server inventory (Tools tab) ──────────────────────────────────────
+# Which MCP servers each profile has configured and which tools each offers,
+# so a connected server shows on the Tools tab before its first call. Both
+# sources are local files Hermes maintains: config.yaml `mcp_servers` and
+# the schema cache Hermes writes when it discovers a server's tools
+# (cache/mcp_schema_cache.json). Names only; no server is contacted.
+
+_mcp_file_cache: Dict[str, Tuple[Tuple[int, int], Any]] = {}
+
+
+def _sanitize_mcp_component(value: Any) -> str:
+    """Hermes' sanitize_mcp_name_component: every char outside [A-Za-z0-9_] becomes _."""
+    return re.sub(r"[^A-Za-z0-9_]", "_", str(value or ""))
+
+
+def _cached_file_parse(path: Path, parse: Any) -> Any:
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    signature = (stat.st_size, stat.st_mtime_ns)
+    key = str(path)
+    cached = _mcp_file_cache.get(key)
+    if cached and cached[0] == signature:
+        return cached[1]
+    try:
+        value = parse(path.read_text(encoding="utf-8", errors="replace"))
+    except Exception:
+        value = None
+    _mcp_file_cache[key] = (signature, value)
+    return value
+
+
+def _config_mcp_servers(home: Path) -> Dict[str, Mapping[str, Any]]:
+    def parse(text: str) -> Dict[str, Mapping[str, Any]]:
+        try:
+            import yaml  # Hermes ships PyYAML; CI may not
+
+            data = yaml.safe_load(text) or {}
+            servers = data.get("mcp_servers") if isinstance(data, Mapping) else None
+        except ImportError:
+            servers = _mcp_servers_from_text(text)
+        if not isinstance(servers, Mapping):
+            return {}
+        return {str(name): spec for name, spec in servers.items() if isinstance(spec, Mapping)}
+
+    return _cached_file_parse(home / "config.yaml", parse) or {}
+
+
+def _mcp_schema_catalog(home: Path) -> Dict[str, List[str]]:
+    """server name -> tool names from Hermes' MCP schema cache (empty when absent)."""
+
+    def parse(text: str) -> Dict[str, List[str]]:
+        data = json.loads(text)
+        catalog: Dict[str, List[str]] = {}
+        if not isinstance(data, Mapping):
+            return catalog
+        for server, entry in data.items():
+            tools = entry.get("tools") if isinstance(entry, Mapping) else None
+            if isinstance(tools, list):
+                catalog[str(server)] = sorted(
+                    {str(tool.get("name")) for tool in tools if isinstance(tool, Mapping) and tool.get("name")}
+                )
+        return catalog
+
+    return _cached_file_parse(home / "cache" / "mcp_schema_cache.json", parse) or {}
+
+
+def _mcp_enabled(spec: Mapping[str, Any]) -> bool:
+    enabled = spec.get("enabled", True)
+    return enabled if isinstance(enabled, bool) else str(enabled).strip().lower() not in {"false", "0", "no", "off"}
+
+
+def _mcp_inventory() -> Dict[str, Dict[str, Any]]:
+    """Configured MCP servers across the scope, keyed by their tool-name prefix.
+
+    The key is the server name as Hermes writes it into tool names
+    (mcp__<key>__<tool>), so it joins recorded usage directly.
+    """
+    inventory: Dict[str, Dict[str, Any]] = {}
+    for home in _scope_homes():
+        servers = _config_mcp_servers(home)
+        catalog = _mcp_schema_catalog(home)
+        for name, spec in servers.items():
+            key = _sanitize_mcp_component(name)
+            url = str(spec.get("url") or "").strip()
+            entry = inventory.setdefault(
+                key,
+                {
+                    "label": name,
+                    "enabled": False,
+                    "transport": "http" if url else "stdio",
+                    "host": (urlparse(url).hostname or "")[:120] if url else None,
+                    "tool_names": set(),
+                    "catalogued": False,
+                },
+            )
+            entry["enabled"] = entry["enabled"] or _mcp_enabled(spec)
+            if name in catalog:
+                entry["catalogued"] = True
+                entry["tool_names"].update(catalog[name])
+    for entry in inventory.values():
+        entry["available_tools"] = len(entry["tool_names"]) if entry["catalogued"] else None
+    return inventory
+
+
+def _registrable_domain(host: Any) -> str:
+    parts = [part for part in str(host or "").lower().split(".") if part]
+    return ".".join(parts[-2:]) if len(parts) >= 2 else ""
+
+
+def _service_for_mcp_name(name: str, host: Optional[str] = None) -> Optional[str]:
+    """The service an mcp_servers entry belongs to: by a name hint, else by a
+    host on the same domain as an adapter's API host (mcp.twilio.com joins
+    api.twilio.com)."""
     lowered = str(name or "").lower()
     for adapter in _service_adapters().values():
         if any(hint in lowered for hint in adapter.mcp_hints):
             return adapter.id
+    domain = _registrable_domain(host)
+    if domain:
+        for adapter in _service_adapters().values():
+            if any(_registrable_domain(api_host) == domain for api_host in adapter.hosts):
+                return adapter.id
     return None
 
 
@@ -177,7 +296,7 @@ def _services_inventory() -> Dict[str, Dict[str, Any]]:
         item["sources"].append(f"env:{name}")
 
     for server in _mcp_server_entries():
-        service_id = _service_for_mcp_name(server["name"]) or server["name"].lower()
+        service_id = _service_for_mcp_name(server["name"], server.get("host")) or server["name"].lower()
         item = entry(service_id, "service" if service_id in adapters else "mcp")
         source = f"mcp:{server['name']}"
         if server.get("host"):

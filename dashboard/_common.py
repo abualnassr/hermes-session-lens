@@ -64,7 +64,7 @@ def _plugin_version() -> str:
             return match.group(1)
     except OSError:
         pass
-    return "0.44.0"
+    return "0.45.0"
 
 
 PLUGIN_VERSION = _plugin_version()
@@ -574,7 +574,58 @@ def _parse_json(value: Any, fallback: Any) -> Any:
         return fallback
 
 
+# Hermes' tool search (2026-09) defers most tools behind three bridge tools:
+# the model finds one with tool_search, loads its schema with tool_describe,
+# and runs it through tool_call {"calls": [{"name", "arguments"}, ...]}.
+TOOL_BRIDGE_CALL = "tool_call"
+TOOL_BRIDGE_NAMES = frozenset({"tool_search", "tool_describe", TOOL_BRIDGE_CALL})
+
+
+def _bridge_entries(name: str, arguments: Any) -> Optional[List[Tuple[str, Dict[str, Any]]]]:
+    """The tools a tool_call bridge invocation actually ran, or None.
+
+    Accepts the shapes Hermes' normalize_tool_call_entries accepts: the
+    batch {"calls": [...]} (also as a JSON string or a single object) and
+    the legacy {"name", "arguments"}. None when `name` is not the bridge or
+    nothing parses, so the call stays attributed to tool_call itself.
+
+    Hermes runs one local tool per bridge call (it splits a valid local
+    batch into single calls before recording it) but runs a batch of
+    connector tools as one call. A recorded multi-entry batch that is not
+    all connectors was refused, so none of its tools ran: it stays
+    tool_call, failure and all.
+    """
+    if name != TOOL_BRIDGE_CALL or not isinstance(arguments, Mapping):
+        return None
+    raw_calls = arguments.get("calls")
+    if raw_calls is None and str(arguments.get("name") or "").strip():
+        raw_calls = [{"name": arguments.get("name"), "arguments": arguments.get("arguments")}]
+    raw_calls = _parse_json(raw_calls, raw_calls) if isinstance(raw_calls, str) else raw_calls
+    if isinstance(raw_calls, Mapping):
+        raw_calls = [raw_calls]
+    if not isinstance(raw_calls, list):
+        return None
+    entries: List[Tuple[str, Dict[str, Any]]] = []
+    for raw in raw_calls:
+        if not isinstance(raw, Mapping):
+            continue
+        inner = str(raw.get("name") or "").strip()
+        if not inner or inner in TOOL_BRIDGE_NAMES:
+            continue
+        inner_args = _parse_json(raw.get("arguments"), {})
+        entries.append((inner, inner_args if isinstance(inner_args, dict) else {}))
+    if len(entries) > 1 and not all(inner.startswith("connectors__") for inner, _ in entries):
+        return None
+    return entries or None
+
+
 def _iter_tool_calls(value: Any) -> Iterable[Dict[str, Any]]:
+    """Recorded tool calls, with tool_call bridge invocations unwrapped.
+
+    A bridged call yields one entry per tool it ran, named after that tool
+    and carrying "via": "tool_call"; every entry keeps the bridge call's id,
+    which is the id the recorded tool result pairs with.
+    """
     calls = _parse_json(value, [])
     if not isinstance(calls, list):
         return []
@@ -589,13 +640,13 @@ def _iter_tool_calls(value: Any) -> Iterable[Dict[str, Any]]:
         arguments = _parse_json(function.get("arguments"), {})
         if not isinstance(arguments, dict):
             arguments = {}
-        parsed.append(
-            {
-                "call_id": call.get("id") or call.get("call_id") or call.get("response_item_id"),
-                "name": name.strip(),
-                "arguments": arguments,
-            }
-        )
+        call_id = call.get("id") or call.get("call_id") or call.get("response_item_id")
+        entries = _bridge_entries(name.strip(), arguments)
+        if entries:
+            for inner, inner_args in entries:
+                parsed.append({"call_id": call_id, "name": inner, "arguments": inner_args, "via": TOOL_BRIDGE_CALL})
+            continue
+        parsed.append({"call_id": call_id, "name": name.strip(), "arguments": arguments})
     return parsed
 
 

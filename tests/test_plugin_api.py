@@ -649,6 +649,143 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertEqual(kept, ["Plan: Free"])
         self.assertEqual(muted, ["Top up at https://portal.nousresearch.com/billing", "(or run /topup)"])
 
+    def test_tool_call_bridge_is_credited_to_the_tool_it_ran(self):
+        def bridged(arguments):
+            return json.dumps([{"id": "call-b", "function": {"name": "tool_call", "arguments": json.dumps(arguments)}}])
+
+        single = list(api._iter_tool_calls(bridged({"calls": [{"name": "mcp__vercel__get_project", "arguments": {"id": "p1"}}]})))
+        self.assertEqual([(c["name"], c["call_id"], c.get("via")) for c in single], [("mcp__vercel__get_project", "call-b", "tool_call")])
+        self.assertEqual(single[0]["arguments"], {"id": "p1"})
+        legacy = list(api._iter_tool_calls(bridged({"name": "terminal", "arguments": "{\"command\": \"ls\"}"})))
+        self.assertEqual([(c["name"], c["arguments"]) for c in legacy], [("terminal", {"command": "ls"})])
+        # Hermes refuses a multi-entry batch of local tools: nothing ran, it stays the bridge call.
+        refused = list(api._iter_tool_calls(bridged({"calls": [{"name": "read_file"}, {"name": "terminal"}]})))
+        self.assertEqual([c["name"] for c in refused], ["tool_call"])
+        # A batch of connector tools runs as one call; each tool is credited.
+        connectors = list(api._iter_tool_calls(bridged({"calls": [
+            {"name": "connectors__gmail__send_email", "arguments": {}},
+            {"name": "connectors__slack__post_message", "arguments": {}},
+        ]})))
+        self.assertEqual([c["name"] for c in connectors], ["connectors__gmail__send_email", "connectors__slack__post_message"])
+        self.assertEqual([c["name"] for c in api._iter_tool_calls(bridged({"calls": "not json"}))], ["tool_call"])
+        rule_calls = rules_mod._tool_calls_from_row(bridged({"calls": [{"name": "terminal", "arguments": {"command": "rm -rf /tmp/x"}}]}))
+        self.assertEqual(rule_calls[0]["name"], "terminal")
+        self.assertIn("rm -rf", rule_calls[0]["arguments"])
+
+        self.assertEqual(api._tool_group("connectors__gmail__send_email"), ("connector", "gmail", "send_email"))
+        self.assertEqual(api._tool_group("tool_search"), ("builtin", "tool search", "tool_search"))
+        self.assertEqual(api._tool_group("mcp__scrape_creators__v1_x"), ("mcp", "scrape_creators", "v1_x"))
+
+    def test_tools_tab_lists_configured_mcp_servers_without_calls(self):
+        (self.home / "config.yaml").write_text(
+            "model: x\n"
+            "mcp_servers:\n"
+            "  scrape-creators:\n"
+            "    url: https://api.scrapecreators.com/mcp\n"
+            "  vercel:\n"
+            "    url: https://mcp.vercel.com\n"
+            "  old-thing:\n"
+            "    command: npx\n"
+            "    enabled: false\n",
+            encoding="utf-8",
+        )
+        (self.home / "cache").mkdir(exist_ok=True)
+        (self.home / "cache" / "mcp_schema_cache.json").write_text(json.dumps({
+            "scrape-creators": {"tools": [{"name": "v1_a"}, {"name": "v1_b"}, {"name": "v1_c"}]},
+            "vercel": {"tools": [{"name": "get_project"}, {"name": "list_teams"}]},
+            "gone-from-config": {"tools": [{"name": "x"}]},
+        }), encoding="utf-8")
+        connection = sqlite3.connect(self.db_path)
+        connection.execute(
+            "INSERT INTO messages (session_id, role, content, tool_name, tool_call_id, timestamp) "
+            "VALUES ('session-1', 'tool', '{}', 'mcp__scrape_creators__v1_a', 'c-sc', 1800000050)"
+        )
+        connection.commit()
+        connection.close()
+        payload = api._tools_sync(0)
+        by_name = {group["name"]: group for group in payload["groups"] if group["kind"] == "mcp"}
+        self.assertEqual(by_name["scrape_creators"]["status"], "used")
+        self.assertEqual(by_name["scrape_creators"]["label"], "scrape-creators")
+        self.assertEqual(by_name["scrape_creators"]["available_tools"], 3)
+        self.assertEqual(by_name["vercel"]["status"], "unused")
+        self.assertEqual(by_name["vercel"]["calls"], 0)
+        self.assertEqual(by_name["vercel"]["available_tools"], 2)
+        self.assertEqual(by_name["vercel"]["host"], "mcp.vercel.com")
+        self.assertEqual(by_name["old_thing"]["status"], "disabled")
+        self.assertIsNone(by_name["old_thing"]["available_tools"])
+        self.assertNotIn("gone_from_config", by_name)
+        self.assertEqual(payload["totals"]["mcp_servers_unused"], 2)
+        self.assertEqual(payload["groups"][-1]["calls"], 0)
+        names = {item["name"] for item in api._tool_names_sync()["tools"]}
+        self.assertIn("mcp__vercel__list_teams", names)
+        self.assertNotIn("mcp__old_thing__x", names)
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("function toolSourceNote(row)", source)
+        self.assertIn("no calls in this period", source)
+
+    def test_new_service_adapters_parse_vendor_responses(self):
+        from dashboard._services import contextdev, hive, realitydefender, twilio, vapi, voximplant
+
+        card = twilio._twilio_payload(
+            {"account_sid": "AC1", "balance": "36.1353", "currency": "USD"},
+            {"usage_records": [{"category": "totalprice", "price": 12.71, "price_unit": "usd"}]},
+        )
+        self.assertEqual((card["status"], card["windows"][0]["remaining"]), ("ok", 36.1353))
+        self.assertEqual(card["details"], ["Spent this month: 12.71 USD"])
+        self.assertEqual(twilio._twilio_payload({"balance": "5"}, None)["details"], [])
+        self.assertEqual(twilio._twilio_payload({"account_sid": "AC1"}, None)["status"], "unavailable")
+
+        card = voximplant._voximplant_payload({"result": {"balance": 9.964, "currency": "USD", "credit_limit": 0}})
+        self.assertEqual((card["windows"][0]["remaining"], card["windows"][0]["unit"]), (9.964, "USD"))
+        self.assertEqual(voximplant._voximplant_payload({"error": {"msg": "Invalid token", "code": 100}})["status"], "expired")
+
+        card = contextdev._contextdev_payload({"data": [], "key_metadata": {"credits_consumed": 0, "credits_remaining": 1000}})
+        self.assertEqual(card["windows"][0]["remaining"], 1000)
+        self.assertEqual(contextdev._contextdev_payload({"data": []})["status"], "unavailable")
+
+        card = vapi._vapi_payload([{"name": "spend", "result": [{"sumCost": 1.5, "countId": 3}]}])
+        self.assertEqual(card["details"], ["$1.50 call spend this month across 3 calls"])
+        query = vapi._vapi_month_query()["queries"][0]
+        self.assertEqual((query["table"], query["timeRange"]["step"]), ("call", "month"))
+
+        self.assertEqual(realitydefender._realitydefender_payload({"totalItems": 0})["details"], ["0 scans this month"])
+
+        os.environ["HIVE_API_KEY"] = "test-key"
+        os.environ["HIVE_CREDIT_REMAINING"] = "49.926"
+        try:
+            card = hive._collect_hive()
+            self.assertEqual(card["windows"][0]["label"], "Credit (kept in .env)")
+            self.assertEqual(card["windows"][0]["remaining"], 49.926)
+            os.environ.pop("HIVE_CREDIT_REMAINING")
+            self.assertEqual(hive._collect_hive()["windows"], [])
+        finally:
+            os.environ.pop("HIVE_API_KEY", None)
+            os.environ.pop("HIVE_CREDIT_REMAINING", None)
+
+        self.assertEqual(services._service_for_mcp_name("twilio-docs", "mcp.twilio.com"), "twilio")
+        self.assertEqual(services._service_for_mcp_name("context", "mcp.context.dev"), "contextdev")
+        self.assertIsNone(services._service_for_mcp_name("context7", "mcp.context7.com"))
+        self.assertIsNone(services._service_for_mcp_name("vercel", "mcp.vercel.com"))
+
+    def test_voximplant_token_is_a_short_lived_rs256_service_account_jwt(self):
+        try:
+            import jwt
+            from cryptography.hazmat.primitives import serialization
+            from cryptography.hazmat.primitives.asymmetric import rsa
+        except ImportError:
+            self.skipTest("PyJWT/cryptography not installed")
+        from dashboard._services import voximplant
+
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        pem = key.private_bytes(
+            serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8, serialization.NoEncryption()
+        ).decode("ascii")
+        token = voximplant._voximplant_token("1234", "key-uuid", pem.replace("\n", "\\n"))
+        self.assertEqual(jwt.get_unverified_header(token)["kid"], "key-uuid")
+        claims = jwt.decode(token, key.public_key(), algorithms=["RS256"])
+        self.assertEqual(claims["iss"], "1234")
+        self.assertLessEqual(claims["exp"] - claims["iat"], 3600)
+
     def test_collector_threads_inherit_the_request_context(self):
         import contextvars
         from concurrent.futures import ThreadPoolExecutor
@@ -4566,7 +4703,7 @@ class AdapterRegistryTests(unittest.TestCase):
 
     def test_registry_order_tables_and_declarations(self):
         self.assertEqual(api._provider_ids(), ("codex", "anthropic", "nous", "openrouter", "deepseek", "grok", "kimi", "zai"))
-        self.assertEqual(api._service_ids(), ("firecrawl", "scrapecreators", "agentmail", "brightdata", "monid", "brave", "telegram", "herenow"))
+        self.assertEqual(api._service_ids(), ("firecrawl", "scrapecreators", "agentmail", "brightdata", "monid", "brave", "twilio", "voximplant", "contextdev", "vapi", "realitydefender", "hive", "telegram", "herenow", "typesafe", "reef"))
         self.assertEqual(api._USAGE_BILLING_KEYS["kimi"], ("kimi-coding", "kimi-coding-cn"))
         self.assertEqual(api._BUDGET_BILLING_TO_PROVIDER["xai-oauth"], "grok")
         self.assertTrue({"openai-codex", "claude", "moonshot", "zai-coding"} <= api._USAGE_COVERED_PROVIDER_IDS)
