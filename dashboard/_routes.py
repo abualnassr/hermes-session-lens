@@ -16,6 +16,7 @@ try:
     from ._watch import *
     from ._anatomy import *
     from ._chains import *
+    from ._savings import *
 except ImportError:  # pragma: no cover - direct Hermes file loading
     from _common import *
     from _logparse import *
@@ -28,6 +29,7 @@ except ImportError:  # pragma: no cover - direct Hermes file loading
     from _watch import *
     from _anatomy import *
     from _chains import *
+    from _savings import *
 
 router = APIRouter()
 
@@ -2473,7 +2475,12 @@ def _route_descriptor(provider: Any, base_url: Any, billing_mode: Any) -> Dict[s
     if provider_key == "anthropic" and mode_subscription:
         meta = {"label": "Anthropic OAuth", "provider": "Anthropic", "quota_provider": "anthropic"}
         oauth = True
-    subscription = oauth and provider_key not in {"nous"}
+    plan_route = _is_subscription_route(provider_key, base_url)
+    if plan_route and not meta:
+        # A model-provider plugin driving a flat-rate plan (Claude Pro/Max through
+        # Claude Code): no cash per call, and its use burns the Claude windows.
+        meta = {"label": "Claude subscription (plugin)", "provider": "Anthropic", "quota_provider": "anthropic"}
+    subscription = (oauth and provider_key not in {"nous"}) or plan_route
     provider_label = str(meta.get("provider") or _humanize_identifier(provider_key))
     route_label = str(meta.get("label") or f"{provider_label} {'OAuth' if oauth else 'API'}")
     parsed = urlparse(str(base_url or ""))
@@ -3572,6 +3579,21 @@ def _ai_models_sync(
                 _ai_models_cache.pop(key, None)
         _ai_models_cache[cache_key] = (time.time(), copy.deepcopy(payload))
     return payload
+
+
+def _savings_route_sync(days: int, start_at: Optional[float] = None, end_at: Optional[float] = None) -> Dict[str, Any]:
+    """Savings advice with the AI Models evidence for the same period (its cache serves a warm tab)."""
+    return _savings_sync(days, start_at, end_at, models_payload=_ai_models_sync(days, start_at, end_at))
+
+
+@router.get("/savings")
+async def savings(
+    days: int = Query(30, ge=0, le=3650),
+    start_at: Optional[float] = Query(None, ge=0),
+    end_at: Optional[float] = Query(None, ge=0),
+    profiles: str = Query(""),
+) -> Dict[str, Any]:
+    return await asyncio.to_thread(_scoped_call, profiles, _savings_route_sync, days, start_at, end_at)
 
 
 @router.get("/ai-models")

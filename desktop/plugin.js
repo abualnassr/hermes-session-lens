@@ -5490,6 +5490,7 @@ function SessionLensPage({ ctx }) {
     onDrill: drillToSessions
   })
   if (tab === 'ai-models') content = jsx(AIModelsView, {
+    ctx,
     period,
     onDrill: drillToSessions,
     query: aiModelsQuery,
@@ -6602,7 +6603,54 @@ function AIModelsStatStrip({ data }) {
   })
 }
 
-function AIModelsView({ query, quotaQuery, narrow, refreshError, onDrill, period }) {
+function savingsVerdictPill(verdict) {
+  if (verdict === 'as reliable or better') return { tone: 'accent', label: 'As reliable or better' }
+  if (verdict === 'less reliable') return { tone: 'danger', label: 'Less reliable' }
+  return { tone: 'neutral', label: 'Current model unproven' }
+}
+
+// The same conversation work priced on the routes this install already
+// runs, beside their measured task failure bound. Loaded after AI Models so
+// it reuses that payload's evidence (and its cache).
+function SavingsSection({ ctx, period, enabled }) {
+  const query = useQuery({
+    queryKey: [PLUGIN_ID, 'savings', activeProfilesParam, period.days, period.start_at, period.end_at],
+    queryFn: () => pluginRest(ctx, apiPath('/savings', period)),
+    enabled: Boolean(enabled),
+    staleTime: 120_000
+  })
+  if (!enabled || query.isError || !query.data) return null
+  const data = query.data
+  const rows = []
+  for (const model of data.models || []) {
+    for (const alternative of model.alternatives || []) rows.push({ ...alternative, current: model })
+  }
+  return jsxs('section', {
+    children: [
+      jsx(SectionHeading, {
+        title: 'Cheaper routes with evidence',
+        description: rows.length
+          ? `Up to ${formatCost(data.totals.best_saving_usd, 'estimated')} of this period's ${formatCost(data.totals.cash_usd, 'estimated')} conversation spend could have run on a route at least as reliable or already measured. ${data.definition}`
+          : `No cheaper route with enough evidence for this period's ${formatCost(data.totals?.cash_usd, 'estimated')} of conversation spend. ${data.definition}`
+      }),
+      rows.length
+        ? jsx(SimpleTable, {
+            columns: [
+              { key: 'current', label: 'Now', render: row => jsxs('div', { style: { display: 'grid', gap: '0.1rem' }, children: [jsx('span', { style: { fontWeight: 600 }, children: row.current.model }), jsx('span', { style: { color: color.tertiary, fontSize: '0.625rem' }, children: `${formatCost(row.current.cash_usd, 'estimated')} · ${formatCount(row.current.calls)} calls${row.current.failure_upper_bound != null ? ` · fails ≤ ${(row.current.failure_upper_bound * 100).toFixed(1)}%` : ''}` })] }) },
+              { key: 'model', label: 'Instead', render: row => jsxs('div', { style: { display: 'grid', gap: '0.1rem' }, children: [jsx('span', { style: { fontWeight: 600 }, children: row.model }), jsx('span', { style: { color: color.tertiary, fontSize: '0.625rem' }, children: `${row.route_label || ''}${row.subscription ? ' · uses plan quota' : ''}` })] }) },
+              { key: 'cost_usd', label: 'Would cost', align: 'right', render: row => jsx('span', { style: tabular, children: formatCost(row.cost_usd, 'estimated') }) },
+              { key: 'saving_usd', label: 'Saving', align: 'right', render: row => jsx('span', { style: { ...tabular, color: color.primary, fontWeight: 600 }, children: `${formatCost(row.saving_usd, 'estimated')} (${(row.saving_share * 100).toFixed(0)}%)` }) },
+              { key: 'failure_upper_bound', label: 'Fails at most', align: 'right', render: row => jsx('span', { style: tabular, title: `95% upper bound from ${formatCount(row.eligible_tasks)} scored tasks`, children: `${(row.failure_upper_bound * 100).toFixed(1)}%` }) },
+              { key: 'verdict', label: 'Evidence', render: row => { const pill = savingsVerdictPill(row.verdict); return jsx(Pill, { tone: pill.tone, children: pill.label }) } }
+            ],
+            rows
+          })
+        : null
+    ]
+  })
+}
+
+function AIModelsView({ query, quotaQuery, narrow, refreshError, onDrill, period, ctx }) {
   if (queryPending(query)) return jsx(LoadingBlock, { rows: 9 })
   if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'AI model analytics are unavailable' })
   const data = query.data
@@ -6651,6 +6699,7 @@ function AIModelsView({ query, quotaQuery, narrow, refreshError, onDrill, period
           : null,
         jsx(RoutingSummary, { models: data.models, coverage: data.coverage, onDrill }),
         jsx(AIModelsTable, { models: data.models, quotaData: quotaQuery?.data, coverage: data.coverage, narrow, onDrill, period }),
+        ctx ? jsx(SavingsSection, { ctx, period, enabled: Boolean(data) }) : null,
         jsxs('div', {
           style: { alignItems: 'flex-start', borderTop: border, color: color.tertiary, display: 'flex', fontSize: '0.6875rem', gap: '0.5rem', lineHeight: 1.5, paddingTop: '0.75rem' },
           children: [

@@ -1211,6 +1211,62 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertIn("function ConversationChainsSection({ ctx, period, onOpenSession })", source)
         self.assertIn("jsx(ChainNote, { ctx, sessionId: session.id, profile })", source)
 
+    def test_savings_advisor_offers_only_evidenced_cheaper_routes(self):
+        from dashboard import _savings as savings_mod
+
+        connection = sqlite3.connect(self.db_path)
+        rows = [
+            # model, provider, task, input, cache_read, output, calls, cost, status
+            ("pricey/model", "openrouter", "", 1_000_000, 4_000_000, 50_000, 300, 3.00, "estimated"),
+            ("pricey/model", "openrouter", "vision", 500_000, 0, 10_000, 40, 0.90, "estimated"),
+            ("cheap/model", "deepseek", "", 200_000, 800_000, 10_000, 90, 0.10, "estimated"),
+            ("plan/model", "openai-codex", "", 100_000, 0, 5_000, 30, 0.0, "included"),
+            ("unproven/model", "openrouter", "", 10_000, 0, 1_000, 3, 0.01, "estimated"),
+        ]
+        for index, (model, provider, task, inp, cached, out, calls, cost, status) in enumerate(rows):
+            connection.execute(
+                """
+                INSERT INTO session_model_usage (session_id, model, billing_provider, task, api_call_count, input_tokens,
+                                                 output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                                                 estimated_cost_usd, actual_cost_usd, cost_status, first_seen, last_seen)
+                VALUES ('session-1', ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, 0, ?, 1800000000, 1800000100)
+                """,
+                (model, provider, task, calls, inp, out, cached, cost, status),
+            )
+        connection.commit()
+        connection.close()
+        evidence = {"models": [
+            {"model_id": "pricey/model", "route_label": "OpenRouter API", "cost_kind": "estimated",
+             "work_reliability": {"eligible_tasks": 40, "failure_rate_upper_bound_95": 0.06}},
+            {"model_id": "cheap/model", "route_label": "DeepSeek API", "cost_kind": "estimated",
+             "work_reliability": {"eligible_tasks": 60, "failure_rate_upper_bound_95": 0.05}},
+            {"model_id": "plan/model", "route_label": "OpenAI OAuth", "cost_kind": "subscription",
+             "work_reliability": {"eligible_tasks": 30, "failure_rate_upper_bound_95": 0.20}},
+            {"model_id": "unproven/model", "route_label": "OpenRouter API", "cost_kind": "estimated",
+             "work_reliability": {"eligible_tasks": 3, "failure_rate_upper_bound_95": 0.01}},
+        ]}
+        prices = {("cheap/model", "deepseek"): (0.2e-6, 0.4e-6, 0.02e-6, 0.2e-6),
+                  ("unproven/model", "openrouter"): (0.01e-6, 0.01e-6, 0.001e-6, 0.01e-6)}
+        with patch.object(savings_mod, "_mix_rates", side_effect=lambda model, provider: prices.get((model, provider))):
+            advice = api._savings_sync(0, models_payload=evidence, sample_floor=20)
+        pricey = next(item for item in advice["models"] if item["model"] == "pricey/model")
+        self.assertAlmostEqual(pricey["cash_usd"], 3.00)  # the vision helper task is not counted
+        self.assertEqual([alt["model"] for alt in pricey["alternatives"]], ["cheap/model"])
+        cheap = pricey["alternatives"][0]
+        # 1M x $0.2/M + 4M x $0.02/M + 50k x $0.4/M = $0.30
+        self.assertAlmostEqual(cheap["cost_usd"], 0.30, places=4)
+        self.assertEqual(cheap["verdict"], "as reliable or better")
+        self.assertAlmostEqual(advice["totals"]["best_saving_usd"], 2.70, places=2)
+        self.assertNotIn("unproven/model", [alt["model"] for item in advice["models"] for alt in item["alternatives"]])
+        self.assertNotIn("plan/model", [alt["model"] for item in advice["models"] for alt in item["alternatives"]])
+
+        route = api._route_descriptor("claude-subscription-directsdk-experimental", "process://claude-subscription-directsdk-experimental", "")
+        self.assertTrue(route["subscription"])
+        self.assertEqual(route["quota_provider"], "anthropic")
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("function SavingsSection({ ctx, period, enabled })", source)
+        self.assertIn("pluginRest(ctx, apiPath('/savings', period))", source)
+
     def test_collector_threads_inherit_the_request_context(self):
         import contextvars
         from concurrent.futures import ThreadPoolExecutor
@@ -1951,9 +2007,9 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertEqual(source.count("digestExportItem(ctx, period)"), 3)
         # The views that gained a period-stamped filename receive the period from the page.
         self.assertIn("function AIUsageView({ ctx, query, servicesQuery, narrow, refreshError, history, ledger, onRefreshProvider, onRefreshService, onDrill, budgets, onBudgetsChange, period })", source)
-        self.assertIn("function AIModelsView({ query, quotaQuery, narrow, refreshError, onDrill, period })", source)
+        self.assertIn("function AIModelsView({ query, quotaQuery, narrow, refreshError, onDrill, period, ctx })", source)
         self.assertEqual(source.count("jsx(AIUsageView, {\n    period,"), 1)
-        self.assertEqual(source.count("jsx(AIModelsView, {\n    period,"), 1)
+        self.assertEqual(source.count("jsx(AIModelsView, {\n    ctx,\n    period,"), 1)
 
     def test_export_csv_helpers_escape_and_stamp(self):
         """Run the pure export helpers under node: CSV escaping, BOM, filenames."""
