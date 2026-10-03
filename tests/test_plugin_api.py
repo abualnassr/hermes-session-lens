@@ -1054,6 +1054,73 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertIn("{ id: 'fleet', label: 'Fleet', codicon: 'organization' }", source)
         self.assertIn("function FleetView({ ctx, onOpenProfile })", source)
 
+    def test_cost_anatomy_explains_where_a_session_spent(self):
+        from dashboard import _anatomy as anatomy_mod
+
+        start = 1_800_300_000
+        lines = []
+        prompt = 50_000
+        for index in range(40):
+            prompt = 40_000 if index == 25 else prompt + 4_000  # one compression at call 26
+            lines.append(
+                f"{_stamp(start + index * 30)} INFO [session-1] agent.conversation_loop: API call #{index + 1}: "
+                f"model=provider/model-a provider=openrouter in={prompt} out=500 total={prompt + 500} latency=1.0s "
+                f"cache={int(prompt * 0.9)}/{prompt} (90%)\n"
+            )
+        (self.home / "logs" / "agent.log.anatomy").write_text("".join(lines), encoding="utf-8")
+        api._log_file_cache.clear()
+        connection = sqlite3.connect(self.db_path)
+        connection.execute("UPDATE sessions SET api_call_count = 40 WHERE id = 'session-1'")
+        for index in range(6):
+            connection.execute(
+                "INSERT INTO messages (session_id, role, content, tool_name, tool_call_id, timestamp) VALUES (?,?,?,?,?,?)",
+                ("session-1", "tool", "x" * 40_000, "read_file", f"rf-{index}", start + index),
+            )
+        connection.execute(
+            """
+            INSERT INTO session_model_usage (session_id, model, billing_provider, task, api_call_count, input_tokens,
+                                             output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                                             estimated_cost_usd, actual_cost_usd, cost_status, first_seen, last_seen)
+            VALUES ('session-1', 'big/model', 'openrouter', 'background_review', 9, 1000, 100, 0, 0, 0, 0.8, 0,
+                    'estimated', 1800000000, 1800000100)
+            """
+        )
+        connection.commit()
+        connection.close()
+        (self.home / "config.yaml").write_text(
+            "compression:\n  threshold_tokens: 400000\n  proactive_prune_min_result_chars: 8000\n"
+            "auxiliary:\n  background_review:\n    model: ''\n",
+            encoding="utf-8",
+        )
+
+        with patch.object(anatomy_mod, "_call_rates", return_value=(1e-6, 4e-6, 1e-7)):
+            data = api._session_anatomy_sync("session-1")
+        self.assertGreaterEqual(data["calls"]["logged"], 40)  # plus the base fixture log's call
+        self.assertEqual(len(data["context"]["compressions"]), 1)
+        self.assertEqual(data["context"]["compressions"][0]["to_tokens"], 40_000)
+        self.assertGreater(data["priced_split_usd"]["cache_read"], 0)
+        self.assertEqual(data["tool_context"]["top"][0]["tool"], "read_file")
+        kinds = {finding["kind"] for finding in data["findings"]}
+        self.assertIn("heavy_tool_results", kinds)
+        self.assertIn("helper_task_cost", kinds)
+        helper = next(finding for finding in data["findings"] if finding["kind"] == "helper_task_cost")
+        self.assertEqual(helper["setting"], "auxiliary.background_review.model")
+        self.assertIn("$0.80", helper["headline"])
+        self.assertEqual(data["helpers"][0]["task"], "background_review")
+        rereads = [finding for finding in data["findings"] if finding["kind"] == "context_rereads"]
+        if rereads:
+            self.assertIn("compression.threshold_tokens = 400,000", rereads[0]["detail"])
+
+        tasks = api._helper_tasks_sync(0)
+        self.assertEqual(tasks["tasks"][0]["task"], "background_review")
+        self.assertAlmostEqual(tasks["tasks"][0]["cash_usd"], 0.8)
+        self.assertEqual(tasks["tasks"][0]["setting"], "auxiliary.background_review.model")
+        with self.assertRaises(api.HTTPException):
+            api._session_anatomy_sync("no-such-session")
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("{ id: 'anatomy', label: 'Why it cost' }", source)
+        self.assertIn("function HelperTasksSection({ ctx, period })", source)
+
     def test_collector_threads_inherit_the_request_context(self):
         import contextvars
         from concurrent.futures import ThreadPoolExecutor

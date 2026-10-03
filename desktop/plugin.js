@@ -1507,6 +1507,191 @@ function TraceView({ ctx, sessionId, period }) {
   })
 }
 
+// ============================================================================
+// COST ANATOMY
+// ============================================================================
+
+function AnatomyMetric({ label, value, hint }) {
+  return jsxs('div', {
+    title: hint,
+    style: { border, borderRadius: '6px', display: 'grid', gap: '0.15rem', padding: '0.55rem 0.7rem' },
+    children: [
+      jsx('span', { style: { color: color.tertiary, fontSize: '0.625rem', textTransform: 'uppercase', letterSpacing: '0.04em' }, children: label }),
+      jsx('span', { style: { ...tabular, color: color.primary, fontSize: '0.9375rem', fontWeight: 650 }, children: value })
+    ]
+  })
+}
+
+// Prompt size of every logged call (downsampled), the cached part shaded;
+// a fall of more than 30% between calls marks a compression.
+function ContextChart({ points, compressions }) {
+  if (!points?.length) return jsx('p', { style: { color: color.tertiary, fontSize: '0.6875rem', margin: 0 }, children: 'No API calls for this session are in the retained agent logs.' })
+  const max = Math.max(...points.map(point => point.prompt), 1)
+  const width = 600
+  const height = 120
+  const step = width / points.length
+  const marks = new Set((compressions || []).map(item => Number(item.timestamp)))
+  return jsxs('svg', {
+    viewBox: `0 0 ${width} ${height}`,
+    preserveAspectRatio: 'none',
+    role: 'img',
+    'aria-label': `Prompt tokens per call, up to ${formatCount(max)}`,
+    style: { display: 'block', height: '8rem', width: '100%' },
+    children: points.map((point, index) => {
+      const total = (point.prompt / max) * (height - 4)
+      const cached = (Math.min(point.cached, point.prompt) / max) * (height - 4)
+      const x = index * step
+      const w = Math.max(step - 0.6, 0.6)
+      return jsxs('g', {
+        children: [
+          jsx('rect', { x, y: height - total, width: w, height: total, fill: color.warning, opacity: 0.85 }),
+          jsx('rect', { x, y: height - cached, width: w, height: cached, fill: color.accent, opacity: 0.75 }),
+          marks.has(Number(point.timestamp)) ? jsx('rect', { x, y: 0, width: Math.max(w, 1.5), height, fill: color.danger, opacity: 0.35 }) : null,
+          jsx('title', { children: `${formatShortDate(point.timestamp)} · ${formatCount(point.prompt)} prompt tokens (${formatCount(point.cached)} from cache)${point.cost_usd != null ? ` · ${formatCost(point.cost_usd, 'estimated')}` : ''}` })
+        ]
+      }, index)
+    })
+  })
+}
+
+function SplitBars({ split, total }) {
+  const rows = [
+    ['Prompt that missed the cache', split.uncached_input, color.warning],
+    ['Prompt read from the cache', split.cache_read, color.accent],
+    ['Output', split.output, color.secondary]
+  ]
+  return jsx('div', {
+    style: { display: 'grid', gap: '0.35rem' },
+    children: rows.map(([label, value, tone]) => jsxs('div', {
+      style: { alignItems: 'center', display: 'grid', gap: '0.5rem', gridTemplateColumns: '13rem 1fr 4.5rem' },
+      children: [
+        jsx('span', { style: { color: color.tertiary, fontSize: '0.6875rem' }, children: label }),
+        jsx('div', { style: { background: color.surfaceRaised, borderRadius: '3px', height: '0.5rem', overflow: 'hidden' }, children: jsx('div', { style: { background: tone, height: '100%', width: `${total ? (Number(value) / total) * 100 : 0}%` } }) }),
+        jsx('span', { style: { ...tabular, color: color.primary, fontSize: '0.6875rem', textAlign: 'right' }, children: formatCost(value, 'estimated') })
+      ]
+    }, label))
+  })
+}
+
+function AnatomyView({ ctx, sessionId, profile }) {
+  const query = useQuery({
+    queryKey: [PLUGIN_ID, 'anatomy', activeProfilesParam, sessionId, profile || ''],
+    queryFn: () => pluginRest(ctx, apiPath(`/sessions/${encodeURIComponent(sessionId)}/anatomy`, profile ? { profiles: profile } : {})),
+    staleTime: 60_000
+  })
+  if (queryPending(query)) return jsx(LoadingBlock, { rows: 6 })
+  if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'Cost anatomy unavailable' })
+  const data = query.data
+  const context = data.context || {}
+  const listNote = Number(data.cost?.list_price_usd) > 0 ? ` · ≈ ${formatCost(data.cost.list_price_usd, 'estimated')} list` : ''
+  return jsx('div', {
+    style: { display: 'grid', gap: '1.1rem', padding: '1rem' },
+    children: [
+      jsx('div', {
+        style: { display: 'grid', gap: '0.5rem', gridTemplateColumns: 'repeat(auto-fit, minmax(9.5rem, 1fr))' },
+        children: [
+          jsx(AnatomyMetric, { label: 'Cost', value: `${formatCost(data.cost?.display_cost_usd, data.cost?.cost_kind)}${listNote}` }),
+          jsx(AnatomyMetric, { label: 'Calls logged', value: `${formatCount(data.calls?.logged)} of ${formatCount(data.calls?.recorded)}`, hint: 'Calls found in the retained agent logs, of the calls Hermes recorded for the session' }),
+          jsx(AnatomyMetric, { label: 'Context per call', value: context.mean_prompt_tokens != null ? `${formatCount(context.mean_prompt_tokens)} avg` : '—', hint: context.max_prompt_tokens != null ? `Largest ${formatCount(context.max_prompt_tokens)} · first ${formatCount(context.first_prompt_tokens)}` : undefined }),
+          jsx(AnatomyMetric, { label: 'Compressions', value: formatCount((context.compressions || []).length) }),
+          jsx(AnatomyMetric, { label: 'Span', value: `${Number(data.span_hours || 0).toFixed(1)} h` })
+        ]
+      }),
+      data.findings?.length
+        ? jsx('div', {
+            style: { display: 'grid', gap: '0.5rem' },
+            children: data.findings.map(finding => jsxs('div', {
+              style: { borderLeft: `3px solid ${color.warning}`, display: 'grid', gap: '0.2rem', padding: '0.3rem 0 0.3rem 0.7rem' },
+              children: [
+                jsx('span', { style: { color: color.primary, fontSize: '0.8125rem', fontWeight: 650 }, children: finding.headline }),
+                jsx('span', { style: { color: color.secondary, fontSize: '0.75rem', lineHeight: 1.45 }, children: finding.detail }),
+                finding.setting
+                  ? jsx('code', { style: { color: color.tertiary, fontFamily: 'var(--font-mono, monospace)', fontSize: '0.6875rem' }, children: `${finding.setting}: ${finding.current == null ? 'not set' : finding.current}` })
+                  : null
+              ]
+            }, finding.kind + finding.headline))
+          })
+        : jsx('p', { style: { color: color.tertiary, fontSize: '0.75rem', margin: 0 }, children: 'Nothing stands out: no cost driver crossed its threshold for this session.' }),
+      jsxs('section', {
+        children: [
+          jsx(SectionHeading, { title: 'Context per call', description: 'Prompt tokens of each logged call; blue was read from the cache, amber billed at the full input rate; red marks a compression.' }),
+          jsx(ContextChart, { points: context.points, compressions: context.compressions })
+        ]
+      }),
+      Number(data.priced_total_usd) > 0
+        ? jsxs('section', {
+            children: [
+              jsx(SectionHeading, { title: 'Where the cost went', description: `${formatCost(data.priced_total_usd, 'estimated')} priced from the logged calls${data.route === 'subscription' ? ' at API list price' : ''}.` }),
+              jsx(SplitBars, { split: data.priced_split_usd || {}, total: Number(data.priced_total_usd) })
+            ]
+          })
+        : null,
+      jsxs('section', {
+        children: [
+          jsx(SectionHeading, { title: 'What tools put into context', description: `${formatCount(data.tool_context?.tokens_estimate)} tokens of recorded tool results (length ÷ 4); every later call carries them until compression.` }),
+          jsx(SimpleTable, {
+            columns: [
+              { key: 'tool', label: 'Tool' },
+              { key: 'results', label: 'Results', align: 'right', render: row => formatCount(row.results) },
+              { key: 'tokens_estimate', label: 'Tokens', align: 'right', render: row => formatCount(row.tokens_estimate) },
+              { key: 'share', label: 'Share', align: 'right', render: row => `${(Number(row.share) * 100).toFixed(0)}%` },
+              { key: 'largest_chars', label: 'Largest', align: 'right', muted: true, render: row => formatCount(Math.round(row.largest_chars / 4)) }
+            ],
+            rows: data.tool_context?.top || [],
+            emptyTitle: 'No tool results recorded',
+            emptyDescription: 'This session recorded no tool output.'
+          })
+        ]
+      }),
+      data.helpers?.length
+        ? jsxs('section', {
+            children: [
+              jsx(SectionHeading, { title: 'Helper tasks in this session', description: 'Titles, vision, approvals, reviews and compression run beside the conversation on their own route.' }),
+              jsx(SimpleTable, {
+                columns: [
+                  { key: 'task', label: 'Task' },
+                  { key: 'model', label: 'Model', muted: true },
+                  { key: 'calls', label: 'Calls', align: 'right', render: row => formatCount(row.calls) },
+                  { key: 'cash_usd', label: 'Cost', align: 'right', render: row => row.list_price_usd ? `≈ ${formatCost(row.list_price_usd, 'estimated')} sub.` : formatCost(row.cash_usd, 'estimated') }
+                ],
+                rows: data.helpers
+              })
+            ]
+          })
+        : null
+    ]
+  })
+}
+
+function HelperTasksSection({ ctx, period }) {
+  const query = useQuery({
+    queryKey: [PLUGIN_ID, 'helper-tasks', activeProfilesParam, period.days, period.start_at, period.end_at],
+    queryFn: () => pluginRest(ctx, apiPath('/helper-tasks', period)),
+    staleTime: 60_000
+  })
+  if (query.isError || !query.data?.tasks?.length) return null
+  const data = query.data
+  return jsxs('section', {
+    children: [
+      jsx(SectionHeading, {
+        title: 'Helper tasks',
+        description: `${formatCost(data.totals.cash_usd, 'estimated')} cash${data.totals.list_price_usd ? ` and ≈ ${formatCost(data.totals.list_price_usd, 'estimated')} of subscription use` : ''} across ${formatCount(data.totals.calls)} calls. ${data.definition}`
+      }),
+      jsx(SimpleTable, {
+        columns: [
+          { key: 'task', label: 'Task' },
+          { key: 'model', label: 'Ran on', render: row => jsx('span', { style: { fontSize: '0.6875rem' }, children: row.model || '—' }) },
+          { key: 'profile', label: 'Profile', muted: true, render: row => row.profile || '—' },
+          { key: 'calls', label: 'Calls', align: 'right', render: row => formatCount(row.calls) },
+          { key: 'cost', label: 'Cost', align: 'right', sortValue: row => row.cash_usd + row.list_price_usd, render: row => row.list_price_usd ? `≈ ${formatCost(row.list_price_usd, 'estimated')} sub.` : formatCost(row.cash_usd, 'estimated') },
+          { key: 'configured_model', label: 'Setting', muted: true, render: row => jsx('code', { style: { fontFamily: 'var(--font-mono, monospace)', fontSize: '0.625rem' }, children: `${row.setting}: ${row.configured_model || 'not set'}` }) }
+        ],
+        rows: data.tasks.slice(0, 15)
+      })
+    ]
+  })
+}
+
 function SessionDetail({ query, detailTab, setDetailTab, ctx, period, profile, onBack }) {
   if (!query) {
     return jsx(EmptyState, { title: 'Choose a session', description: 'Select a session to inspect its recorded evidence.' })
@@ -1517,6 +1702,7 @@ function SessionDetail({ query, detailTab, setDetailTab, ctx, period, profile, o
   const session = detail.session
   const detailOptions = [
     { id: 'summary', label: 'Summary' },
+    { id: 'anatomy', label: 'Why it cost' },
     { id: 'trace', label: 'Trace' },
     { id: 'tools', label: `Tools ${detail.tools?.length || 0}` },
     { id: 'failures', label: `Failures ${session.failure_count || 0}` },
@@ -1524,6 +1710,7 @@ function SessionDetail({ query, detailTab, setDetailTab, ctx, period, profile, o
   ]
   let content = jsx(SessionSummary, { detail })
   if (detailTab === 'trace') content = jsx(TraceView, { ctx, sessionId: session.id, period })
+  if (detailTab === 'anatomy') content = jsx(AnatomyView, { ctx, sessionId: session.id, profile })
   if (detailTab === 'tools') content = jsx(ToolEvents, { events: detail.tools })
   if (detailTab === 'failures') content = jsx(FailureInspector, { failures: detail.failures, detectedTotal: session.failure_count })
   if (detailTab === 'files') content = jsx(FilesView, { files: detail.files, truncated: detail.analysis?.truncated })
@@ -2186,6 +2373,7 @@ function OverviewView({ query, ctx, period, watch }) {
       style: { display: 'grid', gap: '1.5rem', margin: '0 auto', maxWidth: '84rem' },
       children: [
         watch ? jsx(RunningNowPanel, { ctx, ...watch }) : null,
+        jsx(HelperTasksSection, { ctx, period }),
         jsxs('section', {
           children: [
             jsx(SectionHeading, {

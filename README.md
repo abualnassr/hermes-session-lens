@@ -6,7 +6,7 @@
 
 It installs as one Hermes plugin: a native Desktop page plus its namespaced Python API. No iframe, no separate server, no telemetry service, and no write path — the backend defines zero mutation routes and never touches a credential store.
 
-This documentation describes Hermes Session Lens `0.47.0`, verified on Hermes Agent `0.21.5` (2026-10-02 build). MIT licensed. A community plugin, not affiliated with or endorsed by Nous Research.
+This documentation describes Hermes Session Lens `0.48.0`, verified on Hermes Agent `0.21.5` (2026-10-02 build). MIT licensed. A community plugin, not affiliated with or endorsed by Nous Research.
 
 ![How Session Lens works: what it reads, what it answers, and what it never does](docs/how-it-works.svg)
 
@@ -52,6 +52,8 @@ The **Trace** tab replays the session in order — user, assistant, reasoning, t
 **Ask Hermes.** A session with failures gets an **Ask Hermes** button beside **Open session**. It builds a failure-analysis prompt from the evidence the Failures tab already shows — failures grouped by tool and error signature with counts, timestamps, and bounded, secret-redacted result snippets, plus the session's model usage and outcome — copies it to the clipboard, and opens a fresh Hermes chat in the session's profile for you to paste it into. Session Lens never submits the prompt or creates a session itself: you see exactly what the model will read, and no tokens are spent until you press send. The prompt stays under 12,000 characters; user and assistant message text is deliberately left out. The same text is available as `GET /api/plugins/session-lens/sessions/{id}/analysis-prompt`.
 
 ![Ask Hermes: the prepared prompt and the analysis Hermes produced — a likely cause per failure group, three actions, and what the evidence cannot settle](docs/screenshots/ask-hermes.png)
+
+**Why it cost.** A long agent session's bill is rarely new work; it is the same context re-read on every call. A session's **Why it cost** tab reads its API calls from Hermes' agent log and shows the prompt size of every call (the cached part shaded, compressions marked), the cost split between prompt that missed the cache, prompt read from it, and output, which tools' results filled the context, and the helper tasks that ran beside it. Each finding states its numbers and the setting that governs it, with its current value — `compression.threshold_tokens`, `compression.proactive_prune_min_result_chars`, or `auxiliary.<task>.model` for a helper task that ran on an expensive model. **Helper tasks** on Overview totals what titles, vision, approvals, background reviews and compression cost across sessions, and which model each ran on.
 
 ### Overview — where the spend goes
 

@@ -14,6 +14,7 @@ try:
     from ._services import *
     from ._rules import *
     from ._watch import *
+    from ._anatomy import *
 except ImportError:  # pragma: no cover - direct Hermes file loading
     from _common import *
     from _logparse import *
@@ -24,6 +25,7 @@ except ImportError:  # pragma: no cover - direct Hermes file loading
     from _services import *
     from _rules import *
     from _watch import *
+    from _anatomy import *
 
 router = APIRouter()
 
@@ -899,6 +901,22 @@ def _trace_sync(session_id: str, limit: int, offset: int) -> Dict[str, Any]:
         },
         "generated_at": time.time(),
     }
+
+
+@router.get("/sessions/{session_id}/anatomy")
+async def session_anatomy(session_id: str, profiles: str = Query("")) -> Dict[str, Any]:
+    """Why this session cost what it did: context per call, cost split, tool context, helper tasks."""
+    return await asyncio.to_thread(_scoped_call, profiles, _session_anatomy_sync, session_id)
+
+
+@router.get("/helper-tasks")
+async def helper_tasks(
+    days: int = Query(30, ge=0, le=3650),
+    start_at: Optional[float] = Query(None, ge=0),
+    end_at: Optional[float] = Query(None, ge=0),
+    profiles: str = Query(""),
+) -> Dict[str, Any]:
+    return await asyncio.to_thread(_scoped_call, profiles, _helper_tasks_sync, days, start_at, end_at)
 
 
 @router.get("/sessions/{session_id}/trace")
