@@ -271,6 +271,9 @@ def _services_inventory() -> Dict[str, Dict[str, Any]]:
                 "kind": kind,
                 "sources": [],
                 "adapter": bool(adapter and adapter.readable),
+                # A registered adapter means Session Lens knows the vendor,
+                # even when it has no API to read: no adapter recipe applies.
+                "known": adapter is not None,
                 "note": adapter.note if adapter else None,
                 "accounts": [],
             },
@@ -304,7 +307,11 @@ def _services_inventory() -> Dict[str, Dict[str, Any]]:
         item["sources"].append(source)
         item["mcp"] = {key: server[key] for key in ("transport", "enabled", "tool_count")}
         if item["kind"] == "mcp" and not item["note"]:
-            item["note"] = "Listed from config.yaml; no Session Lens adapter reads a usage API for this MCP server."
+            item["note"] = (
+                "Runs on this machine with no account behind it; its calls are on the Tools tab."
+                if server.get("transport") == "stdio"
+                else "Listed from config.yaml; no Session Lens adapter reads a usage API for this MCP server."
+            )
 
     for adapter in adapters.values():
         if not adapter.cli:
@@ -341,6 +348,11 @@ def _fold_service_last_success(service: str, result: Dict[str, Any]) -> Dict[str
 
 def _inventory_status(item: Mapping[str, Any], card: Optional[Mapping[str, Any]]) -> str:
     if not item.get("adapter"):
+        # A local (stdio) MCP server nobody recognises is a tool on this
+        # machine, not a service with a usage API missing.
+        mcp = item.get("mcp") or {}
+        if item.get("kind") == "mcp" and not item.get("known") and mcp.get("transport") == "stdio":
+            return "local"
         return "unreadable"
     status = str(card.get("status") if card else "")
     if status in {"ok", "stale"}:
@@ -411,6 +423,7 @@ def _services_sync(fresh: bool = False, only_service: Optional[str] = None) -> D
                 "monitored": sum(1 for row in rows if row["status"] == "monitored"),
                 "attention": sum(1 for row in rows if row["status"] == "attention"),
                 "unreadable": sum(1 for row in rows if row["status"] == "unreadable"),
+                "local": sum(1 for row in rows if row["status"] == "local"),
             },
             "generated_at": time.time(),
             "cached": False,

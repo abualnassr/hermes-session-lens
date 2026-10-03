@@ -3405,7 +3405,15 @@ function serviceInventoryStatus(row) {
   if (row.status === 'monitored') return { tone: 'accent', label: 'Monitored', icon: 'pass' }
   if (row.status === 'attention') return { tone: 'danger', label: 'Needs attention', icon: 'warning' }
   if (row.status === 'monitorable') return { tone: 'neutral', label: 'Not read yet', icon: 'circle-outline' }
+  if (row.status === 'local') return { tone: 'neutral', label: 'Local · nothing to meter', icon: 'device-desktop' }
   return { tone: 'neutral', label: 'No usage API', icon: 'circle-slash' }
+}
+
+// The adapter recipe helps only for a vendor Session Lens does not know.
+// Known vendors without an API (Brave, Telegram, Reef, TypeSafe…) and local
+// MCP servers already say why there is no card.
+function serviceNeedsAdapter(row) {
+  return !row.adapter && !row.known && row.status !== 'local'
 }
 
 // Services without an adapter are inventoried from their key name or MCP
@@ -3461,7 +3469,7 @@ function ServicesSection({ ctx, query, narrow, history, ledger, onRefresh }) {
                   jsx('h3', { id: 'service-inventory', style: { color: color.primary, fontSize: '0.9375rem', fontWeight: 650, lineHeight: 1.35, margin: 0 }, children: 'Everything configured' }),
                   jsx('p', {
                     style: { color: color.tertiary, fontSize: '0.6875rem', lineHeight: 1.5, margin: '0.15rem 0 0' },
-                    children: `${formatCount(summary.configured)} non-model service${Number(summary.configured) === 1 ? '' : 's'} found in Hermes — ${formatCount(summary.monitored)} monitored, ${formatCount(summary.unreadable)} with no usage API Session Lens can read. ${data.definition || ''} A service without an adapter is still listed from its key name or MCP entry, never hidden; a balance card needs a small adapter, and the recipe is linked on each such row.`
+                    children: `${formatCount(summary.configured)} non-model service${Number(summary.configured) === 1 ? '' : 's'} found in Hermes — ${formatCount(summary.monitored)} monitored, ${formatCount(summary.unreadable)} with no usage API Session Lens can read${summary.local ? `, ${formatCount(summary.local)} local MCP server${Number(summary.local) === 1 ? '' : 's'} with nothing to meter` : ''}. ${data.definition || ''} A service Session Lens does not recognise is still listed from its key name or MCP entry, never hidden, and its row links the recipe for a small adapter that gives it a balance card.`
                   })
                 ]
               }),
@@ -3501,7 +3509,7 @@ function ServicesSection({ ctx, query, narrow, history, ledger, onRefresh }) {
                       style: { color: color.quaternary, fontSize: '0.6875rem', lineHeight: 1.4 },
                       children: [
                         row.note || (row.status === 'monitored' ? 'Read from the vendor’s usage endpoint.' : ''),
-                        !row.adapter
+                        serviceNeedsAdapter(row)
                           ? jsx('button', {
                               type: 'button',
                               onClick: () => openExternalLink(ctx, ADAPTER_RECIPE_URL),

@@ -824,6 +824,29 @@ class SessionLensApiTests(unittest.TestCase):
         for provider in api._provider_ids():
             self.assertTrue(api._probe_usage_provider(provider), provider)
 
+    def test_local_mcp_servers_are_not_listed_as_missing_a_usage_api(self):
+        (self.home / "config.yaml").write_text(
+            "mcp_servers:\n"
+            "  classcad:\n"
+            "    command: node\n"
+            "  some-saas:\n"
+            "    url: https://mcp.some-saas.example/mcp\n",
+            encoding="utf-8",
+        )
+        services._services_caches.clear()
+        with _service_collectors({}), patch.object(services.shutil, "which", return_value=None):
+            payload = services._services_sync(fresh=True)
+        rows = {row["id"]: row for row in payload["inventory"]}
+        self.assertEqual(rows["classcad"]["status"], "local")
+        self.assertIn("Tools tab", rows["classcad"]["note"])
+        self.assertEqual(rows["some-saas"]["status"], "unreadable")
+        self.assertEqual(payload["summary"]["local"], 1)
+        services._services_caches.clear()
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("function serviceNeedsAdapter(row)", source)
+        self.assertIn("return !row.adapter && !row.known && row.status !== 'local'", source)
+        self.assertIn("serviceNeedsAdapter(row)\n                          ? jsx('button'", source.replace("\r\n", "\n"))
+
     def test_collector_threads_inherit_the_request_context(self):
         import contextvars
         from concurrent.futures import ThreadPoolExecutor
@@ -4673,7 +4696,9 @@ process.stdout.write(JSON.stringify(out))
         self.assertEqual(rows["brightdata"]["note"], "no permission")
         self.assertEqual(rows["brave"]["status"], "unreadable")
         self.assertEqual(rows["custom-thing"]["status"], "unreadable")
-        self.assertEqual(payload["summary"], {"configured": len(rows), "monitored": 2, "attention": 2, "unreadable": 4})
+        self.assertEqual(payload["summary"], {"configured": len(rows), "monitored": 2, "attention": 2, "unreadable": 4, "local": 0})
+        self.assertTrue(rows["brave"]["known"])
+        self.assertFalse(rows["custom-thing"]["known"])
         # Cached payload serves without collectors; budgets can read it without a fetch.
         collectors["monid"].reset_mock()
         again = services._services_sync()
