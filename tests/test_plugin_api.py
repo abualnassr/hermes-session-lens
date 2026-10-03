@@ -1008,6 +1008,52 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertEqual(result["cards"][0]["status"], "unavailable")
         services._services_caches.clear()
 
+    def test_fleet_board_reads_each_profile_from_its_own_logs_and_store(self):
+        from dashboard import _watch as watch_mod
+
+        now = 1_800_200_000
+        beta_db = self._make_beta_profile()
+        beta_home = beta_db.parent
+        (beta_home / "logs").mkdir(exist_ok=True)
+        lines = "".join(
+            f"{_stamp(now - 600 + index * 60)} INFO [beta-session-1] agent.conversation_loop: API call #{index + 1}: "
+            f"model=provider/model-a provider=openrouter in=100000 out=1000 total=101000 latency=1.0s cache=50000/100000 (50%)\n"
+            for index in range(5)
+        )
+        lines += "".join(
+            f"{_stamp(now - 300)} ERROR [beta-session-1] agent.conversation_loop: Outer loop error in API call #{number}: boom\n"
+            for number in (6, 7, 8)
+        )
+        (beta_home / "logs" / "agent.log").write_text(lines, encoding="utf-8")
+        (beta_home / "gateway_state.json").write_text(json.dumps({"gateway_state": "stopped", "platforms": {}}), encoding="utf-8")
+        connection = sqlite3.connect(beta_db)
+        connection.execute("UPDATE sessions SET last_activity_at = ?, ended_at = NULL", (now - 60,))
+        connection.commit()
+        connection.close()
+        api._log_file_cache.clear()
+
+        with patch.object(watch_mod, "_call_rates", return_value=(1e-6, 4e-6, 1e-7)), \
+                patch.object(api, "_call_rates", return_value=(1e-6, 4e-6, 1e-7)):
+            board = api._scoped_call("", api._fleet_sync, now)
+        rows = {row["profile"]: row for row in board["profiles"]}
+        self.assertEqual(set(rows), {"default", "beta"})
+        beta = rows["beta"]
+        self.assertEqual(beta["state"], "running")
+        self.assertEqual((beta["calls_hour"], beta["calls_day"]), (5, 5))
+        # 5 x (50k x $1/M + 50k x $0.1/M + 1k x $4/M) = 5 x $0.059
+        self.assertAlmostEqual(beta["cash_day_usd"], 0.295, places=3)
+        self.assertEqual(beta["api_errors_day"], 3)
+        self.assertIn("gateway stopped", beta["flags"])
+        self.assertIn("3 API errors in 24 h", beta["flags"])
+        self.assertEqual(beta["open_sessions"], 1)
+        self.assertEqual(rows["default"]["calls_day"], 0)
+        self.assertEqual(board["profiles"][0]["profile"], "beta")
+        self.assertEqual(api._fleet_state(0, 0, now), "dormant")
+        self.assertEqual(api._fleet_state(now - 3 * 86400, 0, now), "quiet")
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("{ id: 'fleet', label: 'Fleet', codicon: 'organization' }", source)
+        self.assertIn("function FleetView({ ctx, onOpenProfile })", source)
+
     def test_collector_threads_inherit_the_request_context(self):
         import contextvars
         from concurrent.futures import ThreadPoolExecutor

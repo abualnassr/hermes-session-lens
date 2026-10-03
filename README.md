@@ -6,7 +6,7 @@
 
 It installs as one Hermes plugin: a native Desktop page plus its namespaced Python API. No iframe, no separate server, no telemetry service, and no write path — the backend defines zero mutation routes and never touches a credential store.
 
-This documentation describes Hermes Session Lens `0.46.0`, verified on Hermes Agent `0.21.5` (2026-10-02 build). MIT licensed. A community plugin, not affiliated with or endorsed by Nous Research.
+This documentation describes Hermes Session Lens `0.47.0`, verified on Hermes Agent `0.21.5` (2026-10-02 build). MIT licensed. A community plugin, not affiliated with or endorsed by Nous Research.
 
 ![How Session Lens works: what it reads, what it answers, and what it never does](docs/how-it-works.svg)
 
@@ -60,6 +60,10 @@ The **Trace** tab replays the session in order — user, assistant, reasoning, t
 **Running now** opens the tab: every session that called a model in the last hour, read from Hermes' agent logs and priced with Hermes' own tables — what it burned in that hour (cash, or subscription use at API list price), its calls, and what it has cost so far. A session still running past your alert rate (default $1/h cash, $5/h subscription use; both editable in place) is flagged there, in the attention strip on every tab, and — unless you switch it off — by one desktop notification per session per day, so a runaway is caught while it runs rather than in next week's totals.
 
 Tokens by day, then the spend rolled up by git repository, working directory, or source for sessions that recorded no directory: sessions, tokens, recorded cost with unpriced counts, confirmed failures, top models, last activity. Every row drills through to the filtered session list.
+
+### Fleet — every profile at a glance
+
+One row per Hermes profile on this machine: running (a model call in the last 15 minutes), idle, quiet this week, or dormant; calls in the last hour and day; spend in the last 24 hours, as cash and subscription use at API list price; tool failures and API errors in 24 hours; open sessions; the main model; and gateway state with its platforms. Bot profiles keep sessions open for weeks, so their spend over time is read from each profile's logged API calls, priced per call with Hermes' pricing tables, never from session totals. A profile with a stopped gateway, a platform that needs attention, three or more API errors, or ten or more tool failures in a day is flagged with the reason, and its name opens its sessions.
 
 ### AI Usage — what you have left, and who used it
 

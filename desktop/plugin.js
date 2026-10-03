@@ -60,6 +60,7 @@ const timeOptions = [
 const pageTabs = [
   { id: 'sessions', label: 'Sessions', codicon: 'list-tree' },
   { id: 'overview', label: 'Overview', codicon: 'graph' },
+  { id: 'fleet', label: 'Fleet', codicon: 'organization' },
   { id: 'operations', label: 'Operations', codicon: 'pulse' },
   { id: 'tools', label: 'Tools', codicon: 'tools' },
   { id: 'rules', label: 'Rules', codicon: 'checklist' },
@@ -2760,6 +2761,106 @@ function SchedulesView({ ctx, period, onSelectJob }) {
   })
 }
 
+// ============================================================================
+// FLEET
+// ============================================================================
+
+function fleetStatePill(row) {
+  if (row.state === 'running') return { tone: 'accent', label: 'Running', icon: 'record' }
+  if (row.state === 'idle') return { tone: 'neutral', label: 'Idle', icon: 'circle-outline' }
+  if (row.state === 'quiet') return { tone: 'neutral', label: 'Quiet this week', icon: 'circle-outline' }
+  return { tone: 'neutral', label: 'Dormant', icon: 'circle-slash' }
+}
+
+function fleetSpend(cash, list) {
+  const parts = []
+  if (Number(cash) > 0 || !(Number(list) > 0)) parts.push(formatCost(cash, 'estimated'))
+  if (Number(list) > 0) parts.push(`≈ ${formatCost(list, 'estimated')} sub.`)
+  return parts.join(' + ')
+}
+
+// Every profile on this machine as one row: alive or not, what it is doing,
+// what it costs today. Bot profiles keep sessions open for weeks, so spend
+// over time is read from each profile's logged API calls, not session totals.
+function FleetView({ ctx, onOpenProfile }) {
+  const query = useQuery({
+    queryKey: [PLUGIN_ID, 'fleet'],
+    queryFn: () => pluginRest(ctx, apiPath('/fleet')),
+    refetchInterval: 60_000
+  })
+  if (queryPending(query)) return jsx(LoadingBlock, { rows: 8 })
+  if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'Fleet unavailable' })
+  const data = query.data
+  const totals = data.totals || {}
+  return jsx('div', {
+    style: { flex: 1, minHeight: 0, overflow: 'auto', padding: '1rem' },
+    children: jsxs('div', {
+      style: { display: 'grid', gap: '1rem', margin: '0 auto', maxWidth: '84rem' },
+      children: [
+        jsx(SectionHeading, {
+          title: 'Fleet',
+          description: `${formatCount(totals.profiles)} profiles · ${formatCount(totals.running)} running · ${formatCount(totals.calls_day)} calls and ${fleetSpend(totals.cash_day_usd, totals.list_day_usd)} in the last 24 h${totals.flagged ? ` · ${formatCount(totals.flagged)} need a look` : ''}. ${data.definition || ''}`
+        }),
+        jsx(SimpleTable, {
+          columns: [
+            {
+              key: 'profile',
+              label: 'Profile',
+              render: row => jsxs('div', {
+                style: { display: 'grid', gap: '0.15rem', minWidth: 0 },
+                children: [
+                  jsx('button', {
+                    type: 'button',
+                    onClick: () => onOpenProfile(row.profile),
+                    title: 'Show this profile’s sessions',
+                    style: { background: 'transparent', border: 'none', color: row.flags?.length ? color.danger : color.primary, cursor: 'pointer', font: 'inherit', fontWeight: 600, outlineColor: color.accent, padding: 0, textAlign: 'left' },
+                    children: row.profile
+                  }),
+                  row.flags?.length
+                    ? jsx('span', { style: { color: color.danger, fontSize: '0.625rem' }, children: row.flags.join(' · ') })
+                    : null
+                ]
+              })
+            },
+            {
+              key: 'state',
+              label: 'State',
+              render: row => {
+                const pill = fleetStatePill(row)
+                return jsx(Pill, { tone: pill.tone, children: jsxs(Fragment, { children: [jsx(Codicon, { name: pill.icon, size: '0.65rem' }), pill.label] }) })
+              }
+            },
+            { key: 'last_activity_at', label: 'Last activity', muted: true, render: row => row.last_activity_at ? formatShortDate(row.last_activity_at) : '—' },
+            { key: 'calls_day', label: 'Calls 1 h / 24 h', align: 'right', render: row => jsx('span', { style: tabular, children: `${formatCount(row.calls_hour)} / ${formatCount(row.calls_day)}` }) },
+            {
+              key: 'spend_day',
+              label: 'Spend 24 h',
+              align: 'right',
+              sortValue: row => Number(row.cash_day_usd) + Number(row.list_day_usd),
+              render: row => jsx('span', {
+                style: tabular,
+                title: `Last hour: ${fleetSpend(row.cash_hour_usd, row.list_hour_usd)}${row.unpriced_calls_day ? ` · ${formatCount(row.unpriced_calls_day)} calls unpriced` : ''}${row.logs_cover_day ? '' : ' · logs cover less than 24 h'}`,
+                children: fleetSpend(row.cash_day_usd, row.list_day_usd)
+              })
+            },
+            { key: 'failures_day', label: 'Failures 24 h', align: 'right', render: row => row.failures_day ? jsx(Pill, { tone: row.failures_day >= 10 ? 'danger' : 'neutral', children: formatCount(row.failures_day) }) : '0' },
+            { key: 'api_errors_day', label: 'API errors 24 h', align: 'right', render: row => row.api_errors_day ? jsx(Pill, { tone: row.api_errors_day >= 3 ? 'danger' : 'neutral', children: formatCount(row.api_errors_day) }) : '0' },
+            { key: 'open_sessions', label: 'Open sessions', align: 'right', render: row => formatCount(row.open_sessions) },
+            { key: 'top_model', label: 'Main model 24 h', muted: true, render: row => jsx('span', { style: { fontSize: '0.6875rem' }, children: row.top_model || '—' }) },
+            { key: 'gateway', label: 'Gateway', muted: true, render: row => row.gateway ? `${row.gateway.state}${row.gateway.platforms?.length ? ` · ${row.gateway.platforms.join(', ')}` : ''}` : '—' }
+          ],
+          rows: data.profiles || [],
+          emptyTitle: 'No profiles found',
+          emptyDescription: 'Hermes profiles with a state.db appear here.'
+        }),
+        data.errors?.length
+          ? jsx('p', { style: { color: color.tertiary, fontSize: '0.6875rem', margin: 0 }, children: `Could not read: ${data.errors.map(item => `${item.profile} (${item.error})`).join('; ')}` })
+          : null
+      ]
+    })
+  })
+}
+
 function OperationsView({ ctx, period, onDrill }) {
   const [section, setSection] = useState('health')
   const options = [
@@ -5001,6 +5102,15 @@ function SessionLensPage({ ctx }) {
   if (tab === 'tools') content = jsx(ToolsView, { ctx, period })
   if (tab === 'rules') content = jsx(RulesView, { ctx, period, onDrill: drillToSessions, rules, onRulesChange: setRules, availableProfiles })
   if (tab === 'system') content = jsx(SystemView, { ctx })
+  if (tab === 'fleet') {
+    content = jsx(FleetView, {
+      ctx,
+      onOpenProfile: name => {
+        setProfileScope([name])
+        setTab('sessions')
+      }
+    })
+  }
   const refreshProvider = async provider => {
     try {
       const data = await pluginRest(ctx, apiPath('/ai-usage', { ...period, fresh: true, provider }))

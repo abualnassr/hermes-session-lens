@@ -4140,7 +4140,7 @@ def _profile_summary(
                            WHEN estimated_cost_usd > 0 THEN estimated_cost_usd
                            ELSE 0 END),0) AS recorded_cost_usd,
                        MAX(coalesce(last_activity_at, started_at)) AS last_activity_at
-                FROM ({_accounted_sessions_sql(_db_connection(db))}) sessions WHERE {period_sql}
+                FROM ({_accounted_sessions_sql(connection)}) sessions WHERE {period_sql}
                 """,
                 tuple(period_params),
             ).fetchone()
@@ -4149,7 +4149,7 @@ def _profile_summary(
         for row in connection.execute(
             f"""
             SELECT end_reason, ended_at, last_activity_at, started_at
-            FROM ({_accounted_sessions_sql(_db_connection(db))}) sessions WHERE {period_sql}
+            FROM ({_accounted_sessions_sql(connection)}) sessions WHERE {period_sql}
             """,
             tuple(period_params),
         ).fetchall():
@@ -4178,6 +4178,7 @@ def _profile_summary(
             raise
         connection = sqlite3.connect(path.resolve().as_uri() + "?mode=ro&immutable=1", uri=True)
         connection.row_factory = sqlite3.Row
+        _install_accounting_views(connection)
         try:
             material = read(connection)
         finally:
@@ -4298,6 +4299,182 @@ def _gateway_sync() -> Dict[str, Any]:
             }
         )
     return {"gateways": gateways, "generated_at": time.time()}
+
+
+# ── Fleet board ───────────────────────────────────────────────────────────
+# One row per profile: is it alive, what is it doing, what is it costing.
+# Bot profiles run sessions for weeks, so a session's lifetime cost says
+# nothing about today: spend and calls over time come from the profile's
+# agent-log API calls, priced per call like the runaway watch. State,
+# failures and open sessions come from its state.db; gateway health from
+# its gateway_state.json.
+
+FLEET_RUNNING_SECONDS = 900
+FLEET_ERROR_ATTENTION = 3
+FLEET_FAILURE_ATTENTION = 10
+
+
+def _fleet_state(last_activity: float, last_call: float, now: float) -> str:
+    latest = max(last_activity or 0.0, last_call or 0.0)
+    if last_call and now - last_call <= FLEET_RUNNING_SECONDS:
+        return "running"
+    if latest and now - latest <= 86400:
+        return "idle"
+    if latest and now - latest <= 7 * 86400:
+        return "quiet"
+    return "dormant"
+
+
+def _fleet_log_figures(name: str, now: float) -> Dict[str, Any]:
+    """Calls, spend and API errors over the last hour and day from one profile's logs."""
+    previous = _get_profile_scope()
+    _set_profile_scope([name])
+    try:
+        runtime = _runtime_events()
+    finally:
+        _set_profile_scope(previous)
+    hour, day = now - 3600, now - 86400
+    figures: Dict[str, Any] = {
+        "calls_hour": 0, "calls_day": 0, "cash_hour_usd": 0.0, "cash_day_usd": 0.0,
+        "list_hour_usd": 0.0, "list_day_usd": 0.0, "unpriced_calls_day": 0, "api_errors_day": 0,
+        "last_call_at": None, "models_day": Counter(),
+    }
+    for event in runtime.get("api", []):
+        timestamp = _number(event.get("timestamp"), 0)
+        if timestamp < day or timestamp > now + 60:
+            continue
+        figures["calls_day"] += 1
+        figures["models_day"][str(event.get("model") or "unknown")] += 1
+        in_hour = timestamp >= hour
+        if in_hour:
+            figures["calls_hour"] += 1
+        if not figures["last_call_at"] or timestamp > figures["last_call_at"]:
+            figures["last_call_at"] = timestamp
+        rates = _call_rates(str(event.get("model") or ""), str(event.get("provider") or ""))
+        if rates is None:
+            figures["unpriced_calls_day"] += 1
+            continue
+        cost = _call_cost(event, rates)
+        bucket = "list" if _is_subscription_route(event.get("provider")) else "cash"
+        figures[f"{bucket}_day_usd"] += cost
+        if in_hour:
+            figures[f"{bucket}_hour_usd"] += cost
+    figures["api_errors_day"] = sum(
+        1 for error in runtime.get("errors", []) if day <= _number(error.get("timestamp"), 0) <= now + 60
+    )
+    stamps = runtime.get("timestamps") or []
+    figures["log_since"] = min(stamps) if stamps else None
+    return figures
+
+
+def _fleet_db_figures(path: Path, now: float) -> Dict[str, Any]:
+    day = now - 86400
+    with _database(path) as db:
+        connection = _db_connection(db)
+        row = _row_dict(
+            connection.execute(
+                """
+                SELECT MAX(coalesce(last_activity_at, ended_at, started_at)) AS last_activity_at,
+                       SUM(CASE WHEN coalesce(last_activity_at, ended_at, started_at) >= ? THEN 1 ELSE 0 END) AS sessions_day,
+                       SUM(CASE WHEN ended_at IS NULL AND coalesce(last_activity_at, started_at) >= ? THEN 1 ELSE 0 END) AS open_sessions,
+                       COUNT(*) AS sessions_all
+                FROM sessions
+                """,
+                (day, day),
+            ).fetchone()
+        )
+        failures = _confirmed_failure_rows(connection, "coalesce(s.last_activity_at, s.ended_at, s.started_at) >= ?", [day])
+    failures_day = sum(1 for failure in failures if _number(failure.get("timestamp"), now) >= day)
+    return {
+        "last_activity_at": row.get("last_activity_at"),
+        "sessions_day": _integer(row.get("sessions_day")),
+        "open_sessions": _integer(row.get("open_sessions")),
+        "sessions_all": _integer(row.get("sessions_all")),
+        "failures_day": failures_day,
+    }
+
+
+def _fleet_sync(now: Optional[float] = None) -> Dict[str, Any]:
+    now = time.time() if now is None else now
+    gateways = {item["profile"]: item for item in _gateway_sync().get("gateways", [])}
+    rows: List[Dict[str, Any]] = []
+    errors: List[Dict[str, str]] = []
+    for name, path in _profile_db_paths(_hermes_root()):
+        _check_route_budget()
+        try:
+            db_figures = _fleet_db_figures(path, now)
+            log_figures = _fleet_log_figures(name, now)
+        except RouteBudgetExceeded:
+            raise
+        except Exception as error:
+            errors.append({"profile": name, "error": _clean_text(error, 240)})
+            continue
+        gateway = gateways.get(name)
+        state = _fleet_state(_number(db_figures["last_activity_at"], 0), _number(log_figures["last_call_at"], 0), now)
+        flags: List[str] = []
+        if gateway and str(gateway.get("state") or "").lower() not in {"running", "connected", "ready", "ok", "unknown"}:
+            flags.append(f"gateway {gateway.get('state')}")
+        if gateway and any(platform.get("needs_attention") for platform in gateway.get("platforms") or []):
+            flags.append("a platform needs attention")
+        if log_figures["api_errors_day"] >= FLEET_ERROR_ATTENTION:
+            flags.append(f"{log_figures['api_errors_day']} API errors in 24 h")
+        if db_figures["failures_day"] >= FLEET_FAILURE_ATTENTION:
+            flags.append(f"{db_figures['failures_day']} tool failures in 24 h")
+        top_model = log_figures["models_day"].most_common(1)
+        rows.append(
+            {
+                "profile": name,
+                "state": state,
+                "flags": flags,
+                "last_activity_at": max(
+                    _number(db_figures["last_activity_at"], 0), _number(log_figures["last_call_at"], 0)
+                ) or None,
+                "calls_hour": log_figures["calls_hour"],
+                "calls_day": log_figures["calls_day"],
+                "cash_hour_usd": round(log_figures["cash_hour_usd"], 4),
+                "cash_day_usd": round(log_figures["cash_day_usd"], 4),
+                "list_hour_usd": round(log_figures["list_hour_usd"], 4),
+                "list_day_usd": round(log_figures["list_day_usd"], 4),
+                "unpriced_calls_day": log_figures["unpriced_calls_day"],
+                "api_errors_day": log_figures["api_errors_day"],
+                "failures_day": db_figures["failures_day"],
+                "sessions_day": db_figures["sessions_day"],
+                "open_sessions": db_figures["open_sessions"],
+                "top_model": top_model[0][0] if top_model else None,
+                "log_since": log_figures["log_since"],
+                "logs_cover_day": bool(log_figures["log_since"] and log_figures["log_since"] <= now - 86400),
+                "gateway": (
+                    {"state": gateway.get("state"), "active_agents": gateway.get("active_agents"),
+                     "platforms": [platform.get("name") for platform in gateway.get("platforms") or []]}
+                    if gateway else None
+                ),
+            }
+        )
+    order = {"running": 0, "idle": 1, "quiet": 2, "dormant": 3}
+    rows.sort(key=lambda row: (order.get(row["state"], 4), -(row["cash_day_usd"] + row["list_day_usd"]), row["profile"]))
+    return {
+        "profiles": rows,
+        "errors": errors,
+        "totals": {
+            "profiles": len(rows),
+            "running": sum(1 for row in rows if row["state"] == "running"),
+            "flagged": sum(1 for row in rows if row["flags"]),
+            "cash_day_usd": round(sum(row["cash_day_usd"] for row in rows), 4),
+            "list_day_usd": round(sum(row["list_day_usd"] for row in rows), 4),
+            "calls_day": sum(row["calls_day"] for row in rows),
+        },
+        "definition": (
+            "Every profile on this machine. Calls and spend over the last hour and day come from each profile's agent "
+            "logs, priced per call with Hermes' pricing tables (subscription use at API list price); failures, open "
+            "sessions and last activity from its state.db; gateway state from its gateway_state.json."
+        ),
+        "generated_at": now,
+    }
+
+
+@router.get("/fleet")
+async def fleet() -> Dict[str, Any]:
+    return await asyncio.to_thread(_scoped_call, "", _fleet_sync)
 
 
 @router.get("/gateway")
