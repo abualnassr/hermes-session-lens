@@ -4095,6 +4095,7 @@ _RECURRING_HEX_RE = re.compile(r"\b[0-9a-f]{8,}(?:-[0-9a-f]{4,})*\b")
 _RECURRING_DIGITS_RE = re.compile(r"\d+")
 _RECURRING_SPACE_RE = re.compile(r"\s+")
 RECURRING_MAX_GROUPS = 40
+RECURRING_MAX_SESSIONS = 200
 
 
 _RECURRING_ERRORISH_RE = re.compile(
@@ -4175,15 +4176,20 @@ def _recurring_failures_sync(
         connection = _db_connection(db)
         failures = _confirmed_failure_rows(connection, period_sql, period_params)
         profiles: Dict[str, str] = {}
-        if getattr(db, "union_profiles", None) and failures:
+        titles: Dict[str, str] = {}
+        if failures:
+            union = bool(getattr(db, "union_profiles", None))
+            profile_column = ", __profile" if union else ""
             ids = sorted({str(row.get("session_id")) for row in failures})
             for start in range(0, len(ids), 400):
                 chunk = ids[start : start + 400]
                 placeholders = ",".join("?" for _ in chunk)
                 for row in connection.execute(
-                    f"SELECT id, __profile FROM sessions WHERE id IN ({placeholders})", tuple(chunk)
+                    f"SELECT id, title{profile_column} FROM sessions WHERE id IN ({placeholders})", tuple(chunk)
                 ).fetchall():
-                    profiles[str(row[0])] = str(row[1])
+                    titles[str(row[0])] = str(row[1] or "")
+                    if union:
+                        profiles[str(row[0])] = str(row[2])
     groups: Dict[str, Dict[str, Any]] = {}
     for index, failure in enumerate(failures):
         if index % 500 == 0:
@@ -4198,7 +4204,7 @@ def _recurring_failures_sync(
                 "tool": str(failure.get("tool_name") or "unknown tool"),
                 "headline": _clean_text(headline, 200),
                 "count": 0,
-                "sessions": set(),
+                "sessions": {},
                 "profiles": set(),
                 "days": Counter(),
                 "first_at": timestamp,
@@ -4207,7 +4213,10 @@ def _recurring_failures_sync(
             }
         group["count"] += 1
         if session_id:
-            group["sessions"].add(session_id)
+            seen = group["sessions"].setdefault(session_id, [0, None])
+            seen[0] += 1
+            if timestamp and (seen[1] is None or timestamp > seen[1]):
+                seen[1] = timestamp
         if profiles.get(session_id):
             group["profiles"].add(profiles[session_id])
         if timestamp:
@@ -4234,6 +4243,9 @@ def _recurring_failures_sync(
             pattern = "once"
         else:
             pattern = "occasional"
+        affected = sorted(
+            group["sessions"].items(), key=lambda item: (-(item[1][1] or 0), -item[1][0], item[0])
+        )[:RECURRING_MAX_SESSIONS]
         rows.append(
             {
                 "rank": rank,
@@ -4244,6 +4256,16 @@ def _recurring_failures_sync(
                 "share": round(group["count"] / total, 4) if total else 0.0,
                 "cumulative_share": round(cumulative / total, 4) if total else 0.0,
                 "sessions": len(group["sessions"]),
+                "affected_sessions": [
+                    {
+                        "session_id": session_id,
+                        "title": _clean_text(titles.get(session_id), 120),
+                        "profile": profiles.get(session_id),
+                        "count": seen[0],
+                        "last_at": seen[1],
+                    }
+                    for session_id, seen in affected
+                ],
                 "profiles": sorted(group["profiles"]),
                 "days_seen": days_seen,
                 "pattern": pattern,

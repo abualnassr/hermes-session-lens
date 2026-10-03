@@ -1082,7 +1082,7 @@ function jsonExportItem(id, label, hint, name, period, data) {
   }
 }
 
-function SimpleTable({ columns, rows, emptyTitle = 'Nothing recorded', emptyDescription }) {
+function SimpleTable({ columns, rows, emptyTitle = 'Nothing recorded', emptyDescription, rowDetail }) {
   const [sortState, setSortState] = useState(null)
   const sortedRows = useMemo(() => {
     const materialRows = (rows || []).map((row, index) => ({
@@ -1171,14 +1171,16 @@ function SimpleTable({ columns, rows, emptyTitle = 'Nothing recorded', emptyDesc
           })
         }),
         jsx('tbody', {
-          children: sortedRows.map((item, rowIndex) => {
+          children: sortedRows.flatMap((item, rowIndex) => {
             const row = item.row
-            return jsx('tr', {
+            const isLast = rowIndex === sortedRows.length - 1
+            const detail = rowDetail ? rowDetail(row) : null
+            const line = jsx('tr', {
               children: columns.map(column =>
                 jsx('td', {
                   style: {
                     ...tabular,
-                    borderBottom: rowIndex === sortedRows.length - 1 ? 'none' : border,
+                    borderBottom: isLast && !detail ? 'none' : border,
                     color: column.muted ? color.tertiary : color.primary,
                     padding: '0.58rem 0.65rem',
                     textAlign: column.align || 'left',
@@ -1188,6 +1190,17 @@ function SimpleTable({ columns, rows, emptyTitle = 'Nothing recorded', emptyDesc
                 }, column.key)
               )
             }, item.key)
+            if (!detail) return [line]
+            return [
+              line,
+              jsx('tr', {
+                children: jsx('td', {
+                  colSpan: columns.length,
+                  style: { background: color.surface, borderBottom: isLast ? 'none' : border, padding: 0 },
+                  children: detail
+                })
+              }, `${item.key}\u001ddetail`)
+            ]
           })
         })
       ]
@@ -2574,9 +2587,52 @@ function recurringPatternPill(row) {
   return { tone: 'neutral', label: `${row.days_seen} day${row.days_seen === 1 ? '' : 's'}` }
 }
 
+function recurringRowId(row) {
+  return `${row.tool}|${row.signature}`
+}
+
+// Every session a fault happened in, most recent first.
+function RecurringSessionsList({ row, onOpenSession }) {
+  const sessions = row.affected_sessions || []
+  const hidden = Math.max(0, Number(row.sessions || 0) - sessions.length)
+  return jsxs('div', {
+    style: { display: 'grid', gap: '0.15rem', maxHeight: '22rem', overflowY: 'auto', padding: '0.5rem 0.65rem 0.6rem 2.4rem' },
+    children: [
+      jsx('span', {
+        style: { color: color.tertiary, fontSize: '0.625rem', marginBottom: '0.2rem' },
+        children: `${formatCount(row.sessions)} session${Number(row.sessions) === 1 ? '' : 's'} with this failure, most recent first${hidden ? ` · showing ${formatCount(sessions.length)}` : ''}`
+      }),
+      ...sessions.map(session => jsxs('div', {
+        style: { alignItems: 'center', display: 'grid', gap: '0.75rem', gridTemplateColumns: 'minmax(0, 1fr) auto auto' },
+        children: [
+          jsxs('button', {
+            type: 'button',
+            onClick: () => onOpenSession(session.session_id),
+            title: `Open ${session.session_id}`,
+            style: { alignItems: 'center', background: 'transparent', border: 'none', color: color.accent, cursor: 'pointer', display: 'flex', font: 'inherit', fontSize: '0.6875rem', gap: '0.4rem', minWidth: 0, outlineColor: color.accent, padding: '0.15rem 0', textAlign: 'left' },
+            children: [
+              jsx('span', { style: { overflow: 'hidden', textDecoration: 'underline', textOverflow: 'ellipsis', textUnderlineOffset: '2px', whiteSpace: 'nowrap' }, children: session.title || session.session_id }),
+              session.profile ? jsx(Pill, { children: session.profile }) : null
+            ]
+          }),
+          jsx('span', { style: { ...tabular, color: color.secondary, fontSize: '0.6875rem' }, children: `${formatCount(session.count)}×` }),
+          jsx('span', { style: { ...tabular, color: color.tertiary, fontSize: '0.6875rem', minWidth: '7.5rem', textAlign: 'right' }, children: formatShortDate(session.last_at) })
+        ]
+      }, session.session_id))
+    ]
+  })
+}
+
 // The agent's bad actors: confirmed failures grouped by what went wrong
 // across every session, ranked by how often they recur.
 function RecurringFailuresSection({ ctx, period, onOpenSession }) {
+  const [open, setOpen] = useState(() => new Set())
+  const toggle = id => setOpen(current => {
+    const next = new Set(current)
+    if (next.has(id)) next.delete(id)
+    else next.add(id)
+    return next
+  })
   const query = useQuery({
     queryKey: [PLUGIN_ID, 'recurring-failures', activeProfilesParam, period.days, period.start_at, period.end_at],
     queryFn: () => pluginRest(ctx, apiPath('/failures/recurring', period)),
@@ -2621,7 +2677,25 @@ function RecurringFailuresSection({ ctx, period, onOpenSession }) {
               return jsx(Pill, { tone: pill.tone, children: pill.label })
             }
           },
-          { key: 'sessions', label: 'Sessions', align: 'right', render: row => formatCount(row.sessions) },
+          {
+            key: 'sessions',
+            label: 'Sessions',
+            align: 'right',
+            render: row => {
+              const isOpen = open.has(recurringRowId(row))
+              return jsxs('button', {
+                type: 'button',
+                onClick: () => toggle(recurringRowId(row)),
+                'aria-expanded': isOpen,
+                title: isOpen ? 'Hide the sessions' : 'List every session with this failure',
+                style: { ...tabular, alignItems: 'center', background: 'transparent', border: 'none', color: color.accent, cursor: 'pointer', display: 'inline-flex', font: 'inherit', gap: '0.25rem', outlineColor: color.accent, padding: 0, textDecoration: 'underline', textUnderlineOffset: '2px' },
+                children: [
+                  formatCount(row.sessions),
+                  jsx(Codicon, { name: isOpen ? 'chevron-down' : 'chevron-right', size: '0.7rem', 'aria-hidden': true })
+                ]
+              })
+            }
+          },
           {
             key: 'last_at',
             label: 'Last seen',
@@ -2630,22 +2704,10 @@ function RecurringFailuresSection({ ctx, period, onOpenSession }) {
               ? jsx(Pill, { tone: 'danger', children: 'last 24 h' })
               : formatShortDate(row.last_at)
           },
-          { key: 'trend', label: 'Trend (14d)', align: 'right', render: row => jsx(TrendBars, { rows: row.trend }) },
-          {
-            key: 'example',
-            label: '',
-            render: row => row.example?.session_id
-              ? jsx('button', {
-                  type: 'button',
-                  onClick: () => onOpenSession(row.example.session_id),
-                  title: row.example.snippet || 'Open the session where it last happened',
-                  style: { background: 'transparent', border: 'none', color: color.accent, cursor: 'pointer', font: 'inherit', fontSize: '0.6875rem', outlineColor: color.accent, padding: 0, textDecoration: 'underline', textUnderlineOffset: '2px' },
-                  children: 'Latest'
-                })
-              : null
-          }
+          { key: 'trend', label: 'Trend (14d)', align: 'right', render: row => jsx(TrendBars, { rows: row.trend }) }
         ],
         rows: data.groups || [],
+        rowDetail: row => open.has(recurringRowId(row)) ? jsx(RecurringSessionsList, { row, onOpenSession }) : null,
         emptyTitle: 'No confirmed failures',
         emptyDescription: 'No tool failure was confirmed in this period.'
       })

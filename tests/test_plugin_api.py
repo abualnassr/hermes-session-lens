@@ -1160,10 +1160,13 @@ class SessionLensApiTests(unittest.TestCase):
         module = next(group for group in by_tool["execute_code"] if "httpx" in group["headline"])
         self.assertEqual((module["count"], module["pattern"]), (6, "burst"))
         self.assertEqual(module["example"]["session_id"], "session-1")
+        self.assertEqual([(item["session_id"], item["count"]) for item in module["affected_sessions"]], [("session-1", 6)])
+        self.assertEqual(module["affected_sessions"][0]["last_at"], base + 3605)
         self.assertEqual(len(module["trend"]), 14)
         self.assertGreaterEqual(data["totals"]["failures"], 10)
         source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
         self.assertIn("function RecurringFailuresSection({ ctx, period, onOpenSession })", source)
+        self.assertIn("function RecurringSessionsList({ row, onOpenSession })", source)
         self.assertIn("pluginRest(ctx, apiPath('/failures/recurring', period))", source)
 
     def test_conversation_chains_sum_a_conversation_across_its_sessions(self):
