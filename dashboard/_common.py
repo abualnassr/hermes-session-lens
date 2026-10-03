@@ -267,6 +267,9 @@ _NOISE_DETAIL_PATTERNS = (
     re.compile(r"^[A-Za-z][\w /.\-]*:\s*(?:\$|USD\s*)?0(?:[.,]0+)?(?:\s*(?:USD|credits?|runs?))?\s*$", re.I),
     re.compile(r"update available|npm (?:update|install)|new version|please upgrade", re.I),
     re.compile(r"https?://", re.I),
+    # Hermes' Nous snapshot splits its top-up hint over two lines; the URL
+    # line is muted above, this is its slash-command half.
+    re.compile(r"^\(?\s*or run /\w+\s*\)?$", re.I),
 )
 
 

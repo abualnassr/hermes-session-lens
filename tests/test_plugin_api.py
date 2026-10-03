@@ -642,6 +642,13 @@ class SessionLensApiTests(unittest.TestCase):
             self.assertFalse(nous_mod._probe_nous())
             self.assertEqual(nous_mod._collect_nous_usage()["status"], "not_configured")
 
+    def test_nous_top_up_command_hint_is_muted(self):
+        kept, muted = api._split_noise_details(
+            ["Top up at https://portal.nousresearch.com/billing", "(or run /topup)", "Plan: Free"]
+        )
+        self.assertEqual(kept, ["Plan: Free"])
+        self.assertEqual(muted, ["Top up at https://portal.nousresearch.com/billing", "(or run /topup)"])
+
     def test_collector_threads_inherit_the_request_context(self):
         import contextvars
         from concurrent.futures import ThreadPoolExecutor
@@ -2050,7 +2057,7 @@ process.stdout.write(JSON.stringify(out))
         self.assertEqual(card["windows"][0]["remaining"], 7.89)
         self.assertIn("$7.89 top-up", card["windows"][0]["detail"])
         self.assertIn("renews Sep 23, 2026", card["windows"][0]["detail"])
-        self.assertEqual(card["details"], ["(or run /topup)"])
+        self.assertEqual(card["details"], [])
         source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
         self.assertIn("function ProviderWindows({ provider, history, ledger, onDrill })", source)
         self.assertIn("Rate limits per minute: ", source)
