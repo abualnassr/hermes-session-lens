@@ -1166,6 +1166,51 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertIn("function RecurringFailuresSection({ ctx, period, onOpenSession })", source)
         self.assertIn("pluginRest(ctx, apiPath('/failures/recurring', period))", source)
 
+    def test_conversation_chains_sum_a_conversation_across_its_sessions(self):
+        connection = sqlite3.connect(self.db_path)
+        connection.execute("UPDATE sessions SET title = '```json {}', parent_session_id = NULL WHERE id = 'session-1'")
+        members = [
+            ("chain-2", "session-1", "desktop", 1_800_000_200, 0.40, "Second part"),
+            ("chain-3", "chain-2", "subagent", 1_800_000_300, 0.10, "Helper"),
+            ("chain-4", "chain-3", "telegram", 1_800_000_400, 0.25, "Latest part"),
+        ]
+        for sid, parent, source, started, cost, title in members:
+            connection.execute(
+                """
+                INSERT INTO sessions (id, parent_session_id, source, model, started_at, last_activity_at, ended_at,
+                                      estimated_cost_usd, cost_status, title, api_call_count)
+                VALUES (?, ?, ?, 'provider/model-a', ?, ?, ?, ?, 'estimated', ?, 3)
+                """,
+                (sid, parent, source, started, started + 50, started + 50, cost, title),
+            )
+        # A corrupt cycle must not hang the walk.
+        connection.execute(
+            "INSERT INTO sessions (id, parent_session_id, source, started_at, title) VALUES ('loop-a', 'loop-b', 'cli', 1800000500, 'a')"
+        )
+        connection.execute(
+            "INSERT INTO sessions (id, parent_session_id, source, started_at, title) VALUES ('loop-b', 'loop-a', 'cli', 1800000600, 'b')"
+        )
+        connection.commit()
+        connection.close()
+
+        data = api._chains_sync(0)
+        chain = next(item for item in data["chains"] if item["root_id"] == "session-1")
+        self.assertEqual(chain["sessions"], 4)
+        self.assertEqual(chain["links"], {"continuation": 1, "subagent": 1, "branch": 1})
+        self.assertEqual(chain["latest_id"], "chain-4")
+        self.assertEqual(chain["title"], "Latest part")  # the first title was JSON
+        root_cost = api._cost_view(api._session_detail_sync("session-1")["session"])["display_cost_usd"] or 0
+        self.assertAlmostEqual(chain["cash_usd"], round(root_cost + 0.75, 4), places=3)
+        self.assertTrue(any(item["root_id"] in {"loop-a", "loop-b"} for item in data["chains"]))
+
+        one = api._session_chain_sync("chain-3")
+        self.assertEqual((one["sessions"], one["position"]), (4, 3))
+        with self.assertRaises(api.HTTPException):
+            api._session_chain_sync("missing")
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("function ConversationChainsSection({ ctx, period, onOpenSession })", source)
+        self.assertIn("jsx(ChainNote, { ctx, sessionId: session.id, profile })", source)
+
     def test_collector_threads_inherit_the_request_context(self):
         import contextvars
         from concurrent.futures import ThreadPoolExecutor

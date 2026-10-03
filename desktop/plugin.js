@@ -1692,6 +1692,75 @@ function HelperTasksSection({ ctx, period }) {
   })
 }
 
+function chainCost(chain) {
+  return fleetSpend(chain.cash_usd, chain.list_price_usd)
+}
+
+function chainLinksLabel(links) {
+  const parts = []
+  if (links?.continuation) parts.push(`${links.continuation} continued`)
+  if (links?.subagent) parts.push(`${links.subagent} subagent${links.subagent === 1 ? '' : 's'}`)
+  if (links?.branch) parts.push(`${links.branch} branched`)
+  return parts.join(' · ')
+}
+
+// One conversation's cost across the sessions it was split into: a chat that
+// hits session_reset continues in a new, linked session, and each piece
+// alone looks cheap.
+function ConversationChainsSection({ ctx, period, onOpenSession }) {
+  const query = useQuery({
+    queryKey: [PLUGIN_ID, 'chains', activeProfilesParam, period.days, period.start_at, period.end_at],
+    queryFn: () => pluginRest(ctx, apiPath('/chains', period)),
+    staleTime: 60_000
+  })
+  if (query.isError || !query.data?.chains?.length) return null
+  const data = query.data
+  const totals = data.totals || {}
+  return jsxs('section', {
+    children: [
+      jsx(SectionHeading, {
+        title: 'Conversations across sessions',
+        description: `${formatCount(totals.chains)} conversations were split into ${formatCount(totals.sessions)} sessions, costing ${fleetSpend(totals.cash_usd, totals.list_price_usd)} in all. ${data.definition || ''}`
+      }),
+      jsx(SimpleTable, {
+        columns: [
+          {
+            key: 'title',
+            label: 'Conversation',
+            render: row => jsx('button', {
+              type: 'button',
+              onClick: () => onOpenSession(row.latest_id),
+              title: `Open the latest session: ${row.latest_title}`,
+              style: { background: 'transparent', border: 'none', color: color.primary, cursor: 'pointer', font: 'inherit', fontWeight: 600, maxWidth: '28rem', outlineColor: color.accent, overflow: 'hidden', padding: 0, textAlign: 'left', textOverflow: 'ellipsis', whiteSpace: 'nowrap' },
+              children: row.title
+            })
+          },
+          { key: 'profile', label: 'Profile', muted: true, render: row => row.profile ? `${row.profile} · ${row.source || ''}` : (row.source || '—') },
+          { key: 'sessions', label: 'Sessions', align: 'right', render: row => jsx('span', { title: chainLinksLabel(row.links), children: formatCount(row.sessions) }) },
+          { key: 'started_at', label: 'Span', muted: true, render: row => `${formatShortDate(row.started_at)} → ${formatShortDate(row.last_activity_at)}` },
+          { key: 'cost', label: 'Total cost', align: 'right', sortValue: row => row.cash_usd + row.list_price_usd, render: row => jsx('span', { style: tabular, children: chainCost(row) }) }
+        ],
+        rows: data.chains.slice(0, 12)
+      })
+    ]
+  })
+}
+
+function ChainNote({ ctx, sessionId, profile }) {
+  const query = useQuery({
+    queryKey: [PLUGIN_ID, 'chain', activeProfilesParam, sessionId, profile || ''],
+    queryFn: () => pluginRest(ctx, apiPath(`/sessions/${encodeURIComponent(sessionId)}/chain`, profile ? { profiles: profile } : {})),
+    staleTime: 60_000
+  })
+  const chain = query.data
+  if (!chain || chain.sessions < 2) return null
+  return jsx('div', {
+    title: chainLinksLabel(chain.links),
+    style: { color: color.tertiary, fontSize: '0.6875rem', marginTop: '0.15rem' },
+    children: `Session ${chain.position} of ${chain.sessions} in one conversation · ${chainCost(chain)} in total`
+  })
+}
+
 function SessionDetail({ query, detailTab, setDetailTab, ctx, period, profile, onBack }) {
   if (!query) {
     return jsx(EmptyState, { title: 'Choose a session', description: 'Select a session to inspect its recorded evidence.' })
@@ -1744,7 +1813,8 @@ function SessionDetail({ query, detailTab, setDetailTab, ctx, period, profile, o
                   jsx('div', {
                     style: { color: color.tertiary, fontSize: '0.6875rem', marginTop: '0.2rem' },
                     children: `${formatDate(session.started_at)} · ${session.model || 'model not recorded'}${session.hidden ? ' · hidden from the Hermes sidebar' : ''}`
-                  })
+                  }),
+                  jsx(ChainNote, { ctx, sessionId: session.id, profile })
                 ]
               })
             ]
@@ -2374,6 +2444,7 @@ function OverviewView({ query, ctx, period, watch }) {
       children: [
         watch ? jsx(RunningNowPanel, { ctx, ...watch }) : null,
         jsx(HelperTasksSection, { ctx, period }),
+        watch?.onOpenSession ? jsx(ConversationChainsSection, { ctx, period, onOpenSession: watch.onOpenSession }) : null,
         jsxs('section', {
           children: [
             jsx(SectionHeading, {

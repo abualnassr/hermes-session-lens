@@ -15,6 +15,7 @@ try:
     from ._rules import *
     from ._watch import *
     from ._anatomy import *
+    from ._chains import *
 except ImportError:  # pragma: no cover - direct Hermes file loading
     from _common import *
     from _logparse import *
@@ -26,6 +27,7 @@ except ImportError:  # pragma: no cover - direct Hermes file loading
     from _rules import *
     from _watch import *
     from _anatomy import *
+    from _chains import *
 
 router = APIRouter()
 
@@ -907,6 +909,22 @@ def _trace_sync(session_id: str, limit: int, offset: int) -> Dict[str, Any]:
 async def session_anatomy(session_id: str, profiles: str = Query("")) -> Dict[str, Any]:
     """Why this session cost what it did: context per call, cost split, tool context, helper tasks."""
     return await asyncio.to_thread(_scoped_call, profiles, _session_anatomy_sync, session_id)
+
+
+@router.get("/sessions/{session_id}/chain")
+async def session_chain(session_id: str, profiles: str = Query("")) -> Dict[str, Any]:
+    """The conversation this session belongs to, across every session it was split into."""
+    return await asyncio.to_thread(_scoped_call, profiles, _session_chain_sync, session_id)
+
+
+@router.get("/chains")
+async def chains(
+    days: int = Query(30, ge=0, le=3650),
+    start_at: Optional[float] = Query(None, ge=0),
+    end_at: Optional[float] = Query(None, ge=0),
+    profiles: str = Query(""),
+) -> Dict[str, Any]:
+    return await asyncio.to_thread(_scoped_call, profiles, _chains_sync, days, start_at, end_at)
 
 
 @router.get("/helper-tasks")

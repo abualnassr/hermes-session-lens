@@ -6,7 +6,7 @@
 
 It installs as one Hermes plugin: a native Desktop page plus its namespaced Python API. No iframe, no separate server, no telemetry service, and no write path — the backend defines zero mutation routes and never touches a credential store.
 
-This documentation describes Hermes Session Lens `0.49.0`, verified on Hermes Agent `0.21.5` (2026-10-02 build). MIT licensed. A community plugin, not affiliated with or endorsed by Nous Research.
+This documentation describes Hermes Session Lens `0.50.0`, verified on Hermes Agent `0.21.5` (2026-10-02 build). MIT licensed. A community plugin, not affiliated with or endorsed by Nous Research.
 
 ![How Session Lens works: what it reads, what it answers, and what it never does](docs/how-it-works.svg)
 
@@ -62,6 +62,8 @@ The **Trace** tab replays the session in order — user, assistant, reasoning, t
 **Running now** opens the tab: every session that called a model in the last hour, read from Hermes' agent logs and priced with Hermes' own tables — what it burned in that hour (cash, or subscription use at API list price), its calls, and what it has cost so far. A session still running past your alert rate (default $1/h cash, $5/h subscription use; both editable in place) is flagged there, in the attention strip on every tab, and — unless you switch it off — by one desktop notification per session per day, so a runaway is caught while it runs rather than in next week's totals.
 
 Tokens by day, then the spend rolled up by git repository, working directory, or source for sessions that recorded no directory: sessions, tokens, recorded cost with unpriced counts, confirmed failures, top models, last activity. Every row drills through to the filtered session list.
+
+**Conversations across sessions.** A Telegram topic or bot chat that hits `session_reset` continues in a new session Hermes links to the old one, so a long conversation reads as many cheap sessions. Overview walks those links to each conversation's first session and ranks the conversations by what they cost in all — sessions, span, and total, with continuations, subagents and moves to another surface told apart — and a session's detail says which conversation it belongs to ("Session 24 of 24 in one conversation · $9.68 in total").
 
 ### Fleet — every profile at a glance
 
