@@ -37,6 +37,30 @@ from dashboard._providers import shared as provider_shared
 import contextlib
 
 
+# Hermes' own Python packages, which the plugin imports lazily inside its
+# credential probes, collectors and settings readers.
+_HERMES_PACKAGES = ("hermes_cli", "agent", "tools", "tui_gateway")
+
+
+def _block_hermes_packages():
+    """A patch that makes every lazy Hermes import fail, as it does in CI.
+
+    Run with Hermes' own Python, those imports succeed and read the
+    machine's real logins, keys and config instead of the test's temporary
+    HERMES_HOME — three AI Usage tests then saw the developer's Nous login
+    state. A None entry in sys.modules makes `import x` raise ImportError,
+    for the package and for any submodule already loaded. A test that needs
+    a Hermes module stubs it with its own patch.dict on top.
+    """
+    blocked = {
+        name: None
+        for name in list(sys.modules)
+        if any(name == package or name.startswith(package + ".") for package in _HERMES_PACKAGES)
+    }
+    blocked.update({package: None for package in _HERMES_PACKAGES})
+    return patch.dict(sys.modules, blocked)
+
+
 @contextlib.contextmanager
 def _provider_collectors(mapping):
     """Swap provider collectors on the adapter registry.
@@ -121,6 +145,9 @@ class FakeSessionDB:
 
 class SessionLensApiTests(unittest.TestCase):
     def setUp(self):
+        hermes_block = _block_hermes_packages()
+        hermes_block.start()
+        self.addCleanup(hermes_block.stop)
         self.temp = tempfile.TemporaryDirectory()
         self.home = Path(self.temp.name)
         self.db_path = self.home / "state.db"
@@ -785,6 +812,17 @@ class SessionLensApiTests(unittest.TestCase):
         claims = jwt.decode(token, key.public_key(), algorithms=["RS256"])
         self.assertEqual(claims["iss"], "1234")
         self.assertLessEqual(claims["exp"] - claims["iat"], 3600)
+
+    def test_suite_runs_as_outside_hermes_even_in_hermes_python(self):
+        # Probes and collectors must never see the developer's real Hermes
+        # logins while the suite runs, whichever interpreter runs it.
+        import importlib
+
+        for module in ("hermes_cli.auth", "hermes_cli.nous_account", "agent.anthropic_credentials", "agent.secret_scope"):
+            with self.assertRaises(ImportError, msg=module):
+                importlib.import_module(module)
+        for provider in api._provider_ids():
+            self.assertTrue(api._probe_usage_provider(provider), provider)
 
     def test_collector_threads_inherit_the_request_context(self):
         import contextvars
@@ -4691,6 +4729,11 @@ process.stdout.write(JSON.stringify(out))
 
 class AdapterRegistryTests(unittest.TestCase):
     """Vendors live in one module each and register themselves; dispatchers read the registry."""
+
+    def setUp(self):
+        hermes_block = _block_hermes_packages()
+        hermes_block.start()
+        self.addCleanup(hermes_block.stop)
 
     def test_every_vendor_module_registers_itself(self):
         root = MODULE_PATH.parent
