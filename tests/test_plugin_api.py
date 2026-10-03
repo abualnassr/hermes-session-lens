@@ -1121,6 +1121,51 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertIn("{ id: 'anatomy', label: 'Why it cost' }", source)
         self.assertIn("function HelperTasksSection({ ctx, period })", source)
 
+    def test_recurring_failures_group_one_fault_across_sessions(self):
+        import time as time_mod
+
+        git_a = json.dumps({"output": "cd C:/work/alpha\nfatal: not a git repository (or any of the parent directories): .git", "exit_code": 128, "error": None})
+        git_b = json.dumps({"output": "fatal: not a git repository (or any of the parent directories): .git", "exit_code": 128, "error": None})
+        trace = "Traceback (most recent call last):\n  File \"x.py\", line 3\nModuleNotFoundError: No module named 'httpx'"
+        self.assertEqual(api._recurring_signature("terminal", git_a)[0], api._recurring_signature("terminal", git_b)[0])
+        self.assertIn("not a git repository", api._recurring_signature("terminal", git_a)[1])
+        self.assertIn("modulenotfounderror", api._recurring_signature("execute_code", trace)[0])
+        self.assertEqual(
+            api._recurring_signature("read_file", "Error: no such file C:\\a\\b.py")[0],
+            api._recurring_signature("read_file", "Error: no such file D:/other/c.py")[0],
+        )
+        started = time_mod.perf_counter()
+        api._recurring_signature("terminal", ("/a" * 30000) + " c:/" + ("b/" * 30000))
+        self.assertLess(time_mod.perf_counter() - started, 0.5)
+
+        base = 1_800_000_000
+        connection = sqlite3.connect(self.db_path)
+        rows = [(git_a if day % 2 else git_b, base + day * 86400) for day in range(4)]
+        rows += [(trace, base + 3600 + offset) for offset in range(6)]
+        for index, (content, stamp) in enumerate(rows):
+            connection.execute(
+                "INSERT INTO messages (session_id, role, content, tool_name, tool_call_id, timestamp) VALUES (?,?,?,?,?,?)",
+                ("session-1", "tool", content, "terminal" if content != trace else "execute_code", f"rec-{index}", stamp),
+            )
+        connection.execute("UPDATE sessions SET message_count = message_count + ? WHERE id = 'session-1'", (len(rows),))
+        connection.commit()
+        connection.close()
+        data = api._recurring_failures_sync(0)
+        by_tool = {}
+        for group in data["groups"]:
+            by_tool.setdefault(group["tool"], []).append(group)
+        git = next(group for group in by_tool["terminal"] if "git repository" in group["headline"])
+        self.assertEqual((git["count"], git["days_seen"], git["pattern"]), (4, 4, "recurring"))
+        self.assertTrue(git["headline"].startswith("exit 128:"))
+        module = next(group for group in by_tool["execute_code"] if "httpx" in group["headline"])
+        self.assertEqual((module["count"], module["pattern"]), (6, "burst"))
+        self.assertEqual(module["example"]["session_id"], "session-1")
+        self.assertEqual(len(module["trend"]), 14)
+        self.assertGreaterEqual(data["totals"]["failures"], 10)
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("function RecurringFailuresSection({ ctx, period, onOpenSession })", source)
+        self.assertIn("pluginRest(ctx, apiPath('/failures/recurring', period))", source)
+
     def test_collector_threads_inherit_the_request_context(self):
         import contextvars
         from concurrent.futures import ThreadPoolExecutor

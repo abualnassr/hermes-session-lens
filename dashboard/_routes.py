@@ -4038,6 +4038,213 @@ def _merge_mcp_inventory(groups: List[Dict[str, Any]], day_keys: List[str]) -> N
         )
 
 
+# ── Recurring failures ────────────────────────────────────────────────────
+# Failures grouped by what went wrong, across every session in the scope,
+# ranked by how often they recur: the agent's bad actors. The signature is
+# the tool plus the first meaningful line of its result with the parts that
+# differ between occurrences neutralised — URLs, paths, quoted values, long
+# ids, numbers — so the same fault in two repositories is one row. Every
+# pattern below is linear: no nested quantifier can backtrack on a hostile
+# token (the 0.34.3 file-path regex took the backend down that way).
+
+_RECURRING_URL_RE = re.compile(r"https?://\S+")
+_RECURRING_WIN_PATH_RE = re.compile(r"\b[a-z]:[\\/][^\s'\"]*")
+_RECURRING_POSIX_PATH_RE = re.compile(r"(?:(?<=\s)|^)~?/[^\s'\"]+")
+_RECURRING_QUOTED_RE = re.compile(r"(?<![a-z])'[^'\n]{1,200}'|\"[^\"\n]{1,200}\"|`[^`\n]{1,200}`")
+_RECURRING_HEX_RE = re.compile(r"\b[0-9a-f]{8,}(?:-[0-9a-f]{4,})*\b")
+_RECURRING_DIGITS_RE = re.compile(r"\d+")
+_RECURRING_SPACE_RE = re.compile(r"\s+")
+RECURRING_MAX_GROUPS = 40
+
+
+_RECURRING_ERRORISH_RE = re.compile(
+    r"(?i)(error|exception|failed|failure|fatal|denied|not found|no such|cannot|can't|invalid|refus|timed out|blocked)"
+)
+
+
+def _recurring_pick_line(text: str) -> str:
+    """The most telling line of a multi-line result: the last error-like line, else the last line."""
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    if not lines:
+        return ""
+    for line in reversed(lines[-60:]):
+        if _RECURRING_ERRORISH_RE.search(line):
+            return line
+    return lines[-1]
+
+
+def _recurring_headline(content: Any) -> str:
+    """What went wrong, in one line, for grouping.
+
+    Tool results are often JSON envelopes ({"output", "exit_code", "error"}) or
+    Python tracebacks, whose first line is identical for every failure; the
+    telling part is the error field, the failing output line with its exit
+    code, or the traceback's final exception line.
+    """
+    text = str(content or "").strip()
+    if text.startswith("{"):
+        try:
+            payload = json.loads(text)
+        except (TypeError, ValueError):
+            payload = None
+        if isinstance(payload, dict):
+            error = payload.get("error")
+            if isinstance(error, dict):
+                error = error.get("message") or error.get("detail") or json.dumps(error)[:300]
+            if error:
+                return _recurring_pick_line(str(error)) or str(error)[:300]
+            output = payload.get("output") or payload.get("stdout") or payload.get("stderr") or payload.get("result")
+            exit_code = payload.get("exit_code", payload.get("returncode"))
+            line = _recurring_pick_line(output if isinstance(output, str) else json.dumps(output)[:2000] if output else "")
+            if exit_code not in (None, 0) and line:
+                return f"exit {exit_code}: {line}"
+            if line:
+                return line
+    first = _analysis_first_line(content)
+    if first.lower().startswith("traceback"):
+        last = _recurring_pick_line(text)
+        if last:
+            return last
+    return first
+
+
+def _recurring_signature(tool: Any, content: Any) -> Tuple[str, str]:
+    """(group key, readable headline) for one confirmed failure."""
+    headline = _recurring_headline(content) or "no result text recorded"
+    text = headline.lower()
+    text = _RECURRING_URL_RE.sub("<url>", text)
+    text = _RECURRING_WIN_PATH_RE.sub("<path>", text)
+    text = _RECURRING_POSIX_PATH_RE.sub("<path>", text)
+    text = _RECURRING_QUOTED_RE.sub("'…'", text)
+    text = _RECURRING_HEX_RE.sub("<id>", text)
+    text = _RECURRING_DIGITS_RE.sub("#", text)
+    text = _RECURRING_SPACE_RE.sub(" ", text).strip()[:120]
+    name = str(tool or "unknown tool").strip()
+    return f"{name.lower()}|{text}", headline
+
+
+def _recurring_failures_sync(
+    days: int,
+    start_at: Optional[float] = None,
+    end_at: Optional[float] = None,
+) -> Dict[str, Any]:
+    period_start, period_end = _period_bounds(days, start_at, end_at)
+    period_sql, period_params = _period_sql("s.started_at", period_start, period_end)
+    now = time.time()
+    with _database() as db:
+        connection = _db_connection(db)
+        failures = _confirmed_failure_rows(connection, period_sql, period_params)
+        profiles: Dict[str, str] = {}
+        if getattr(db, "union_profiles", None) and failures:
+            ids = sorted({str(row.get("session_id")) for row in failures})
+            for start in range(0, len(ids), 400):
+                chunk = ids[start : start + 400]
+                placeholders = ",".join("?" for _ in chunk)
+                for row in connection.execute(
+                    f"SELECT id, __profile FROM sessions WHERE id IN ({placeholders})", tuple(chunk)
+                ).fetchall():
+                    profiles[str(row[0])] = str(row[1])
+    groups: Dict[str, Dict[str, Any]] = {}
+    for index, failure in enumerate(failures):
+        if index % 500 == 0:
+            _check_route_budget()
+        key, headline = _recurring_signature(failure.get("tool_name"), failure.get("content"))
+        timestamp = _number(failure.get("timestamp"), 0) or None
+        session_id = str(failure.get("session_id") or "")
+        group = groups.get(key)
+        if group is None:
+            group = groups[key] = {
+                "key": key,
+                "tool": str(failure.get("tool_name") or "unknown tool"),
+                "headline": _clean_text(headline, 200),
+                "count": 0,
+                "sessions": set(),
+                "profiles": set(),
+                "days": Counter(),
+                "first_at": timestamp,
+                "last_at": timestamp,
+                "example": None,
+            }
+        group["count"] += 1
+        if session_id:
+            group["sessions"].add(session_id)
+        if profiles.get(session_id):
+            group["profiles"].add(profiles[session_id])
+        if timestamp:
+            group["days"][dt.datetime.fromtimestamp(timestamp).strftime("%Y-%m-%d")] += 1
+            if group["first_at"] is None or timestamp < group["first_at"]:
+                group["first_at"] = timestamp
+            if group["last_at"] is None or timestamp >= group["last_at"]:
+                group["last_at"] = timestamp
+                group["example"] = {"session_id": session_id, "snippet": _clean_text(failure.get("content"), 280)}
+    total = sum(group["count"] for group in groups.values())
+    ordered = sorted(groups.values(), key=lambda item: (-item["count"], -(item["last_at"] or 0), item["key"]))
+    trend_end = period_end or now
+    day_keys = [dt.datetime.fromtimestamp(trend_end - offset * 86400).strftime("%Y-%m-%d") for offset in range(13, -1, -1)]
+    rows = []
+    cumulative = 0
+    for rank, group in enumerate(ordered[:RECURRING_MAX_GROUPS], start=1):
+        cumulative += group["count"]
+        days_seen = len(group["days"])
+        if days_seen >= 3:
+            pattern = "recurring"
+        elif group["count"] >= 5:
+            pattern = "burst"
+        elif group["count"] == 1:
+            pattern = "once"
+        else:
+            pattern = "occasional"
+        rows.append(
+            {
+                "rank": rank,
+                "tool": group["tool"],
+                "headline": group["headline"],
+                "signature": group["key"].split("|", 1)[1],
+                "count": group["count"],
+                "share": round(group["count"] / total, 4) if total else 0.0,
+                "cumulative_share": round(cumulative / total, 4) if total else 0.0,
+                "sessions": len(group["sessions"]),
+                "profiles": sorted(group["profiles"]),
+                "days_seen": days_seen,
+                "pattern": pattern,
+                "still_happening": bool(group["last_at"] and now - group["last_at"] <= 86400),
+                "first_at": group["first_at"],
+                "last_at": group["last_at"],
+                "example": group["example"],
+                "trend": [{"day": day, "requests": group["days"].get(day, 0)} for day in day_keys],
+            }
+        )
+    top_five = sum(row["count"] for row in rows[:5])
+    return {
+        "groups": rows,
+        "totals": {
+            "failures": total,
+            "signatures": len(groups),
+            "top5_share": round(top_five / total, 4) if total else 0.0,
+            "recurring": sum(1 for row in rows if row["pattern"] == "recurring"),
+            "still_happening": sum(1 for row in rows if row["still_happening"]),
+        },
+        "period_days": days,
+        "period": _period_payload(days, period_start, period_end),
+        "definition": (
+            "Confirmed tool failures grouped by tool and the first line of the error with paths, URLs, quoted "
+            "values, ids and numbers neutralised, so one fault is one row. Recurring = seen on three or more days; "
+            "burst = five or more on one or two days. Signatures read English error text."
+        ),
+        "generated_at": now,
+    }
+
+
+@router.get("/failures/recurring")
+async def recurring_failures(
+    days: int = Query(30, ge=0, le=3650),
+    start_at: Optional[float] = Query(None, ge=0),
+    end_at: Optional[float] = Query(None, ge=0),
+    profiles: str = Query(""),
+) -> Dict[str, Any]:
+    return await asyncio.to_thread(_scoped_call, profiles, _recurring_failures_sync, days, start_at, end_at)
+
+
 @router.get("/tools")
 async def tools(
     days: int = Query(30, ge=0, le=3650),

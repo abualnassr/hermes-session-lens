@@ -6,7 +6,7 @@
 
 It installs as one Hermes plugin: a native Desktop page plus its namespaced Python API. No iframe, no separate server, no telemetry service, and no write path — the backend defines zero mutation routes and never touches a credential store.
 
-This documentation describes Hermes Session Lens `0.48.0`, verified on Hermes Agent `0.21.5` (2026-10-02 build). MIT licensed. A community plugin, not affiliated with or endorsed by Nous Research.
+This documentation describes Hermes Session Lens `0.49.0`, verified on Hermes Agent `0.21.5` (2026-10-02 build). MIT licensed. A community plugin, not affiliated with or endorsed by Nous Research.
 
 ![How Session Lens works: what it reads, what it answers, and what it never does](docs/how-it-works.svg)
 
@@ -98,6 +98,8 @@ Expanding a row opens the full evidence card. The scoring rules — how a sessio
 ![Tools: MCP server groups with latency, context weight, and context cost](docs/screenshots/tools.png)
 
 Call volume, sessions, fail rate, p50/p95 latency, and last use for every tool and every MCP server — including connected servers with no calls yet, listed from `config.yaml` with the number of tools each offers (from Hermes' local MCP schema cache) and marked when switched off. Tools Hermes runs through its tool-search bridge (`tool_call`) are credited to the tool that actually ran, and tools of apps linked through Hermes connectors form their own groups. Then per-tool reliability ranked failures-first with a dedicated failed-call inspector. **Context weight** estimates the tokens each tool's results push into model context (recorded result length ÷ 4) and prices them at each session's billing route through Hermes' own pricing tables — direct entry at the input rate plus a carried upper bound for re-sends, "quota" on subscription routes, "unpriced" where Hermes has no rate. Explicit skill invocations are counted from recorded `skill_view` / `skill_manage` calls; available skills are never mislabelled as used.
+
+**Recurring failures** ranks the agent's bad actors: confirmed tool failures from every session in the scope, grouped by what went wrong — the tool plus the error's telling line (a JSON result's error field or its failing output line with the exit code, a traceback's final exception) with paths, URLs, quoted values, ids and numbers neutralised, so the same fault in two repositories is one row. Each row shows its count and share, whether it recurs (three or more days), came in one burst, or happened once, the sessions it hit, a 14-day trend, whether it happened in the last 24 hours, and a link to the latest session it hit.
 
 ### Rules — grade your agent against its own instructions
 

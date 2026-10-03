@@ -2496,7 +2496,93 @@ function ContextWeightCell({ row }) {
   })
 }
 
-function ToolsView({ ctx, period }) {
+function recurringPatternPill(row) {
+  if (row.pattern === 'recurring') return { tone: 'danger', label: `Recurring · ${row.days_seen} days` }
+  if (row.pattern === 'burst') return { tone: 'neutral', label: 'Burst' }
+  if (row.pattern === 'once') return { tone: 'neutral', label: 'Once' }
+  return { tone: 'neutral', label: `${row.days_seen} day${row.days_seen === 1 ? '' : 's'}` }
+}
+
+// The agent's bad actors: confirmed failures grouped by what went wrong
+// across every session, ranked by how often they recur.
+function RecurringFailuresSection({ ctx, period, onOpenSession }) {
+  const query = useQuery({
+    queryKey: [PLUGIN_ID, 'recurring-failures', activeProfilesParam, period.days, period.start_at, period.end_at],
+    queryFn: () => pluginRest(ctx, apiPath('/failures/recurring', period)),
+    refetchInterval: 120_000
+  })
+  if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'Recurring failures unavailable' })
+  if (queryPending(query)) return jsx(LoadingBlock, { rows: 4 })
+  const data = query.data
+  const totals = data.totals || {}
+  return jsxs('section', {
+    children: [
+      jsx(SectionHeading, {
+        title: 'Recurring failures',
+        description: `${formatCount(totals.failures)} confirmed failures in ${formatCount(totals.signatures)} distinct faults; the top five are ${(Number(totals.top5_share) * 100).toFixed(0)}% of them${totals.recurring ? ` · ${formatCount(totals.recurring)} recur on three or more days` : ''}${totals.still_happening ? ` · ${formatCount(totals.still_happening)} happened in the last 24 h` : ''}. ${data.definition || ''}`
+      }),
+      jsx(SimpleTable, {
+        columns: [
+          { key: 'rank', label: '#', align: 'right', muted: true },
+          {
+            key: 'headline',
+            label: 'Failure',
+            render: row => jsxs('div', {
+              title: `Signature: ${row.signature}`,
+              style: { display: 'grid', gap: '0.1rem', minWidth: 0 },
+              children: [
+                jsx('span', { style: { color: color.tertiary, fontSize: '0.625rem' }, children: row.tool }),
+                jsx('span', { style: { color: color.primary, fontSize: '0.75rem', overflow: 'hidden', textOverflow: 'ellipsis' }, children: row.headline })
+              ]
+            })
+          },
+          {
+            key: 'count',
+            label: 'Count',
+            align: 'right',
+            render: row => jsx('span', { style: tabular, title: `${(Number(row.share) * 100).toFixed(1)}% of failures · ${(Number(row.cumulative_share) * 100).toFixed(0)}% with those above`, children: formatCount(row.count) })
+          },
+          {
+            key: 'pattern',
+            label: 'Pattern',
+            render: row => {
+              const pill = recurringPatternPill(row)
+              return jsx(Pill, { tone: pill.tone, children: pill.label })
+            }
+          },
+          { key: 'sessions', label: 'Sessions', align: 'right', render: row => formatCount(row.sessions) },
+          {
+            key: 'last_at',
+            label: 'Last seen',
+            muted: true,
+            render: row => row.still_happening
+              ? jsx(Pill, { tone: 'danger', children: 'last 24 h' })
+              : formatShortDate(row.last_at)
+          },
+          { key: 'trend', label: 'Trend (14d)', align: 'right', render: row => jsx(TrendBars, { rows: row.trend }) },
+          {
+            key: 'example',
+            label: '',
+            render: row => row.example?.session_id
+              ? jsx('button', {
+                  type: 'button',
+                  onClick: () => onOpenSession(row.example.session_id),
+                  title: row.example.snippet || 'Open the session where it last happened',
+                  style: { background: 'transparent', border: 'none', color: color.accent, cursor: 'pointer', font: 'inherit', fontSize: '0.6875rem', outlineColor: color.accent, padding: 0, textDecoration: 'underline', textUnderlineOffset: '2px' },
+                  children: 'Latest'
+                })
+              : null
+          }
+        ],
+        rows: data.groups || [],
+        emptyTitle: 'No confirmed failures',
+        emptyDescription: 'No tool failure was confirmed in this period.'
+      })
+    ]
+  })
+}
+
+function ToolsView({ ctx, period, onOpenSession }) {
   const query = useQuery({
     queryKey: [PLUGIN_ID, 'tools', activeProfilesParam, period.days, period.start_at, period.end_at],
     queryFn: () => pluginRest(ctx, apiPath('/tools', period)),
@@ -2603,6 +2689,7 @@ function ToolsView({ ctx, period }) {
           emptyTitle: 'No tool calls recorded',
           emptyDescription: 'The selected period contains no tool-call evidence.'
         }),
+        onOpenSession ? jsx(RecurringFailuresSection, { ctx, period, onOpenSession }) : null,
         jsx(SectionHeading, {
           title: 'Per-tool reliability',
           description: 'Every individual tool, ranked failures-first. Failure signatures are conservative, match English error text only, and are inspectable per session; recorded error states count in any language.'
@@ -5287,7 +5374,7 @@ function SessionLensPage({ ctx }) {
     })
   }
   if (tab === 'operations') content = jsx(OperationsView, { ctx, period, onDrill: drillToSessions })
-  if (tab === 'tools') content = jsx(ToolsView, { ctx, period })
+  if (tab === 'tools') content = jsx(ToolsView, { ctx, period, onOpenSession: openSessionById })
   if (tab === 'rules') content = jsx(RulesView, { ctx, period, onDrill: drillToSessions, rules, onRulesChange: setRules, availableProfiles })
   if (tab === 'system') content = jsx(SystemView, { ctx })
   if (tab === 'fleet') {
