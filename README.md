@@ -10,7 +10,7 @@ This documentation describes Hermes Session Lens `0.51.0`, verified on Hermes Ag
 
 ![How Session Lens works: what it reads, what it answers, and what it never does](docs/how-it-works.svg)
 
-Left to right: what the plugin reads (local records, read-only, plus the vendor usage endpoints it can ask — only for credentials you have configured), the plugin itself (a GET-only API inside Hermes' backend and a native Desktop page, separated by a boundary no credential crosses), and the eight questions the page answers. The strip along the bottom is what it never does; the [Trust](#trust) section states each claim in full and how to verify it.
+Left to right: what the plugin reads (local records, read-only, plus the vendor usage endpoints it can ask — only for credentials you have configured), the plugin itself (a GET-only API inside Hermes' single backend, scoped to each request's profile, and a native Desktop page, separated by a boundary no credential crosses), and the ten questions the page answers. The strip along the bottom is what it never does; the [Trust](#trust) section states each claim in full and how to verify it.
 
 ## Install
 
