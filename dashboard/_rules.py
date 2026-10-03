@@ -1226,7 +1226,7 @@ def _tool_globs(names: Iterable[str]) -> List[Dict[str, Any]]:
 
 def _tool_names_sync() -> Dict[str, Any]:
     scope = _get_profile_scope()
-    cache_key = ",".join(scope) if scope else ""
+    cache_key = ",".join(scope) if scope else _account_home_key()
     now = time.time()
     cached = _tool_names_cache.get(cache_key)
     if cached and now - cached[0] < TOOL_NAMES_CACHE_TTL_SECONDS:

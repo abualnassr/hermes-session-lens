@@ -50,9 +50,15 @@ _LLM_ENV_KEYS = {
 _SECRET_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*(_API_KEY|_TOKEN|_SECRET|_API_TOKEN|_ACCESS_KEY)$")
 
 SERVICES_CACHE_TTL_SECONDS = AI_USAGE_CACHE_TTL_SECONDS
-_services_cache: Optional[Tuple[float, Dict[str, Any]]] = None
+# Keyed by Hermes home: one backend serves every local profile, and a
+# balance belongs to the profile whose .env key produced it.
+_services_caches: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 _services_cache_lock = threading.Lock()
-_services_last_success: Dict[str, Dict[str, Any]] = {}
+_services_last_success_by_home: Dict[str, Dict[str, Dict[str, Any]]] = {}
+
+
+def _services_last_success() -> Dict[str, Dict[str, Any]]:
+    return _services_last_success_by_home.setdefault(_account_home_key(), {})
 
 
 # ── Discovery ─────────────────────────────────────────────────────────────
@@ -202,13 +208,14 @@ def _service_collectors() -> Dict[str, Any]:
 
 def _fold_service_last_success(service: str, result: Dict[str, Any]) -> Dict[str, Any]:
     """Same memory rule as provider cards: transient failures re-serve the last good reading as stale."""
+    last_success = _services_last_success()
     if result.get("status") == "ok":
-        _services_last_success[service] = copy.deepcopy(result)
+        last_success[service] = copy.deepcopy(result)
     elif result.get("status") in {"not_configured", "expired", "forbidden"}:
-        _services_last_success.pop(service, None)
-    elif result.get("status") == "unavailable" and service in _services_last_success:
+        last_success.pop(service, None)
+    elif result.get("status") == "unavailable" and service in last_success:
         message = result.get("message")
-        result = copy.deepcopy(_services_last_success[service])
+        result = copy.deepcopy(last_success[service])
         result.update({"status": "stale", "stale": True, "message": message or "The latest refresh failed; showing the last successful reading."})
     return result
 
@@ -225,15 +232,16 @@ def _inventory_status(item: Mapping[str, Any], card: Optional[Mapping[str, Any]]
 
 
 def _services_sync(fresh: bool = False, only_service: Optional[str] = None) -> Dict[str, Any]:
-    global _services_cache
     now = time.time()
+    home = _account_home_key()
     with _services_cache_lock:
-        if not fresh and _services_cache and now - _services_cache[0] < SERVICES_CACHE_TTL_SECONDS:
-            cached = copy.deepcopy(_services_cache[1])
+        entry = _services_caches.get(home)
+        if not fresh and entry and now - entry[0] < SERVICES_CACHE_TTL_SECONDS:
+            cached = copy.deepcopy(entry[1])
             cached["cached"] = True
             return cached
-        base = copy.deepcopy(_services_cache[1]) if _services_cache else None
-        cached_at = _services_cache[0] if _services_cache else now
+        base = copy.deepcopy(entry[1]) if entry else None
+        cached_at = entry[0] if entry else now
 
     inventory = _services_inventory()
     collectors = _service_collectors()
@@ -245,7 +253,7 @@ def _services_sync(fresh: bool = False, only_service: Optional[str] = None) -> D
     results: Dict[str, Dict[str, Any]] = {}
     if targets:
         with ThreadPoolExecutor(max_workers=len(targets), thread_name_prefix="session-lens-services") as pool:
-            futures = {pool.submit(collector): sid for sid, collector in targets.items()}
+            futures = {_submit_in_context(pool, collector): sid for sid, collector in targets.items()}
             for future in as_completed(futures):
                 sid = futures[future]
                 try:
@@ -294,15 +302,16 @@ def _services_sync(fresh: bool = False, only_service: Optional[str] = None) -> D
                 "readable usage API are listed, not guessed."
             ),
         }
-        _services_cache = (cached_at if only_service and base is not None else time.time(), copy.deepcopy(payload))
+        _services_caches[home] = (cached_at if only_service and base is not None else time.time(), copy.deepcopy(payload))
         return payload
 
 
 def _services_cached_payload(max_age_seconds: float = 3600.0) -> Optional[Dict[str, Any]]:
     """A recent cached /services payload WITHOUT triggering collection."""
     with _services_cache_lock:
-        if _services_cache and time.time() - _services_cache[0] < max_age_seconds:
-            return copy.deepcopy(_services_cache[1])
+        entry = _services_caches.get(_account_home_key())
+        if entry and time.time() - entry[0] < max_age_seconds:
+            return copy.deepcopy(entry[1])
     return None
 
 __all__ = [name for name in globals() if not name.startswith("__")]

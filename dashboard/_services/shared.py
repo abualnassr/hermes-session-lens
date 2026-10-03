@@ -99,12 +99,13 @@ def _service_payload(
 def _service_secret(*names: str) -> Tuple[str, str]:
     """(value, env name) for the first configured key among `names`.
 
-    Hermes loads the profile's .env into the process environment at startup,
-    so the environment is the source of truth; the file is read only as a
-    fallback for callers outside a Hermes process.
+    Hermes' profile-scoped secret lookup is the source of truth (one backend
+    serves every profile, so the process environment is only the launch
+    profile's); the profile's .env file is read as a fallback for callers
+    outside a Hermes process.
     """
     for name in names:
-        value = str(os.environ.get(name) or "").strip()
+        value = _scoped_secret(name)
         if value:
             return value, name
     try:

@@ -103,8 +103,57 @@ def _scope_db_paths() -> List[Tuple[str, Path]]:
     return [(name, path) for name, path in paths if path.exists()]
 
 
+def _scoped_secret(name: str) -> str:
+    """A credential by env-var name, as the profile this request serves sees it.
+
+    Hermes Desktop now serves every local profile from one backend and binds a
+    per-request secret scope; os.environ there holds the LAUNCH profile's
+    values, so reading it directly would show one profile's balances under
+    another. Hermes' get_secret honours the scope and fails closed when none
+    is bound — treated as unset, never borrowed. Outside Hermes (tests, the
+    standalone smoke runs) the process environment is the only source.
+    """
+    try:
+        from agent.secret_scope import get_secret
+    except Exception:
+        return str(os.environ.get(name) or "").strip()
+    try:
+        return str(get_secret(name, "") or "").strip()
+    except Exception:
+        return ""
+
+
 def _quote_identifier(name: str) -> str:
     return '"' + str(name).replace('"', '""') + '"'
+
+
+def _is_union_scope(handle: Any) -> bool:
+    """True when `handle` (a db or its connection) reads the multi-profile union views."""
+    if getattr(handle, "union_profiles", None):
+        return True
+    execute = getattr(handle, "execute", None)
+    if not callable(execute) or not isinstance(handle, sqlite3.Connection):
+        return False
+    try:
+        return execute(
+            "SELECT 1 FROM sqlite_temp_master WHERE type='view' AND name='sessions'"
+        ).fetchone() is not None
+    except sqlite3.Error:
+        return False
+
+
+def _same_profile(handle: Any, left: str, right: str) -> str:
+    """Join term that keeps a union-scope join inside one profile.
+
+    SQLite flattens `messages m JOIN sessions s` over two UNION ALL views into
+    one arm per (messages profile x sessions profile) pair — a hundred full
+    scans of messages with ten profiles (Tools took 29 s, 2026-10). Matching
+    __profile turns every cross-profile arm into a constant-false term SQLite
+    skips before scanning. Empty outside the union scope.
+    """
+    if not _is_union_scope(handle):
+        return ""
+    return f" AND {left}.__profile = {right}.__profile"
 
 
 class _UnionDB:
@@ -232,7 +281,7 @@ class _UnionDB:
 # budget and how to change it. Read-only throughout; nothing is cancelled
 # except our own work.
 
-DEFAULT_ROUTE_BUDGET_SECONDS = 30.0
+DEFAULT_ROUTE_BUDGET_SECONDS = 25.0
 
 
 class RouteBudgetExceeded(RuntimeError):

@@ -433,8 +433,8 @@ class SessionLensApiTests(unittest.TestCase):
     def tearDown(self):
         hermes_compat.SessionDB = self.original_session_db
         api._log_file_cache.clear()
-        api._ai_usage_cache = None
-        api._ai_usage_last_success.clear()
+        api._ai_usage_caches.clear()
+        api._ai_usage_last_success_by_home.clear()
         api._ai_models_cache.clear()
         api._session_classification_cache.clear()
         api._session_failure_cache.clear()
@@ -557,6 +557,106 @@ class SessionLensApiTests(unittest.TestCase):
         connection.commit()
         connection.close()
 
+    def test_union_joins_stay_inside_one_profile(self):
+        # SQLite flattens a join of two UNION ALL views into one arm per
+        # profile pair; the __profile term lets it skip the cross pairs.
+        self._make_beta_profile()
+        api._set_profile_scope(["default", "beta"])
+        try:
+            with api._database() as db:
+                connection = api._db_connection(db)
+                self.assertTrue(api._is_union_scope(db))
+                self.assertTrue(api._is_union_scope(connection))
+                self.assertEqual(api._same_profile(connection, "s", "m"), " AND s.__profile = m.__profile")
+        finally:
+            api._set_profile_scope(None)
+        with api._database() as db:
+            self.assertFalse(api._is_union_scope(db))
+            self.assertEqual(api._same_profile(api._db_connection(db), "s", "m"), "")
+        tools = api._scoped_call("all", api._tools_sync, 0)
+        single = api._scoped_call("", api._tools_sync, 0)
+        calls = {row["name"]: row["calls"] for row in tools["tools"]}
+        for row in single["tools"]:
+            self.assertEqual(calls[row["name"]], row["calls"] * 2)
+        source = (MODULE_PATH.parents[1] / "dashboard" / "_routes.py").read_text(encoding="utf-8")
+        for line in source.splitlines():
+            if re.search(r"JOIN sessions s ON s\.id\s*=\s*[mu]\.session_id", line):
+                self.assertIn("_same_profile(", line)
+
+    def test_account_caches_are_keyed_by_the_request_hermes_home(self):
+        # Hermes Desktop serves every local profile from one backend and
+        # scopes each request's Hermes home; a reading cached for one home
+        # must never answer for another.
+        other_home = self.home / "profiles" / "other"
+        other_home.mkdir(parents=True)
+        calls = []
+
+        def collect():
+            calls.append(os.environ["HERMES_HOME"])
+            return api._provider_payload("openrouter", status="ok", windows=[])
+
+        with _provider_collectors({"_collect_openrouter_usage": collect}), \
+                patch.object(api, "_probe_usage_provider", side_effect=lambda provider: provider == "openrouter"):
+            api._ai_usage_sync(True)
+            self.assertTrue(api._ai_usage_sync(False)["cached"])
+            os.environ["HERMES_HOME"] = str(other_home)
+            try:
+                self.assertIsNone(api._ai_usage_cached_payload())
+                self.assertFalse(api._ai_usage_sync(False)["cached"])
+                self.assertEqual(len(api._ai_usage_caches), 2)
+            finally:
+                os.environ["HERMES_HOME"] = str(self.home)
+            self.assertTrue(api._ai_usage_sync(False)["cached"])
+        self.assertEqual(calls, [str(self.home), str(other_home)])
+
+        services._services_caches.clear()
+        now = time.time()
+        services._services_caches[services._account_home_key()] = (now, {"cards": [], "inventory": []})
+        self.assertIsNotNone(services._services_cached_payload())
+        os.environ["HERMES_HOME"] = str(other_home)
+        try:
+            self.assertIsNone(services._services_cached_payload())
+        finally:
+            os.environ["HERMES_HOME"] = str(self.home)
+
+    def test_nous_card_names_a_rejected_login_instead_of_no_login(self):
+        from dashboard._providers import nous as nous_mod
+
+        account = SimpleNamespace(logged_in=False)
+        nous_account = SimpleNamespace(get_nous_portal_account_info=lambda force_fresh=False: account)
+        broken = {"last_auth_error": {"provider": "nous", "message": "Invalid refresh token"}}
+        auth = SimpleNamespace(get_provider_auth_state=lambda provider: broken if provider == "nous" else {})
+        modules = {
+            "hermes_cli": SimpleNamespace(nous_account=nous_account, auth=auth),
+            "hermes_cli.nous_account": nous_account,
+            "hermes_cli.auth": auth,
+            "agent": SimpleNamespace(),
+            "agent.account_usage": SimpleNamespace(build_nous_credits_snapshot=lambda account: None),
+        }
+        with patch.dict(sys.modules, modules):
+            self.assertTrue(nous_mod._probe_nous())
+            card = nous_mod._collect_nous_usage()
+            self.assertEqual(card["status"], "expired")
+            self.assertIn("Invalid refresh token", card["message"])
+            broken.clear()
+            self.assertFalse(nous_mod._probe_nous())
+            self.assertEqual(nous_mod._collect_nous_usage()["status"], "not_configured")
+
+    def test_collector_threads_inherit_the_request_context(self):
+        import contextvars
+        from concurrent.futures import ThreadPoolExecutor
+
+        marker = contextvars.ContextVar("session_lens_test_marker", default="unset")
+        marker.set("request-profile")
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            plain = pool.submit(marker.get).result()
+            carried = api._submit_in_context(pool, marker.get).result()
+        self.assertEqual(plain, "unset")
+        self.assertEqual(carried, "request-profile")
+        for module in ("_routes.py", "_services/__init__.py"):
+            source = (MODULE_PATH.parents[1] / "dashboard" / module).read_text(encoding="utf-8")
+            self.assertNotIn("pool.submit(", source, module)
+
     def test_profile_scope_union_matches_columns_by_name_not_position(self):
         beta_db = self._make_beta_profile()
         self._relayout_beta_tables(beta_db)
@@ -646,7 +746,7 @@ class SessionLensApiTests(unittest.TestCase):
         # The budget travels with the request thread only: a fresh call runs normally.
         with patch.object(api, "_plugin_settings", return_value={"route_budget_seconds": 30}):
             self.assertEqual(api._scoped_call("all", lambda: {"ok": True}), {"ok": True})
-        self.assertEqual(api._route_budget_seconds({"route_budget_seconds": "abc"}), 30.0)
+        self.assertEqual(api._route_budget_seconds({"route_budget_seconds": "abc"}), 25.0)
         self.assertEqual(api._route_budget_seconds({"route_budget_seconds": -5}), 0.0)
 
     def test_route_budget_is_documented_and_visible(self):
@@ -657,7 +757,7 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertIn("route_budget_seconds", (repo / "plugin.yaml").read_text(encoding="utf-8"))
         self.assertIn("`route_budget_seconds`", (repo / "README.md").read_text(encoding="utf-8"))
         payload = api._system_sync()
-        self.assertEqual(payload["privacy"]["route_budget_seconds"], 30.0)
+        self.assertEqual(payload["privacy"]["route_budget_seconds"], 25.0)
 
     def test_hidden_sessions_count_and_are_labelled(self):
         connection = sqlite3.connect(self.db_path)
@@ -834,7 +934,7 @@ class SessionLensApiTests(unittest.TestCase):
 
             # And the cache itself never carries any scope's records.
             self.assertNotIn("recorded_local", next(
-                card for card in api._ai_usage_cache[1]["providers"] if card["provider"] == "openrouter"
+                card for card in api._ai_usage_cache_entry()[1]["providers"] if card["provider"] == "openrouter"
             ))
 
         budgets_all = api._scoped_call("all", api._budgets_sync, {})
@@ -2001,7 +2101,7 @@ process.stdout.write(JSON.stringify(out))
             self.assertEqual(payload["summary"]["forecasts"], 1)
             self.assertEqual(payload["summary"]["needs_attention"], 1)
             # The cache never holds a forecast; a cached response gets a fresh one.
-            cached_card = next(card for card in api._ai_usage_cache[1]["providers"] if card["provider"] == "codex")
+            cached_card = next(card for card in api._ai_usage_cache_entry()[1]["providers"] if card["provider"] == "codex")
             self.assertNotIn("forecast", cached_card["windows"][0])
             again = api._ai_usage_sync(False)
             self.assertTrue(again["cached"])
@@ -2950,7 +3050,7 @@ process.stdout.write(JSON.stringify(out))
         self.assertEqual(refreshed["summary"]["needs_attention"], 1)
 
     def test_ai_usage_expired_login_does_not_reuse_stale_reading(self):
-        api._ai_usage_last_success["grok"] = api._provider_payload(
+        api._ai_usage_last_success()["grok"] = api._provider_payload(
             "grok",
             status="ok",
             windows=[api._usage_window("Weekly", used_percent=25)],
@@ -2972,7 +3072,7 @@ process.stdout.write(JSON.stringify(out))
         grok = next(item for item in payload["providers"] if item["provider"] == "grok")
         self.assertEqual(grok["status"], "expired")
         self.assertFalse(grok["stale"])
-        self.assertNotIn("grok", api._ai_usage_last_success)
+        self.assertNotIn("grok", api._ai_usage_last_success())
 
     def test_ai_usage_provider_failure_isolated_from_other_collectors(self):
         def explode():
@@ -3053,7 +3153,7 @@ process.stdout.write(JSON.stringify(out))
         }
         with _provider_collectors(first):
             api._ai_usage_sync(True)
-        cached_at = api._ai_usage_cache[0]
+        cached_at = api._ai_usage_cache_entry()[0]
 
         second = {
             f"_collect_{provider}_usage": Mock(return_value=ok(provider, 60))
@@ -3070,7 +3170,7 @@ process.stdout.write(JSON.stringify(out))
         self.assertEqual(by_provider["codex"]["windows"][0]["percentage_used"], 25.0)
         self.assertFalse(payload["cached"])
         # Refreshing one card must not extend the whole payload's lifetime.
-        self.assertEqual(api._ai_usage_cache[0], cached_at)
+        self.assertEqual(api._ai_usage_cache_entry()[0], cached_at)
 
     def test_ai_usage_attaches_local_seven_day_usage_per_provider(self):
         connection = sqlite3.connect(self.db_path)
@@ -3150,7 +3250,7 @@ process.stdout.write(JSON.stringify(out))
         self.assertIn("No monitorable AI providers are connected", source)
 
     def test_attention_quota_notes_come_from_cached_usage_only(self):
-        api._ai_usage_cache = None
+        api._ai_usage_caches.clear()
         self.assertEqual(api._attention_sync(0)["quotas"], [])
 
         now = time.time()
@@ -3170,7 +3270,7 @@ process.stdout.write(JSON.stringify(out))
             ],
             "generated_at": now,
         }
-        api._ai_usage_cache = (now, payload)
+        api._ai_usage_cache_store((now, payload))
         quotas = api._attention_sync(0)["quotas"]
         self.assertEqual([note["provider"] for note in quotas], ["codex", "kimi"])
         self.assertEqual(quotas[0]["severity"], "danger")
@@ -3180,7 +3280,7 @@ process.stdout.write(JSON.stringify(out))
         self.assertTrue(quotas[0]["id"].startswith("quota:codex:"))
 
         # An aged-out cache stops producing notes rather than lying quietly.
-        api._ai_usage_cache = (now - api.QUOTA_ATTENTION_MAX_CACHE_AGE_SECONDS - 1, payload)
+        api._ai_usage_cache_store((now - api.QUOTA_ATTENTION_MAX_CACHE_AGE_SECONDS - 1, payload))
         self.assertEqual(api._attention_sync(0)["quotas"], [])
 
     def test_quota_alert_strip_ui_shows_on_other_tabs_and_dismisses_per_window(self):
@@ -3250,11 +3350,11 @@ process.stdout.write(JSON.stringify(out))
         self.assertEqual(payload["coverage"]["log_start_at"], 1_799_999_940.0)
         self.assertEqual(payload["coverage"]["log_end_at"], 1_800_000_060.0)
 
-        for index in range(11):
+        for index in range(api.MAX_LOG_CACHE_FILES + 1):
             rotated = self.home / "logs" / f"rotated-{index}.log"
-            rotated.write_text(f"2027-01-15 09:00:{index:02d},000 INFO line\n", encoding="utf-8")
+            rotated.write_text(f"2027-01-15 09:00:{index % 60:02d},000 INFO line\n", encoding="utf-8")
             api._parse_log_file(rotated)
-        self.assertEqual(len(api._log_file_cache), 10)
+        self.assertEqual(len(api._log_file_cache), api.MAX_LOG_CACHE_FILES)
         self.assertNotIn(str(self.home / "logs" / "rotated-0.log"), api._log_file_cache)
 
     def test_tools_scan_enforces_real_assistant_row_cap(self):
@@ -4219,7 +4319,7 @@ process.stdout.write(JSON.stringify(out))
             ],
             "generated_at": now,
         }
-        api._ai_usage_cache = (now, cached)
+        api._ai_usage_cache_store((now, cached))
         with patch.object(api.time, "time", return_value=now):
             payload = api._budgets_sync({"openrouter": 250})
         openrouter = next(item for item in payload["entries"] if item["id"] == "openrouter")
@@ -4370,8 +4470,8 @@ process.stdout.write(JSON.stringify(out))
 
     def test_services_sync_flattens_accounts_and_keeps_unreadable_rows(self):
         self._write_services_home()
-        services._services_cache = None
-        services._services_last_success.clear()
+        services._services_caches.clear()
+        services._services_last_success_by_home.clear()
         primary = services._service_payload("firecrawl", status="ok", windows=[services._usage_window("Credits", kind="balance", remaining=5, unit="credits")])
         primary["extra_accounts"] = [services._service_payload("firecrawl", status="expired", message="rejected", account="n8n")]
         collectors = {
@@ -4398,18 +4498,18 @@ process.stdout.write(JSON.stringify(out))
         self.assertTrue(again["cached"])
         collectors["monid"].assert_not_called()
         self.assertIsNotNone(services._services_cached_payload())
-        services._services_cache = None
+        services._services_caches.clear()
 
     def test_budgets_pick_up_service_account_spend(self):
         now = 1_800_000_000
-        services._services_cache = (now, {"cards": [{"provider": "monid", "status": "ok", "fetched_at": now,
+        services._services_caches[services._account_home_key()] = (now, {"cards": [{"provider": "monid", "status": "ok", "fetched_at": now,
                                                      "account_spend": {"daily": 0.5, "weekly": 2.5, "monthly": 2.5, "unit": "USD"}}],
                                           "inventory": [], "generated_at": now})
         try:
             with patch.object(api.time, "time", return_value=now):
                 payload = api._budgets_sync({"monid": 20})
         finally:
-            services._services_cache = None
+            services._services_caches.clear()
         monid = next(item for item in payload["entries"] if item["id"] == "monid")
         self.assertEqual((monid["label"], monid["spend_source"], monid["spend_usd"]), ("Monid", "account", 2.5))
         self.assertEqual(monid["status"], "ok")

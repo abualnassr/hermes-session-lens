@@ -16,6 +16,7 @@ import threading
 import time
 from collections import Counter, OrderedDict, defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+import contextvars
 from contextlib import contextmanager
 from difflib import SequenceMatcher
 from pathlib import Path
@@ -63,7 +64,7 @@ def _plugin_version() -> str:
             return match.group(1)
     except OSError:
         pass
-    return "0.43.0"
+    return "0.44.0"
 
 
 PLUGIN_VERSION = _plugin_version()
@@ -75,6 +76,9 @@ MAX_TRACE_PAGE = 200
 MAX_TRACE_CONTENT_CHARS = 6000
 MAX_LOG_FILES = 5
 MAX_LOG_FILE_BYTES = 6 * 1024 * 1024
+# Parsed-log cache entries: MAX_LOG_FILES per profile home, so an all-profiles
+# scope (ten homes and more) stays cached instead of reparsing every request.
+MAX_LOG_CACHE_FILES = 64
 AI_USAGE_CACHE_TTL_SECONDS = 300
 AI_MODELS_CACHE_TTL_SECONDS = 60
 AI_USAGE_PROVIDER_TIMEOUT_SECONDS = 12
@@ -312,9 +316,15 @@ _WORKER_COMMAND_RE = re.compile(
 )
 
 _log_file_cache: OrderedDict[str, Tuple[Tuple[int, int], Dict[str, Any]]] = OrderedDict()
+_log_hour_epochs: Dict[str, float] = {}
 _ai_usage_cache_lock = threading.Lock()
-_ai_usage_cache: Optional[Tuple[float, Dict[str, Any]]] = None
-_ai_usage_last_success: Dict[str, Dict[str, Any]] = {}
+# Account readings belong to the profile whose credentials produced them.
+# Hermes Desktop serves every local profile from ONE backend and scopes
+# each request with ?profile= (2026-09), so these caches are keyed by the
+# request's Hermes home — one module-level slot would show one profile's
+# quotas under another.
+_ai_usage_caches: Dict[str, Tuple[float, Dict[str, Any]]] = {}
+_ai_usage_last_success_by_home: Dict[str, Dict[str, Dict[str, Any]]] = {}
 _ai_models_cache_lock = threading.Lock()
 _ai_models_cache: Dict[Tuple[Any, ...], Tuple[float, Dict[str, Any]]] = {}
 _session_classification_cache_lock = threading.Lock()
@@ -892,5 +902,43 @@ def _confirmed_failure_counts(
     for row in _confirmed_failure_rows(connection, session_where_sql, params):
         counts[str(row.get("session_id") or "")] += 1
     return dict(counts)
+
+def _account_home_key() -> str:
+    """The Hermes home a credential-backed reading belongs to (cache key)."""
+    try:
+        return os.path.normcase(os.path.abspath(str(_hermes_home())))
+    except Exception:
+        return ""
+
+
+def _ai_usage_cache_entry() -> Optional[Tuple[float, Dict[str, Any]]]:
+    """This home's cached /ai-usage payload; call with _ai_usage_cache_lock held."""
+    return _ai_usage_caches.get(_account_home_key())
+
+
+def _ai_usage_cache_store(entry: Optional[Tuple[float, Dict[str, Any]]]) -> None:
+    """Replace (or with None drop) this home's cached payload; lock held."""
+    key = _account_home_key()
+    if entry is None:
+        _ai_usage_caches.pop(key, None)
+    else:
+        _ai_usage_caches[key] = entry
+
+
+def _ai_usage_last_success() -> Dict[str, Dict[str, Any]]:
+    """This home's last good provider readings, by provider id."""
+    return _ai_usage_last_success_by_home.setdefault(_account_home_key(), {})
+
+
+def _submit_in_context(pool: ThreadPoolExecutor, fn: Any, *args: Any) -> Any:
+    """pool.submit that carries the caller's context into the worker.
+
+    Hermes scopes a plugin request to a profile through context variables
+    (Hermes home, secret scope); plain executor threads start without them
+    and would read the launch profile's credentials. One copy per task —
+    a Context cannot be entered by two threads at once.
+    """
+    return pool.submit(contextvars.copy_context().run, fn, *args)
+
 
 __all__ = [name for name in globals() if not name.startswith("__")]

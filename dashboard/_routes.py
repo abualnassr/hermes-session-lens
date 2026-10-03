@@ -998,7 +998,7 @@ def _digest_period_totals(
     joined_sql, joined_params = _period_sql("s.started_at", period_start, period_end)
     tool_calls = connection.execute(
         f"""
-        SELECT COUNT(*) FROM messages m JOIN sessions s ON s.id=m.session_id
+        SELECT COUNT(*) FROM messages m JOIN sessions s ON s.id=m.session_id{_same_profile(connection, "s", "m")}
         WHERE {joined_sql}
           AND coalesce(m.active,1)=1 AND m.role='tool'
         """,
@@ -1288,7 +1288,7 @@ def _digest_sync(
             for model_row in connection.execute(
                 f"""
                 SELECT u.model, coalesce(SUM(u.api_call_count),0) AS requests
-                FROM session_model_usage u JOIN sessions s ON s.id=u.session_id
+                FROM session_model_usage u JOIN sessions s ON s.id=u.session_id{_same_profile(connection, "s", "u")}
                 WHERE {prev_sql}
                 GROUP BY u.model
                 """,
@@ -1944,8 +1944,9 @@ def _ai_usage_cached_payload(max_age_seconds: float = QUOTA_ATTENTION_MAX_CACHE_
     pages. No cache (or one too old) simply means no quota notes.
     """
     with _ai_usage_cache_lock:
-        if _ai_usage_cache and time.time() - _ai_usage_cache[0] < max_age_seconds:
-            return copy.deepcopy(_ai_usage_cache[1])
+        entry = _ai_usage_cache_entry()
+        if entry and time.time() - entry[0] < max_age_seconds:
+            return copy.deepcopy(entry[1])
     return None
 
 
@@ -2247,7 +2248,7 @@ def _overview_sync(
                        SUM(CASE WHEN u.actual_cost_usd > 0 THEN u.actual_cost_usd ELSE u.estimated_cost_usd END) AS cost_usd,
                        SUM(CASE WHEN lower(coalesce(u.cost_status,'')) IN ('included','subscription','free') THEN 1 ELSE 0 END) AS included_rows
                 FROM session_model_usage u
-                JOIN sessions s ON s.id = u.session_id
+                JOIN sessions s ON s.id = u.session_id{_same_profile(db, "s", "u")}
                 WHERE {joined_period_sql}
                 GROUP BY u.model, u.billing_provider
                 ORDER BY total_tokens DESC LIMIT 30
@@ -2636,7 +2637,7 @@ def _ai_models_payload_sync(
                            u.reasoning_tokens, u.estimated_cost_usd, u.actual_cost_usd,
                            u.cost_status, u.cost_source, u.first_seen, u.last_seen
                     FROM session_model_usage u
-                    JOIN sessions s ON s.id=u.session_id
+                    JOIN sessions s ON s.id=u.session_id{_same_profile(connection, "s", "u")}
                     WHERE {period_sql}
                     """,
                     tuple(period_params),
@@ -2650,7 +2651,7 @@ def _ai_models_payload_sync(
                            {base_url_expr} AS billing_base_url, u.billing_mode,
                            MAX(coalesce(u.last_seen, s.last_activity_at, s.started_at)) AS last_seen
                     FROM session_model_usage u
-                    JOIN sessions s ON s.id=u.session_id
+                    JOIN sessions s ON s.id=u.session_id{_same_profile(connection, "s", "u")}
                     GROUP BY u.model, u.billing_provider, {base_url_expr}, u.billing_mode
                     """
                 ).fetchall()
@@ -2739,7 +2740,7 @@ def _ai_models_payload_sync(
                     f"""
                     SELECT m.session_id, m.timestamp
                     FROM messages m
-                    JOIN sessions s ON s.id=m.session_id
+                    JOIN sessions s ON s.id=m.session_id{_same_profile(connection, "s", "m")}
                     WHERE {period_sql}
                       AND coalesce(m.active,1)=1 AND m.role='tool'
                     """,
@@ -3473,7 +3474,7 @@ def _ai_models_database_revision() -> Tuple[Any, ...]:
         except OSError:
             return (0, 0)
 
-    parts: List[Any] = [_number(last_activity, 0)]
+    parts: List[Any] = [_number(last_activity, 0), _account_home_key()]
     scope = _get_profile_scope()
     parts.extend(scope or ())
     for home in _scope_homes():
@@ -3614,7 +3615,7 @@ def _context_weight_by_tool(
     assistant_rows = connection.execute(
         f"""
         SELECT m.session_id, m.id
-        FROM messages m JOIN sessions s ON s.id=m.session_id
+        FROM messages m JOIN sessions s ON s.id=m.session_id{_same_profile(connection, "s", "m")}
         WHERE {period_sql} AND m.role='assistant'
         ORDER BY m.id DESC LIMIT {_CONTEXT_SCAN_ROW_CAP + 1}
         """,
@@ -3624,7 +3625,7 @@ def _context_weight_by_tool(
         f"""
         SELECT m.session_id, m.id, m.tool_name, length(m.content) AS chars,
                s.model, s.billing_provider, s.billing_base_url, s.billing_mode, s.cost_status
-        FROM messages m JOIN sessions s ON s.id=m.session_id
+        FROM messages m JOIN sessions s ON s.id=m.session_id{_same_profile(connection, "s", "m")}
         WHERE {period_sql} AND m.role='tool'
           AND m.tool_name IS NOT NULL AND m.content IS NOT NULL
         ORDER BY m.id DESC LIMIT {_CONTEXT_SCAN_ROW_CAP + 1}
@@ -3739,7 +3740,7 @@ def _tools_sync(
             f"""
             SELECT m.session_id, m.tool_calls, m.timestamp
             FROM messages m
-            JOIN sessions s ON s.id=m.session_id
+            JOIN sessions s ON s.id=m.session_id{_same_profile(db, "s", "m")}
             WHERE {period_sql}
               AND coalesce(m.active,1)=1 AND m.role='assistant'
               AND m.tool_calls IS NOT NULL
@@ -3775,7 +3776,7 @@ def _tools_sync(
                    COUNT(DISTINCT m.session_id) AS sessions,
                    MAX(m.timestamp) AS last_used_at
             FROM messages m
-            JOIN sessions s ON s.id=m.session_id
+            JOIN sessions s ON s.id=m.session_id{_same_profile(db, "s", "m")}
             WHERE {period_sql}
               AND coalesce(m.active,1)=1 AND m.role='tool'
               AND m.tool_name IS NOT NULL
@@ -3968,7 +3969,7 @@ def _skills_sync(
             f"""
             SELECT m.session_id, m.tool_calls, m.timestamp
             FROM messages m
-            JOIN sessions s ON s.id=m.session_id
+            JOIN sessions s ON s.id=m.session_id{_same_profile(db, "s", "m")}
             WHERE {period_sql}
               AND m.role='assistant' AND m.tool_calls IS NOT NULL
               AND (instr(m.tool_calls,'skill_view') > 0 OR instr(m.tool_calls,'skill_manage') > 0)
@@ -4289,12 +4290,12 @@ def _ai_usage_sync(
     start_at: Optional[float] = None,
     end_at: Optional[float] = None,
 ) -> Dict[str, Any]:
-    global _ai_usage_cache
     now = time.time()
     period = (days, start_at, end_at)
     with _ai_usage_cache_lock:
-        if not fresh and _ai_usage_cache and now - _ai_usage_cache[0] < AI_USAGE_CACHE_TTL_SECONDS:
-            cached = copy.deepcopy(_ai_usage_cache[1])
+        entry = _ai_usage_cache_entry()
+        if not fresh and entry and now - entry[0] < AI_USAGE_CACHE_TTL_SECONDS:
+            cached = copy.deepcopy(entry[1])
             cached["cached"] = True
             return _finish_usage_payload(cached, period)
 
@@ -4324,7 +4325,7 @@ def _ai_usage_sync(
         _set_collect_fresh(fresh)
         try:
             with ThreadPoolExecutor(max_workers=len(active), thread_name_prefix="session-lens-usage") as pool:
-                futures = {pool.submit(collector): provider for provider, collector in active.items()}
+                futures = {_submit_in_context(pool, collector): provider for provider, collector in active.items()}
                 for future in as_completed(futures):
                     provider = futures[future]
                     try:
@@ -4371,7 +4372,7 @@ def _ai_usage_sync(
                 "external_hosts": sorted({host for adapter in _provider_adapters().values() for host in adapter.hosts}),
             },
         }
-        _ai_usage_cache = (time.time(), copy.deepcopy(payload))
+        _ai_usage_cache_store((time.time(), copy.deepcopy(payload)))
         return _finish_usage_payload(payload, period)
 
 
@@ -4455,14 +4456,15 @@ def _fold_usage_last_success(provider: str, result: Dict[str, Any]) -> Dict[str,
     definitive credential failure (expired/forbidden/not configured) clears
     the memory so dead credentials never show comforting numbers.
     """
+    last_success = _ai_usage_last_success()
     if result.get("status") == "ok":
-        _ai_usage_last_success[provider] = copy.deepcopy(result)
+        last_success[provider] = copy.deepcopy(result)
     elif result.get("status") in {"not_configured", "expired", "forbidden"}:
-        _ai_usage_last_success.pop(provider, None)
-    elif result.get("status") == "unavailable" and provider in _ai_usage_last_success:
+        last_success.pop(provider, None)
+    elif result.get("status") == "unavailable" and provider in last_success:
         current_status = result.get("status")
         current_message = result.get("message")
-        result = copy.deepcopy(_ai_usage_last_success[provider])
+        result = copy.deepcopy(last_success[provider])
         result.update(
             {
                 "status": "stale",
@@ -4616,7 +4618,7 @@ def _usage_attribution_rows(provider: str, since: float) -> List[Dict[str, Any]]
                    MAX(COALESCE(u.last_seen, u.first_seen, s.last_activity_at, s.started_at, 0)) AS seen_at,
                    SUM(u.input_tokens + u.output_tokens + u.cache_read_tokens + u.cache_write_tokens) AS tokens,
                    SUM(CASE WHEN u.actual_cost_usd > 0 THEN u.actual_cost_usd ELSE u.estimated_cost_usd END) AS cost_usd
-            FROM session_model_usage u JOIN sessions s ON s.id = u.session_id
+            FROM session_model_usage u JOIN sessions s ON s.id = u.session_id{_same_profile(db, "s", "u")}
             WHERE LOWER(u.billing_provider) IN ({placeholders})
               AND COALESCE(u.last_seen, u.first_seen, s.last_activity_at, s.started_at, 0) >= ?
             GROUP BY u.session_id, u.model
@@ -5150,11 +5152,11 @@ def _ai_usage_refresh_provider(provider: str, collector: Any) -> Optional[Dict[s
     The cache timestamp is deliberately left untouched — refreshing one card
     must not extend the whole payload's lifetime.
     """
-    global _ai_usage_cache
     with _ai_usage_cache_lock:
-        if not _ai_usage_cache:
+        entry = _ai_usage_cache_entry()
+        if not entry:
             return None
-        cached_at, base = _ai_usage_cache
+        cached_at, base = entry
         base = copy.deepcopy(base)
     if _probe_usage_provider(provider):
         _set_collect_fresh(True)
@@ -5190,7 +5192,7 @@ def _ai_usage_refresh_provider(provider: str, collector: Any) -> Optional[Dict[s
             "generated_at": time.time(),
             "cached": False,
         }
-        _ai_usage_cache = (cached_at, copy.deepcopy(payload))
+        _ai_usage_cache_store((cached_at, copy.deepcopy(payload)))
         return payload
 
 

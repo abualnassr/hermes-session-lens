@@ -8,10 +8,28 @@ except ImportError:  # pragma: no cover
     from _common import *
 
 def _timestamp_from_log(value: str) -> float:
+    # "YYYY-MM-DD HH:MM:SS,mmm" in local time. strptime per line dominated
+    # wide scopes (800k lines), so the local-time conversion is done once per
+    # hour and minutes, seconds and milliseconds are added as integers.
+    if len(value) != 23:
+        return 0.0
+    hour = value[:13]
+    base = _log_hour_epochs.get(hour)
+    if base is None:
+        try:
+            base = dt.datetime.strptime(hour, "%Y-%m-%d %H").astimezone().timestamp()
+        except ValueError:
+            return 0.0
+        if len(_log_hour_epochs) > 50_000:
+            _log_hour_epochs.clear()
+        _log_hour_epochs[hour] = base
     try:
-        return dt.datetime.strptime(value, "%Y-%m-%d %H:%M:%S,%f").astimezone().timestamp()
+        minutes, seconds, millis = int(value[14:16]), int(value[17:19]), int(value[20:23])
     except ValueError:
         return 0.0
+    if minutes > 59 or seconds > 59:
+        return 0.0
+    return base + minutes * 60 + seconds + millis / 1000
 
 
 def _api_failure_category(detail: Any) -> str:
@@ -114,7 +132,7 @@ def _parse_log_file(path: Path) -> Dict[str, Any]:
     parsed = {"api": api_events, "errors": api_errors, "tools": tool_events, "timestamps": timestamps}
     _log_file_cache[key] = (signature, parsed)
     _log_file_cache.move_to_end(key)
-    while len(_log_file_cache) > 10:
+    while len(_log_file_cache) > MAX_LOG_CACHE_FILES:
         _log_file_cache.popitem(last=False)
     return parsed
 

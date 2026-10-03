@@ -35,10 +35,10 @@ const color = {
   accentSoft: 'color-mix(in srgb, var(--ui-accent) 14%, transparent)',
   success: 'var(--ui-success)',
   successSoft: 'color-mix(in srgb, var(--ui-success) 12%, transparent)',
-  warning: 'var(--ui-warning)',
-  warningSoft: 'color-mix(in srgb, var(--ui-warning) 12%, transparent)',
-  danger: 'var(--destructive)',
-  dangerSoft: 'color-mix(in srgb, var(--destructive) 12%, transparent)',
+  warning: 'var(--ui-yellow, #c08532)',
+  warningSoft: 'color-mix(in srgb, var(--ui-yellow, #c08532) 12%, transparent)',
+  danger: 'var(--dt-destructive, var(--ui-red, #cf2d56))',
+  dangerSoft: 'color-mix(in srgb, var(--dt-destructive, var(--ui-red, #cf2d56)) 12%, transparent)',
   primary: 'var(--ui-text-primary)',
   secondary: 'var(--ui-text-secondary)',
   tertiary: 'var(--ui-text-tertiary)',
@@ -103,8 +103,14 @@ function apiPath(path, params = {}) {
 // crash deep inside a view; a thrown error instead lands in ErrorBlock with
 // its Retry button. The path is trimmed to its route so the message never
 // carries query parameters.
+// Hermes' bridge gives up on a plugin request after 30 s by default — the
+// same moment the backend's route budget used to answer with its own
+// sentence, so the user saw a bare "Timed out connecting". Wait longer than
+// any budget the backend applies; it always answers first.
+const PLUGIN_REST_TIMEOUT_MS = 90_000
+
 async function pluginRest(ctx, path, options) {
-  const result = options === undefined ? await ctx.rest(path) : await ctx.rest(path, options)
+  const result = await ctx.rest(path, { timeoutMs: PLUGIN_REST_TIMEOUT_MS, ...(options || {}) })
   if (result === undefined || result === null) {
     throw new Error(`Hermes returned no data for ${String(path).split('?')[0]} — the backend may be busy or restarting`)
   }
@@ -328,7 +334,9 @@ function LoadingBlock({ rows = 4 }) {
 // sentence rather than the envelope, and skip the first-install hint.
 function describeError(error) {
   const raw = error?.message || String(error || 'The backend did not return data.')
-  const envelope = raw.match(/^(\d{3}):\s*(\{[\s\S]*\})\s*$/)
+  // Hermes' bridge reports "<status>: <json body>", sometimes behind
+  // Electron's "Error invoking remote method 'hermes:api': Error: " prefix.
+  const envelope = raw.match(/(?:^|\s)(\d{3}):\s*(\{[\s\S]*\})\s*$/)
   if (envelope) {
     try {
       const detail = JSON.parse(envelope[2])?.detail
@@ -346,8 +354,8 @@ function ErrorBlock({ error, onRetry, title = 'Session Lens could not load this 
     return jsx('div', {
       style: { display: 'grid', minHeight: '15rem', placeItems: 'center', padding: '2rem' },
       children: jsxs(EmptyState, {
-        title: 'Session Lens is not installed in the active profile',
-        description: 'Hermes plugins are per-profile, and this profile’s gateway does not serve session-lens. To use it here, run “hermes plugins install abualnassr/hermes-session-lens --enable” while this profile is active, then restart the gateway. Your other profiles are unaffected.',
+        title: 'Hermes is not serving Session Lens',
+        description: 'The Hermes backend answered “Plugin not found” for session-lens: it is not enabled in the Hermes configuration that backend started with. Turn it on in Capabilities → Plugins (or run “hermes plugins enable session-lens”; install it first with “hermes plugins install abualnassr/hermes-session-lens” if it is missing), then restart Hermes. Hermes Desktop serves every local profile from one backend, so enabling it once covers them all.',
         children: [
           jsx(Button, { variant: 'outline', size: 'sm', onClick: onRetry, children: 'Check again' })
         ]

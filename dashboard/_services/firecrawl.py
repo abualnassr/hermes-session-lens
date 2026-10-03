@@ -53,7 +53,7 @@ def _firecrawl_payload(body: Any, account: Optional[str] = None) -> Dict[str, An
 
 
 def _collect_firecrawl() -> Dict[str, Any]:
-    base = str(os.environ.get("FIRECRAWL_API_URL") or "https://api.firecrawl.dev").strip().rstrip("/")
+    base = (_scoped_secret("FIRECRAWL_API_URL") or "https://api.firecrawl.dev").rstrip("/")
     host = (urlparse(base).hostname or "").lower()
     if host and host != _FIRECRAWL_CLOUD_HOST:
         return _service_payload(
