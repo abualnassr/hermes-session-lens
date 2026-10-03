@@ -13,6 +13,7 @@ try:
     from ._providers import *
     from ._services import *
     from ._rules import *
+    from ._watch import *
 except ImportError:  # pragma: no cover - direct Hermes file loading
     from _common import *
     from _logparse import *
@@ -22,6 +23,7 @@ except ImportError:  # pragma: no cover - direct Hermes file loading
     from _providers import *
     from _services import *
     from _rules import *
+    from _watch import *
 
 router = APIRouter()
 
@@ -2001,6 +2003,7 @@ def _attention_sync(
     end_at: Optional[float] = None,
     budgets: str = "",
     balances: str = "",
+    watch: str = "",
 ) -> Dict[str, Any]:
     """Flag sessions that look like runaway or orphaned work.
 
@@ -2105,6 +2108,7 @@ def _attention_sync(
         "sessions": flagged[:_ATTENTION_MAX_SESSIONS],
         "quotas": _quota_attention_notes(),
         "budgets": _budget_attention_notes(budgets, balances),
+        "runaway": _watch_attention_notes(_parse_watch_param(watch)),
         "totals": {
             "flagged": len(flagged),
             "open_sessions": open_flagged,
@@ -2128,10 +2132,17 @@ async def attention(
     profiles: str = Query(""),
     budgets: str = Query(""),
     balances: str = Query("", max_length=8000),
+    watch: str = Query("", max_length=200),
 ) -> Dict[str, Any]:
     return await asyncio.to_thread(
-        _scoped_call, profiles, _attention_sync, days, start_at, end_at, budgets=budgets, balances=balances
+        _scoped_call, profiles, _attention_sync, days, start_at, end_at, budgets=budgets, balances=balances, watch=watch
     )
+
+
+@router.get("/watch")
+async def watch_route(profiles: str = Query(""), watch: str = Query("", max_length=200)) -> Dict[str, Any]:
+    """Sessions calling a model in the last hour, with their burn, flagged past the alert rates."""
+    return await asyncio.to_thread(_scoped_call, profiles, _watch_sync, _parse_watch_param(watch))
 
 
 @router.get("/telemetry")
@@ -4392,7 +4403,9 @@ def _ai_usage_sync(
                     provider = futures[future]
                     try:
                         result = future.result()
-                    except Exception as error:
+                    except (Exception, SystemExit) as error:
+                        # A library that exits inside a collector (Hermes' bootstrap
+                        # relaunch raises SystemExit) costs one card, never the view.
                         result = _provider_payload(provider, status="unavailable", message=_provider_message(error))
                     results[provider] = result
         finally:
@@ -5224,7 +5237,7 @@ def _ai_usage_refresh_provider(provider: str, collector: Any) -> Optional[Dict[s
         _set_collect_fresh(True)
         try:
             result = collector()
-        except Exception as error:
+        except (Exception, SystemExit) as error:
             result = _provider_payload(provider, status="unavailable", message=_provider_message(error))
         finally:
             _set_collect_fresh(False)

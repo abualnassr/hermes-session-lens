@@ -9,7 +9,7 @@ import threading
 import time
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple
+from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
 
 try:
     from hermes_constants import get_hermes_home
@@ -135,8 +135,10 @@ def _is_union_scope(handle: Any) -> bool:
     if not callable(execute) or not isinstance(handle, sqlite3.Connection):
         return False
     try:
+        # Only the union scope shadows `messages`; every connection now gets
+        # a `sessions` view for subscription accounting.
         return execute(
-            "SELECT 1 FROM sqlite_temp_master WHERE type='view' AND name='sessions'"
+            "SELECT 1 FROM sqlite_temp_master WHERE type='view' AND name='messages'"
         ).fetchone() is not None
     except sqlite3.Error:
         return False
@@ -154,6 +156,81 @@ def _same_profile(handle: Any, left: str, right: str) -> str:
     if not _is_union_scope(handle):
         return ""
     return f" AND {left}.__profile = {right}.__profile"
+
+
+# ── Subscription accounting ─────────────────────────────────────────────
+# A model-provider plugin can drive a flat-rate subscription through a local
+# CLI — Hermes' claude-subscription-directsdk drives a Claude Pro/Max plan
+# through Claude Code. Hermes records the API list-price equivalent of that
+# usage as an estimated cost ("native API list-price equivalent; not
+# subscription invoice"), and summed as dollars it made one 51-hour Opus
+# session 58% of a month's "spend" that was never billed (2026-10). Rows on
+# such a route are presented as included: cash cost 0, cost_status
+# 'included', and the list-price figure kept as list_price_usd. The rewrite
+# lives in the TEMP views every connection reads through, so every reader —
+# overview, sessions, budgets, attribution, AI Models — agrees.
+
+SUBSCRIPTION_ROUTE_PATTERNS = ("%subscription%",)
+_COST_TABLES = ("sessions", "session_model_usage")
+
+
+def _subscription_route_sql(present: Iterable[str]) -> str:
+    """SQL predicate: this row's billing route is a flat-rate subscription."""
+    columns = set(present)
+    terms = []
+    for column in ("billing_provider", "billing_base_url"):
+        if column in columns:
+            for pattern in SUBSCRIPTION_ROUTE_PATTERNS:
+                literal = pattern.replace("'", "''")
+                terms.append(f"lower(coalesce({_quote_identifier(column)},'')) LIKE '{literal}'")
+    return "(" + " OR ".join(terms) + ")" if terms else "0"
+
+
+def _accounting_select_list(table: str, ordered: List[str], present: Iterable[str]) -> List[str]:
+    """Select expressions for `ordered` columns of `table`, NULL where absent,
+    with subscription-routed cost presented as included."""
+    present = set(present)
+    rewrite = table in _COST_TABLES
+    route = _subscription_route_sql(present) if rewrite else "0"
+    expressions = []
+    for column in ordered:
+        name = _quote_identifier(column)
+        if column not in present:
+            expressions.append(f"NULL AS {name}")
+        elif rewrite and column in ("estimated_cost_usd", "actual_cost_usd"):
+            expressions.append(f"CASE WHEN {route} THEN 0 ELSE {name} END AS {name}")
+        elif rewrite and column == "cost_status":
+            expressions.append(f"CASE WHEN {route} THEN 'included' ELSE {name} END AS {name}")
+        else:
+            expressions.append(name)
+    if rewrite:
+        actual = '"actual_cost_usd"' if "actual_cost_usd" in present else "NULL"
+        estimated = '"estimated_cost_usd"' if "estimated_cost_usd" in present else "NULL"
+        expressions.append(
+            f"CASE WHEN {route} THEN coalesce(nullif({actual},0), {estimated}) END AS \"list_price_usd\""
+        )
+    return expressions
+
+
+def _install_accounting_views(connection: Any) -> None:
+    """Shadow sessions and session_model_usage on a single-profile connection
+    with TEMP views carrying the subscription rewrite. TEMP objects live only
+    on this private connection and vanish when it closes; a failure leaves
+    the raw tables in place (costs then read as Hermes recorded them)."""
+    for table in _COST_TABLES:
+        try:
+            exists = connection.execute(
+                "SELECT 1 FROM sqlite_temp_master WHERE type='view' AND name=?", (table,)
+            ).fetchone()
+            if exists:
+                continue
+            columns = [str(row[1]) for row in connection.execute(f"PRAGMA main.table_info({table})").fetchall()]
+            if not columns:
+                continue
+            select = ", ".join(_accounting_select_list(table, columns, columns))
+            connection.execute(f"CREATE TEMP VIEW {table} AS SELECT {select} FROM main.{table}")
+        except sqlite3.Error:
+            continue
 
 
 class _UnionDB:
@@ -200,12 +277,7 @@ class _UnionDB:
                 columns = columns_by_alias.get(alias)
                 if columns is None:
                     continue
-                present = set(columns)
-                projected = ", ".join(
-                    _quote_identifier(column) if column in present
-                    else f"NULL AS {_quote_identifier(column)}"
-                    for column in ordered
-                )
+                projected = ", ".join(_accounting_select_list(table, ordered, columns))
                 literal = str(name).replace("'", "''")
                 selects.append(f"SELECT {projected}, '{literal}' AS __profile FROM {alias}.{table}")
             if selects:
@@ -396,6 +468,8 @@ def _database(db_path: Optional[Path] = None) -> Iterator[Any]:
             db_path = scoped[0][1]
     db = SessionDB(db_path=db_path, read_only=True) if db_path else SessionDB(read_only=True)
     connection = getattr(db, "_conn", None)
+    if connection is not None:
+        _install_accounting_views(connection)
     armed = _arm_route_budget(connection)
     try:
         yield db

@@ -80,6 +80,8 @@ const pageTabs = [
 let activeProfilesParam = ''
 let activeBudgetsParam = ''
 let activeBalancesParam = ''
+// Runaway-watch alert rates (`cash:1,list:5`), from this desktop's storage.
+let activeWatchParam = ''
 
 // Enabled instruction rules as JSON, sent only with /digest so the weekly
 // digest can grade them; the Rules tab sends its own copy to /rules.
@@ -91,6 +93,7 @@ function apiPath(path, params = {}) {
   if (activeBudgetsParam) merged.budgets = activeBudgetsParam
   if (activeBalancesParam && (path === '/budgets' || path === '/attention' || path === '/digest')) merged.balances = activeBalancesParam
   if (activeRulesParam && path === '/digest') merged.rules = activeRulesParam
+  if (activeWatchParam && (path === '/attention' || path === '/watch')) merged.watch = activeWatchParam
   const query = Object.entries(merged)
     .filter(([, value]) => value !== undefined && value !== null && value !== '')
     .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(String(value))}`)
@@ -270,6 +273,7 @@ function formatCount(value) {
 
 function formatCost(value, kind = 'unpriced') {
   if (kind === 'included') return 'Included'
+  if (kind === 'mixed') return `${formatCost(value, 'estimated')} + included`
   if (value === null || value === undefined || kind === 'unpriced') return 'Unpriced'
   const amount = Number(value) || 0
   if (amount === 0) return '$0.00'
@@ -570,11 +574,19 @@ function DateField({ label, value, onChange, min, max }) {
   })
 }
 
+// Usage on a flat-rate subscription route costs no cash; Hermes still
+// records what it would have cost at API list price, shown for scale.
+function listPriceNote(session) {
+  const price = Number(session.list_price_usd)
+  return price > 0 ? `≈ ${formatCost(price, 'estimated')} at API list price` : ''
+}
+
 function CostLabel({ session }) {
   const kind = session.cost_kind || 'unpriced'
+  const listPrice = listPriceNote(session)
   return jsx(Pill, {
     tone: kind === 'actual' ? 'accent' : 'neutral',
-    title: session.cost_source ? `Source: ${session.cost_source}` : `Cost: ${kind}`,
+    title: [listPrice ? `Subscription usage, ${listPrice}` : '', session.cost_source ? `Source: ${session.cost_source}` : `Cost: ${kind}`].filter(Boolean).join(' · '),
     children: formatCost(session.display_cost_usd, kind)
   })
 }
@@ -694,7 +706,7 @@ function SessionRow({ session, selected, onSelect }) {
 
 function DetailMetricGrid({ session }) {
   const items = [
-    ['Cost', formatCost(session.display_cost_usd, session.cost_kind), session.cost_kind],
+    ['Cost', formatCost(session.display_cost_usd, session.cost_kind), listPriceNote(session) || session.cost_kind],
     ['Tokens', formatCount(session.total_tokens), `${formatCount(session.input_tokens)} in · ${formatCount(session.output_tokens)} out`],
     ['Tools', formatCount(session.tool_call_count), `${formatCount(session.failure_count)} failures`],
     ['Duration', formatDuration(session.duration_seconds), `${formatCount(session.message_count)} messages`]
@@ -2036,7 +2048,134 @@ function _modelBasename(model) {
   return slash >= 0 ? text.slice(slash + 1) : text
 }
 
-function OverviewView({ query, ctx, period }) {
+const WATCH_DEFAULT_RATES = { cash: 1, list: 5 }
+
+function WatchRateField({ label, value, onCommit, hint }) {
+  const [draft, setDraft] = useState(String(value))
+  useEffect(() => setDraft(String(value)), [value])
+  const commit = () => {
+    const number = Number(draft.trim())
+    if (!Number.isFinite(number) || number <= 0) {
+      setDraft(String(value))
+      return
+    }
+    const rounded = Math.round(number * 100) / 100
+    if (rounded !== value) onCommit(rounded)
+  }
+  return jsxs('label', {
+    title: hint,
+    style: { alignItems: 'center', color: color.tertiary, display: 'inline-flex', fontSize: '0.6875rem', gap: '0.3rem' },
+    children: [
+      label,
+      jsx('span', { style: { color: color.quaternary }, children: '$' }),
+      jsx(Input, {
+        type: 'number',
+        min: 0,
+        step: 0.5,
+        inputMode: 'decimal',
+        value: draft,
+        'aria-label': `${label} in USD per hour`,
+        onChange: event => setDraft(event.target.value),
+        onBlur: commit,
+        onKeyDown: event => {
+          if (event.key === 'Enter') event.currentTarget.blur()
+          if (event.key === 'Escape') setDraft(String(value))
+        },
+        style: { ...tabular, textAlign: 'right', width: '4.4rem' }
+      }),
+      jsx('span', { style: { color: color.quaternary }, children: '/h' })
+    ]
+  })
+}
+
+function watchBurnLabel(row) {
+  if (row.route === 'subscription') return `≈ ${formatCost(row.list_last_hour_usd, 'estimated')} list`
+  if (!row.cash_last_hour_usd && row.unpriced_calls) return 'Unpriced'
+  return formatCost(row.cash_last_hour_usd, 'estimated')
+}
+
+// Sessions that called a model in the last hour, with what they burned in
+// it, read from Hermes' agent logs. Past an alert rate a running session is
+// flagged here, in the strip on every tab, and (optionally) by a desktop
+// notification — while it runs, not in next week's totals.
+function RunningNowPanel({ ctx, rates, onRatesChange, notify, onNotifyChange, onOpenSession }) {
+  const query = useQuery({
+    queryKey: [PLUGIN_ID, 'watch', activeProfilesParam, activeWatchParam],
+    queryFn: () => pluginRest(ctx, apiPath('/watch')),
+    refetchInterval: 60_000
+  })
+  const data = query.data
+  const rows = data?.sessions || []
+  const running = Number(data?.totals?.running) || 0
+  return jsxs('section', {
+    'aria-labelledby': 'running-now',
+    style: { display: 'grid', gap: '0.6rem' },
+    children: [
+      jsxs('div', {
+        style: { alignItems: 'flex-end', display: 'flex', flexWrap: 'wrap', gap: '0.75rem', justifyContent: 'space-between' },
+        children: [
+          jsxs('div', {
+            children: [
+              jsx('h3', { id: 'running-now', style: { color: color.primary, fontSize: '0.9375rem', fontWeight: 650, margin: 0 }, children: 'Running now' }),
+              jsx('p', {
+                style: { color: color.tertiary, fontSize: '0.6875rem', margin: '0.15rem 0 0' },
+                children: data
+                  ? `${formatCount(running)} running · ${formatCost(data.totals.cash_last_hour_usd, 'estimated')} cash in the last hour${data.totals.list_last_hour_usd ? ` · ≈ ${formatCost(data.totals.list_last_hour_usd, 'estimated')} subscription use at list price` : ''}`
+                  : 'Reading the last hour of calls…'
+              })
+            ]
+          }),
+          jsxs('div', {
+            style: { alignItems: 'center', display: 'flex', flexWrap: 'wrap', gap: '0.75rem' },
+            children: [
+              jsx(WatchRateField, { label: 'Alert above', value: rates.cash, onCommit: cash => onRatesChange({ ...rates, cash }), hint: 'Cash spent by one running session in the last hour' }),
+              jsx(WatchRateField, { label: 'Subscription', value: rates.list, onCommit: list => onRatesChange({ ...rates, list }), hint: 'Subscription use by one running session in the last hour, at API list price' }),
+              jsxs('label', {
+                title: 'A desktop notification the first time a session crosses an alert rate each day. Hermes shows plugin notifications while you are away from the app.',
+                style: { alignItems: 'center', color: color.tertiary, cursor: 'pointer', display: 'inline-flex', fontSize: '0.6875rem', gap: '0.3rem' },
+                children: [
+                  jsx('input', { type: 'checkbox', checked: Boolean(notify), onChange: event => onNotifyChange(event.target.checked) }),
+                  'Notify me'
+                ]
+              })
+            ]
+          })
+        ]
+      }),
+      query.isError
+        ? jsx('p', { style: { color: color.tertiary, fontSize: '0.6875rem', margin: 0 }, children: describeError(query.error).message })
+        : jsx(SimpleTable, {
+            columns: [
+              {
+                key: 'title',
+                label: 'Session',
+                render: row => jsxs('button', {
+                  type: 'button',
+                  onClick: () => onOpenSession(row.id),
+                  title: 'Open this session',
+                  style: { alignItems: 'center', background: 'transparent', border: 'none', color: row.over ? color.danger : color.primary, cursor: 'pointer', display: 'flex', font: 'inherit', fontWeight: 600, gap: '0.4rem', minWidth: 0, outlineColor: color.accent, padding: 0, textAlign: 'left' },
+                  children: [
+                    row.over ? jsx(Codicon, { name: 'flame', size: '0.7rem' }) : null,
+                    jsx('span', { style: { overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }, children: row.title }),
+                    row.profile ? jsx(Pill, { children: row.profile }) : null
+                  ]
+                })
+              },
+              { key: 'model', label: 'Model', muted: true, render: row => jsx('span', { style: { fontSize: '0.6875rem' }, children: row.model || '—' }) },
+              { key: 'burn', label: 'Last hour', align: 'right', sortValue: row => row.cash_last_hour_usd + row.list_last_hour_usd, render: row => jsx('span', { style: { ...tabular, color: row.over ? color.danger : color.primary }, children: watchBurnLabel(row) }) },
+              { key: 'calls_last_hour', label: 'Calls', align: 'right', render: row => formatCount(row.calls_last_hour) },
+              { key: 'running', label: 'State', render: row => row.running ? jsx(Pill, { tone: row.over ? 'danger' : 'accent', children: row.over ? 'Over rate' : 'Running' }) : jsx('span', { style: { color: color.quaternary, fontSize: '0.6875rem' }, children: `idle ${formatDurationShort(Date.now() / 1000 - Number(row.last_call_at))}` }) },
+              { key: 'cost_so_far_usd', label: 'Session so far', align: 'right', muted: true, render: row => formatCost(row.cost_so_far_usd, row.cost_kind) }
+            ],
+            rows,
+            emptyTitle: 'Nothing running',
+            emptyDescription: 'No session has called a model in the last hour.'
+          })
+    ]
+  })
+}
+
+function OverviewView({ query, ctx, period, watch }) {
   if (queryPending(query)) return jsx(LoadingBlock, { rows: 8 })
   if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'Overview unavailable' })
   const data = query.data
@@ -2045,6 +2184,7 @@ function OverviewView({ query, ctx, period }) {
     children: jsxs('div', {
       style: { display: 'grid', gap: '1.5rem', margin: '0 auto', maxWidth: '84rem' },
       children: [
+        watch ? jsx(RunningNowPanel, { ctx, ...watch }) : null,
         jsxs('section', {
           children: [
             jsx(SectionHeading, {
@@ -3183,8 +3323,10 @@ function QuotaAlertStrip({ notes, dismissedIds, onDismiss, onOpen }) {
         }),
         jsxs('button', {
           type: 'button',
-          onClick: onOpen,
-          title: `Open AI Usage. Reading from ${formatDate(note.as_of)}${note.stale ? ' (last known; the latest refresh failed)' : ''}.`,
+          onClick: () => onOpen(note),
+          title: note.kind === 'runaway'
+            ? 'Open this session'
+            : `Open AI Usage. Reading from ${formatDate(note.as_of)}${note.stale ? ' (last known; the latest refresh failed)' : ''}.`,
           style: {
             alignItems: 'baseline',
             background: 'transparent',
@@ -3217,8 +3359,10 @@ function QuotaAlertStrip({ notes, dismissedIds, onDismiss, onOpen }) {
         jsx('button', {
           type: 'button',
           onClick: () => onDismiss(note.id),
-          'aria-label': `Dismiss the quota note for ${note.provider_label} ${note.window_label}`,
-          title: 'Dismiss this note for the current window. It returns after the reset if the condition persists.',
+          'aria-label': `Dismiss the note for ${note.provider_label} ${note.window_label}`,
+          title: note.kind === 'runaway'
+            ? 'Dismiss for today. It returns tomorrow if the session is still burning past the alert rate.'
+            : 'Dismiss this note for the current window. It returns after the reset if the condition persists.',
           style: { alignItems: 'center', background: 'transparent', border: 'none', color: color.quaternary, cursor: 'pointer', display: 'flex', flexShrink: 0, outlineColor: color.accent, padding: '0.05rem' },
           children: jsx(Codicon, { name: 'close', size: '0.7rem' })
         })
@@ -4789,8 +4933,70 @@ function SessionLensPage({ ctx }) {
     setDrill({ ...filters, key: Date.now() })
     setTab('sessions')
   }
+  const openSessionById = id => drillToSessions({ search: String(id || '') })
+  // Runaway watch: the alert rates are the user's own numbers, kept on this
+  // desktop and sent with /attention and /watch like the budget caps.
+  const [watchRates, setWatchRates] = useState(() => {
+    const stored = ctx.storage.get('watchRates')
+    const clean = { cash: WATCH_DEFAULT_RATES.cash, list: WATCH_DEFAULT_RATES.list }
+    if (stored && typeof stored === 'object') {
+      for (const key of ['cash', 'list']) {
+        const value = Number(stored[key])
+        if (Number.isFinite(value) && value > 0) clean[key] = value
+      }
+    }
+    return clean
+  })
+  const watchParam = `cash:${watchRates.cash},list:${watchRates.list}`
+  activeWatchParam = watchParam
+  const watchInitRef = useRef(false)
+  useEffect(() => {
+    ctx.storage.set('watchRates', watchRates)
+    if (!watchInitRef.current) {
+      watchInitRef.current = true
+      return
+    }
+    queryClient.invalidateQueries({ queryKey: [PLUGIN_ID, 'attention', activeProfilesParam] })
+    queryClient.invalidateQueries({ queryKey: [PLUGIN_ID, 'watch'] })
+  }, [watchParam])
+  const [watchNotify, setWatchNotify] = useState(() => ctx.storage.get('watchNotify', true) !== false)
+  useEffect(() => {
+    ctx.storage.set('watchNotify', watchNotify)
+  }, [ctx, watchNotify])
+  // One desktop notification per session per day, the first time it crosses
+  // an alert rate. Hermes shows plugin notifications only while the user is
+  // away from the app, and the in-app strip carries the same note.
+  const runawayNotes = pageAttentionQuery.data?.runaway || []
+  const runawayKey = runawayNotes.map(note => note.id).join('|')
+  useEffect(() => {
+    if (!runawayNotes.length || !watchNotify) return
+    const notified = new Set(ctx.storage.get('watchNotified', []) || [])
+    let changed = false
+    for (const note of runawayNotes) {
+      if (notified.has(note.id)) continue
+      notified.add(note.id)
+      changed = true
+      try {
+        ctx.os?.notify?.({
+          title: 'A Hermes session is burning fast',
+          body: `${note.provider_label}: ${note.reason}`,
+          onActivate: () => openSessionById(note.session_id)
+        })
+      } catch {
+        // Notifications are best effort; the strip still shows the note.
+      }
+    }
+    if (changed) ctx.storage.set('watchNotified', [...notified].slice(-60))
+  }, [runawayKey, watchNotify])
   let content = jsx(SessionsView, { ctx, period, narrow: Boolean(viewport?.narrow), drill })
-  if (tab === 'overview') content = jsx(OverviewView, { query: overviewQuery, ctx, period })
+  if (tab === 'overview') {
+    content = jsx(OverviewView, {
+      query: overviewQuery,
+      ctx,
+      period,
+      watch: { rates: watchRates, onRatesChange: setWatchRates, notify: watchNotify, onNotifyChange: setWatchNotify, onOpenSession: openSessionById }
+    })
+  }
   if (tab === 'operations') content = jsx(OperationsView, { ctx, period, onDrill: drillToSessions })
   if (tab === 'tools') content = jsx(ToolsView, { ctx, period })
   if (tab === 'rules') content = jsx(RulesView, { ctx, period, onDrill: drillToSessions, rules, onRulesChange: setRules, availableProfiles })
@@ -4930,10 +5136,10 @@ function SessionLensPage({ ctx }) {
       }),
       tab !== 'ai-usage'
         ? jsx(QuotaAlertStrip, {
-            notes: [...(pageAttentionQuery.data?.quotas || []), ...(pageAttentionQuery.data?.budgets || [])],
+            notes: [...(pageAttentionQuery.data?.runaway || []), ...(pageAttentionQuery.data?.quotas || []), ...(pageAttentionQuery.data?.budgets || [])],
             dismissedIds: quotaDismissed,
             onDismiss: id => setQuotaDismissed(current => [...new Set([...current, id])].slice(-40)),
-            onOpen: () => setTab('ai-usage')
+            onOpen: note => (note?.kind === 'runaway' ? openSessionById(note.session_id) : setTab('ai-usage'))
           })
         : null,
       jsx('div', { style: { display: 'flex', flex: 1, minHeight: 0, overflow: 'hidden' }, children: content })

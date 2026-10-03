@@ -64,7 +64,7 @@ def _plugin_version() -> str:
             return match.group(1)
     except OSError:
         pass
-    return "0.45.0"
+    return "0.46.0"
 
 
 PLUGIN_VERSION = _plugin_version()
@@ -474,6 +474,15 @@ def _cost_view(row: Mapping[str, Any]) -> Dict[str, Any]:
         "subscription",
         "free",
     }:
+        if estimated_raw is not None and estimated > 0:
+            # A subscription session whose helper tasks (titles, vision,
+            # approvals) ran on a paid route: the cash part is real.
+            return {
+                "display_cost_usd": estimated,
+                "cost_kind": "mixed",
+                "cost_status": status or "included",
+                "cost_source": source,
+            }
         return {
             "display_cost_usd": 0.0,
             "cost_kind": "included",

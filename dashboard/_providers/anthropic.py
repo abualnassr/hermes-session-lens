@@ -538,7 +538,7 @@ register_provider(
     "anthropic", _ANTHROPIC_SUBSCRIPTION_LABEL, "Hermes OAuth", _collect_anthropic_usage,
     probe=_probe_anthropic,
     not_configured_message="No Anthropic credential was found in Hermes (setup token, OAuth login, or API key).",
-    billing_keys=("anthropic-oauth", "anthropic"),
+    billing_keys=("anthropic-oauth", "anthropic", "claude-subscription-directsdk-experimental", "claude-subscription-directsdk"),
     registry_ids=("anthropic", "anthropic-oauth", "claude"),
     hosts=("api.anthropic.com",), order=20, module=__name__,
     request_kind="inference_probe",

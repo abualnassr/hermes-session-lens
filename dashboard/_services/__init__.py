@@ -389,7 +389,7 @@ def _services_sync(fresh: bool = False, only_service: Optional[str] = None) -> D
                 sid = futures[future]
                 try:
                     results[sid] = future.result()
-                except Exception as error:
+                except (Exception, SystemExit) as error:
                     results[sid] = _service_payload(sid, status="unavailable", message=_provider_message(error))
 
     with _services_cache_lock:

@@ -847,6 +847,167 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertIn("return !row.adapter && !row.known && row.status !== 'local'", source)
         self.assertIn("serviceNeedsAdapter(row)\n                          ? jsx('button'", source.replace("\r\n", "\n"))
 
+    def _insert_subscription_session(self, path, session_id="sub-1", helper_cost=0.25):
+        connection = sqlite3.connect(path)
+        connection.execute(
+            """
+            INSERT INTO sessions (id, source, model, started_at, last_activity_at, ended_at, end_reason,
+                                  input_tokens, output_tokens, cache_read_tokens, billing_provider, billing_base_url,
+                                  estimated_cost_usd, cost_status, cost_source, title, api_call_count)
+            VALUES (?, 'desktop', 'claude-opus-5-5[1m]', 1800000000, 1800000300, 1800000300, 'session_reset',
+                    1000, 500, 90000, 'claude-subscription-directsdk-experimental',
+                    'process://claude-subscription-directsdk-experimental', 69.4, 'estimated', 'provider_cost_api',
+                    'Long Opus session', 40)
+            """,
+            (session_id,),
+        )
+        connection.execute(
+            """
+            INSERT INTO session_model_usage (session_id, model, billing_provider, billing_base_url, api_call_count,
+                                             input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
+                                             reasoning_tokens, estimated_cost_usd, actual_cost_usd, cost_status,
+                                             first_seen, last_seen)
+            VALUES (?, 'claude-opus-5-5[1m]', 'claude-subscription-directsdk-experimental',
+                    'process://claude-subscription-directsdk-experimental', 38, 1000, 400, 90000, 0, 0, 69.3, 0,
+                    'estimated', 1800000000, 1800000300)
+            """,
+            (session_id,),
+        )
+        if helper_cost:
+            connection.execute(
+                """
+                INSERT INTO session_model_usage (session_id, model, billing_provider, api_call_count, input_tokens,
+                                                 output_tokens, cache_read_tokens, cache_write_tokens,
+                                                 reasoning_tokens, estimated_cost_usd, actual_cost_usd, cost_status,
+                                                 first_seen, last_seen)
+                VALUES (?, 'google/gemini-flash-lite', 'openrouter', 2, 100, 100, 0, 0, 0, ?, 0, 'estimated',
+                        1800000000, 1800000300)
+                """,
+                (session_id, helper_cost),
+            )
+        connection.commit()
+        connection.close()
+
+    def test_subscription_routed_usage_is_included_not_dollars(self):
+        # The beta copy is taken before the subscription session exists.
+        beta = self._make_beta_profile()
+        before = api._overview_sync(0)["totals"]["display_cost_usd"]
+        self._insert_subscription_session(self.db_path)
+        overview = api._overview_sync(0)
+        # Only the helper task's cash reaches the totals, never the $69 list price.
+        self.assertAlmostEqual(overview["totals"]["display_cost_usd"], before, places=6)
+        opus = next(m for m in overview["models"] if m["model"] == "claude-opus-5-5[1m]")
+        self.assertEqual(opus["cost_kind"], "included")
+        self.assertEqual(opus["cost_usd"], 0)
+
+        detail = api._session_detail_sync("sub-1")["session"]
+        self.assertEqual(detail["cost_kind"], "mixed")
+        self.assertAlmostEqual(detail["display_cost_usd"], 0.25)
+        self.assertAlmostEqual(detail["list_price_usd"], 69.4)
+
+        listed = api._list_sessions_sync(days=0, query="", sort="recent", failures_only=False,
+                                         include_archived=True, limit=50, offset=0)
+        row = next(item for item in listed["sessions"] if item["id"] == "sub-1")
+        self.assertEqual(row["cost_kind"], "mixed")
+        self.assertLess(row["display_cost_usd"], 1)
+
+        with api._database() as db:
+            connection = api._db_connection(db)
+            self.assertFalse(api._is_union_scope(connection))
+            self.assertEqual(api._same_profile(connection, "s", "m"), "")
+
+        self._insert_subscription_session(beta, "beta-sub", helper_cost=0)
+        both = api._scoped_call("all", api._session_detail_sync, "beta-sub")["session"]
+        self.assertEqual(both["cost_kind"], "included")
+        self.assertAlmostEqual(both["list_price_usd"], 69.4)
+        self.assertIn("claude-subscription-directsdk-experimental",
+                      api._provider_adapters()["anthropic"].billing_keys)
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("if (kind === 'mixed') return `${formatCost(value, 'estimated')} + included`", source)
+        self.assertIn("at API list price", source)
+
+    def test_runaway_watch_flags_running_sessions_past_their_alert_rate(self):
+        self.assertEqual(api._parse_watch_param(""), {"cash_per_hour": 1.0, "list_per_hour": 5.0})
+        self.assertEqual(api._parse_watch_param("cash:2.5,list:x,bogus:3"), {"cash_per_hour": 2.5, "list_per_hour": 5.0})
+        self.assertEqual(api._parse_watch_param("cash:-1")["cash_per_hour"], 1.0)
+
+        now = 1_800_100_000
+        self._insert_subscription_session(self.db_path, "sub-1", helper_cost=0)
+
+        def call(epoch, session, model, provider, prompt, cached, out, number):
+            return (
+                f"{_stamp(epoch)} INFO [{session}] agent.conversation_loop: API call #{number}: model={model} "
+                f"provider={provider} in={prompt} out={out} total={prompt + out} latency=2.0s "
+                f"cache={cached}/{prompt} (50%)\n"
+            )
+
+        lines = []
+        for index in range(30):  # session-1: 30 cash calls in the last hour, the latest 2 minutes ago
+            lines.append(call(now - 3500 + index * 110, "session-1", "provider/model-a", "openrouter", 200_000, 100_000, 1_000, index + 1))
+        for index in range(25):  # sub-1: subscription route, still running (25 x $0.245 at list price)
+            lines.append(call(now - 1800 + index * 70, "sub-1", "claude-opus-5-5[1m]", "claude-subscription-directsdk-experimental", 300_000, 290_000, 2_000, index + 1))
+        lines.append(call(now - 7200, "idle-1", "provider/model-a", "openrouter", 1000, 0, 10, 1))  # outside the hour
+        (self.home / "logs" / "agent.log.watch").write_text("".join(lines), encoding="utf-8")
+        api._log_file_cache.clear()
+
+        rates = {("provider/model-a", "openrouter"): (1e-6, 4e-6, 1e-7),
+                 ("claude-opus-5-5[1m]", "claude-subscription-directsdk-experimental"): (5e-6, 25e-6, 5e-7)}
+        from dashboard import _watch as watch_mod
+
+        with patch.object(watch_mod, "_call_rates", side_effect=lambda model, provider: rates.get((model, provider))):
+            watch = api._watch_sync(api._parse_watch_param(""), now)
+            by_id = {row["id"]: row for row in watch["sessions"]}
+            self.assertNotIn("idle-1", by_id)
+            cash = by_id["session-1"]
+            # 30 x (100k uncached x $1/M + 100k cached x $0.1/M + 1k out x $4/M) = 30 x $0.114
+            self.assertAlmostEqual(cash["cash_last_hour_usd"], 3.42, places=2)
+            self.assertTrue(cash["running"])
+            self.assertTrue(cash["over"])
+            self.assertIn("in the last hour (alert at $1.00/h)", cash["reason"])
+            sub = by_id["sub-1"]
+            self.assertEqual(sub["route"], "subscription")
+            self.assertEqual(sub["cash_last_hour_usd"], 0)
+            self.assertGreater(sub["list_last_hour_usd"], 5)
+            self.assertTrue(sub["over"])
+            self.assertIn("subscription use at list price", sub["reason"])
+            self.assertEqual(sub["cost_kind"], "included")
+            self.assertEqual(watch["totals"]["over"], 2)
+
+            quiet = api._watch_sync(api._parse_watch_param("cash:50,list:500"), now)
+            self.assertEqual(quiet["totals"]["over"], 0)
+            later = api._watch_sync(api._parse_watch_param(""), now + 1200)  # last calls 20+ min ago
+            self.assertFalse(any(row["running"] for row in later["sessions"]))
+            self.assertEqual(later["totals"]["over"], 0)
+
+            with patch.object(api.time, "time", return_value=now):
+                notes = api._watch_attention_notes(api._parse_watch_param(""))
+            self.assertEqual({note["session_id"] for note in notes}, {"session-1", "sub-1"})
+            self.assertTrue(all(note["kind"] == "runaway" and note["id"].startswith("runaway:") for note in notes))
+
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("if (activeWatchParam && (path === '/attention' || path === '/watch')) merged.watch = activeWatchParam", source)
+        self.assertIn("function RunningNowPanel(", source)
+        self.assertIn("pluginRest(ctx, apiPath('/watch'))", source)
+        self.assertIn("ctx.os?.notify?.({", source)
+        self.assertIn("note?.kind === 'runaway' ? openSessionById(note.session_id)", source)
+
+    def test_a_collector_that_exits_costs_one_card_not_the_view(self):
+        class RelaunchExit(SystemExit):
+            pass
+
+        def exits():
+            raise RelaunchExit(1)
+
+        with _provider_collectors({"codex": exits}),                 patch.object(api, "_probe_usage_provider", side_effect=lambda provider: provider == "codex"):
+            payload = api._ai_usage_sync(True)
+        codex = next(card for card in payload["providers"] if card["provider"] == "codex")
+        self.assertEqual(codex["status"], "unavailable")
+        services._services_caches.clear()
+        with _service_collectors({"twilio": exits}),                 patch.object(services, "_services_inventory", return_value={"twilio": {"id": "twilio", "label": "Twilio", "kind": "service", "sources": [], "adapter": True, "known": True, "note": None, "accounts": []}}):
+            result = services._services_sync(fresh=True)
+        self.assertEqual(result["cards"][0]["status"], "unavailable")
+        services._services_caches.clear()
+
     def test_collector_threads_inherit_the_request_context(self):
         import contextvars
         from concurrent.futures import ThreadPoolExecutor
