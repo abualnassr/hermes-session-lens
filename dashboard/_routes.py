@@ -99,7 +99,8 @@ def _fts_query(raw: str) -> str:
     return " ".join(safe)
 
 
-def _search_hits(db: Any, query: str) -> Dict[str, str]:
+def _search_hits(db: Any, query: str) -> Dict[str, Dict[str, Any]]:
+    """session id -> the first full-text hit: its snippet (Hermes marks the term >>>like this<<<) and role."""
     fts = _fts_query(query)
     if not fts:
         return {}
@@ -111,12 +112,30 @@ def _search_hits(db: Any, query: str) -> Dict[str, str]:
         )
     except Exception:
         return {}
-    snippets: Dict[str, str] = {}
+    snippets: Dict[str, Dict[str, Any]] = {}
     for match in matches:
         session_id = str(match.get("session_id") or "")
         if session_id and session_id not in snippets:
-            snippets[session_id] = _clean_text(match.get("snippet"), 260)
+            snippets[session_id] = {
+                "snippet": _clean_text(match.get("snippet"), 260),
+                "role": str(match.get("role") or "").lower() or None,
+            }
     return snippets
+
+
+# Where a search term was found, strongest first: a session whose own
+# details carry the term outranks one that only mentions it in passing.
+_SEARCH_DETAIL_MATCHES = (("title", "title"), ("cwd", "folder"), ("model", "model"), ("id", "id"), ("source", "source"))
+_SEARCH_ROLE_MATCHES = {"tool": "tool result", "assistant": "agent reply", "user": "user message"}
+
+
+def _search_match(material: Mapping[str, Any], free_text: str, hit: Any) -> Optional[str]:
+    term = free_text.lower()
+    for column, label in _SEARCH_DETAIL_MATCHES:
+        if term in str(material.get(column) or "").lower():
+            return label
+    role = hit.get("role") if isinstance(hit, Mapping) else None
+    return _SEARCH_ROLE_MATCHES.get(str(role or ""), "message")
 
 
 _SEARCH_FIELDS = {
@@ -310,18 +329,24 @@ def _list_sessions_sync(
                 continue
             materials.append(material)
 
+        if free_text:
+            for material in materials:
+                material["_search_match"] = _search_match(material, free_text, snippets.get(str(material.get("id"))))
+
         def sort_key(material: Mapping[str, Any]) -> Tuple[Any, ...]:
             started = _number(material.get("started_at"), 0)
             recent = _number(material.get("last_activity_at"), started)
+            # With a search, sessions whose own details match come first.
+            strong = (int(material.get("_search_match") in dict(_SEARCH_DETAIL_MATCHES).values()),) if free_text else ()
             if sort == "recent":
-                return (recent,)
+                return (*strong, recent)
             if sort == "cost":
-                actual = material.get("actual_cost_usd")
-                estimated = material.get("estimated_cost_usd")
-                cost = actual if actual is not None else (estimated if estimated is not None else -1)
-                return (_number(cost, -1), started)
+                # The cost the card shows: subscription use counts as its cash part.
+                cost = _cost_view(material).get("display_cost_usd")
+                return (*strong, _number(cost, -1) if cost is not None else -1, started)
             if sort == "tokens":
                 return (
+                    *strong,
                     sum(
                         _integer(material.get(key))
                         for key in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens")
@@ -329,8 +354,8 @@ def _list_sessions_sync(
                     started,
                 )
             if sort == "tools":
-                return (_integer(material.get("tool_call_count")), started)
-            return (_integer(material.get("failure_count")), recent)
+                return (*strong, _integer(material.get("tool_call_count")), started)
+            return (*strong, _integer(material.get("failure_count")), recent)
 
         materials.sort(key=sort_key, reverse=True)
         total = len(materials)
@@ -339,7 +364,9 @@ def _list_sessions_sync(
         sessions = []
         for material in materials[offset : offset + limit]:
             item = _session_payload(material)
-            item["search_snippet"] = snippets.get(str(item.get("id")))
+            hit = snippets.get(str(item.get("id")))
+            item["search_snippet"] = hit.get("snippet") if isinstance(hit, Mapping) else hit
+            item["search_match"] = material.get("_search_match")
             item["profile"] = (
                 str(material.get("__profile") or "")
                 or single_profile

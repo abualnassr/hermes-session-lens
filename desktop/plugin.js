@@ -688,21 +688,40 @@ function SessionRow({ session, selected, onSelect }) {
             children: session.model
           })
         : null,
-      session.search_snippet
-        ? jsx('div', {
+      session.search_snippet || session.search_match
+        ? jsxs('div', {
             style: {
               borderTop: border,
               color: color.tertiary,
               fontSize: '0.6875rem',
               lineHeight: 1.45,
               marginTop: '0.1rem',
+              overflowWrap: 'anywhere',
               paddingTop: '0.4rem'
             },
-            children: session.search_snippet
+            children: [
+              session.search_match
+                ? jsx('span', {
+                    style: { color: SEARCH_DETAIL_MATCHES.has(session.search_match) ? color.accent : color.quaternary, fontWeight: 600, marginRight: '0.35rem' },
+                    children: SEARCH_DETAIL_MATCHES.has(session.search_match) ? `Matches the ${session.search_match}` : `Mentioned in ${/^[aeiou]/i.test(session.search_match) ? 'an' : 'a'} ${session.search_match}${session.search_snippet ? ':' : ''}`
+                  })
+                : null,
+              ...searchSnippetParts(session.search_snippet)
+            ]
           })
         : null
     ]
   })
+}
+
+// Hermes' full-text search marks the matched term >>>like this<<<.
+const SEARCH_DETAIL_MATCHES = new Set(['title', 'folder', 'model', 'id', 'source'])
+
+function searchSnippetParts(snippet) {
+  if (!snippet) return []
+  return String(snippet).split(/>>>([\s\S]*?)<<</).map((part, index) => index % 2
+    ? jsx('mark', { style: { background: 'transparent', color: color.primary, fontWeight: 650 }, children: part }, index)
+    : part)
 }
 
 function DetailMetricGrid({ session }) {

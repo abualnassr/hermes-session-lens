@@ -3037,6 +3037,32 @@ process.stdout.write(JSON.stringify(out))
         )
         self.assertEqual(payload["pagination"]["total"], 1)
         self.assertIn("plugin", payload["sessions"][0]["search_snippet"].lower())
+        self.assertIn(payload["sessions"][0]["search_match"], {"tool result", "agent reply", "user message", "message", "title", "folder", "model", "id", "source"})
+
+    def test_search_ranks_sessions_whose_details_match_before_passing_mentions(self):
+        connection = sqlite3.connect(self.db_path)
+        connection.execute(
+            "INSERT INTO sessions (id, source, model, started_at, title, message_count, estimated_cost_usd, actual_cost_usd, cost_status, billing_mode) "
+            "VALUES ('kravio-1', 'cli', 'm', 1800000000, 'Rebuild the Kravio UI', 1, 0.14, 0, 'included', 'subscription')"
+        )
+        connection.execute(
+            "INSERT INTO sessions (id, source, model, started_at, title, message_count, estimated_cost_usd) "
+            "VALUES ('mention-1', 'cli', 'm', 1800000000, 'Tidy the vault', 1, 5.0)"
+        )
+        connection.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp) VALUES ('mention-1', 'tool', 'ls: kravio-dashboard.md', 1800000001)"
+        )
+        connection.commit()
+        connection.close()
+        payload = api._list_sessions_sync(
+            days=0, query="kravio", sort="cost", failures_only=False, include_archived=False, limit=50, offset=0
+        )
+        order = [(item["id"], item["search_match"]) for item in payload["sessions"]]
+        self.assertEqual(order[0], ("kravio-1", "title"))
+        self.assertIn(("mention-1", "tool result"), order)
+        self.assertEqual(api._search_match({"title": "x"}, "kravio", {"role": "assistant"}), "agent reply")
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("function searchSnippetParts(snippet)", source)
 
     def test_search_snippet_ids_are_queried_in_sql_safe_chunks(self):
         snippets = {f"missing-session-{index}": "match" for index in range(1801)}
