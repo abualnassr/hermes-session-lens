@@ -3689,7 +3689,7 @@ process.stdout.write(JSON.stringify(out))
 
         from dashboard._providers import anthropic as anthropic_provider
 
-        for value, expected in (({}, True), ({"anthropic_usage_probe": "off"}, False), ({"anthropic_usage_probe": False}, False), ({"anthropic_usage_probe": "yes"}, True)):
+        for value, expected in (({}, False), ({"anthropic_usage_probe": "off"}, False), ({"anthropic_usage_probe": False}, False), ({"anthropic_usage_probe": "yes"}, True)):
             with patch.object(anthropic_provider, "_plugin_settings", return_value=value):
                 self.assertEqual(anthropic_provider._anthropic_probe_enabled(), expected, value)
 

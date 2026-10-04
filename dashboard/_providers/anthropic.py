@@ -16,10 +16,11 @@ only readable source is the ``anthropic-ratelimit-*`` headers Anthropic
 attaches to every message response. The collector therefore sends ONE
 one-token message to Claude Haiku per credential, at most once per
 ``ANTHROPIC_PROBE_TTL_SECONDS`` (a manual refresh bypasses the cache), and
-reads the headers. That is the only inference request Session Lens makes: the
-adapter declares it as ``request_kind="inference_probe"``, the README Trust
-section states it, and ``anthropic_usage_probe: false`` in the plugin
-settings turns it off (the usage endpoint is still tried for full logins).
+reads the headers. That is the only inference request Session Lens makes, and
+it is OFF by default: ``anthropic_usage_probe: true`` in the plugin settings
+turns it on. The adapter declares it as ``request_kind="inference_probe"`` and
+the README Trust section states it. With the probe off, the usage endpoint is
+still tried for full logins.
 
 Nothing here refreshes, rotates, or writes a credential.
 """
@@ -67,8 +68,8 @@ _ANTHROPIC_ENV_SOURCES = {
 _ANTHROPIC_SUBSCRIPTION_LABEL = "Anthropic Claude"
 _ANTHROPIC_API_LABEL = "Anthropic API (console)"
 _ANTHROPIC_PROBE_OFF_MESSAGE = (
-    "The Anthropic usage probe is turned off (plugins.entries.session-lens.settings.anthropic_usage_probe). "
-    "Session Lens reads this credential's allowance from the headers of a one-token message; turn the probe on to read it."
+    "The Anthropic usage probe is off (it is off by default). Session Lens can read this credential's allowance from "
+    "the headers of a one-token message; set plugins.entries.session-lens.settings.anthropic_usage_probe to true to read it."
 )
 _ANTHROPIC_RATE_LIMITS = (
     ("requests", "Requests per minute", "requests"),
@@ -145,9 +146,9 @@ def _anthropic_credentials() -> List[Dict[str, str]]:
 
 def _anthropic_probe_enabled() -> bool:
     try:
-        value = _plugin_settings().get("anthropic_usage_probe", True)
+        value = _plugin_settings().get("anthropic_usage_probe", False)
     except Exception:
-        return True
+        return False
     if isinstance(value, str):
         return value.strip().lower() not in {"0", "false", "no", "off"}
     return bool(value)
@@ -544,7 +545,7 @@ register_provider(
     request_kind="inference_probe",
     note=(
         "Reads allowances from the rate-limit headers of one one-token Claude Haiku message per credential, "
-        "cached 15 minutes; anthropic_usage_probe: false turns it off."
+        "cached 15 minutes. Off by default; anthropic_usage_probe: true turns it on."
     ),
 )
 
