@@ -1270,6 +1270,7 @@ class SessionLensApiTests(unittest.TestCase):
             ("cheap/model", "deepseek", "", 200_000, 800_000, 10_000, 90, 0.10, "estimated"),
             ("plan/model", "openai-codex", "", 100_000, 0, 5_000, 30, 0.0, "included"),
             ("unproven/model", "openrouter", "", 10_000, 0, 1_000, 3, 0.01, "estimated"),
+            ("fresh/model", "openrouter", "", 1_000_000, 0, 50_000, 100, 2.00, "estimated"),  # no reliability record
         ]
         for index, (model, provider, task, inp, cached, out, calls, cost, status) in enumerate(rows):
             connection.execute(
@@ -1304,7 +1305,13 @@ class SessionLensApiTests(unittest.TestCase):
         # 1M x $0.2/M + 4M x $0.02/M + 50k x $0.4/M = $0.30
         self.assertAlmostEqual(cheap["cost_usd"], 0.30, places=4)
         self.assertEqual(cheap["verdict"], "as reliable or better")
-        self.assertAlmostEqual(advice["totals"]["best_saving_usd"], 2.70, places=2)
+        fresh = next(item for item in advice["models"] if item["model"] == "fresh/model")
+        self.assertEqual(fresh["alternatives"][0]["verdict"], "proven; the current model is not yet")
+        # Proven and unproven savings are reported apart: $3.00 - $0.30, then $2.00 - $0.22.
+        self.assertAlmostEqual(advice["totals"]["proven_saving_usd"], 2.70, places=2)
+        self.assertAlmostEqual(advice["totals"]["unproven_saving_usd"], 1.78, places=2)
+        self.assertAlmostEqual(advice["totals"]["best_saving_usd"], 4.48, places=2)
+        self.assertIn("up to 3 percentage points", advice["definition"])
         self.assertNotIn("unproven/model", [alt["model"] for item in advice["models"] for alt in item["alternatives"]])
         self.assertNotIn("plan/model", [alt["model"] for item in advice["models"] for alt in item["alternatives"]])
 
@@ -1313,6 +1320,7 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertEqual(route["quota_provider"], "anthropic")
         source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
         self.assertIn("function SavingsSection({ ctx, period, enabled })", source)
+        self.assertIn("function savingsHeadline(totals)", source)
         self.assertIn("pluginRest(ctx, apiPath('/savings', period))", source)
 
     def test_collector_threads_inherit_the_request_context(self):

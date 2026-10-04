@@ -219,25 +219,41 @@ def _savings_sync(
             }
         )
     advice.sort(key=lambda item: -item["cash_usd"])
-    best = sum(
-        next((alt["saving_usd"] for alt in item["alternatives"] if alt["verdict"] != "less reliable"), 0.0) for item in advice
+
+    def _best_saving(item: Dict[str, Any], verdict: str) -> float:
+        return max((alt["saving_usd"] for alt in item["alternatives"] if alt["verdict"] == verdict), default=0.0)
+
+    # One route per current model: a proven one where it exists, else the
+    # best route whose reliability cannot be compared yet.
+    proven = sum(_best_saving(item, "as reliable or better") for item in advice)
+    unproven = sum(
+        _best_saving(item, "proven; the current model is not yet")
+        for item in advice
+        if not _best_saving(item, "as reliable or better")
     )
+    margin_points = round(SAVINGS_RELIABILITY_MARGIN * 100, 1)
+    margin_label = f"{margin_points:g}"
     return {
         "models": advice,
         "candidates": len(candidates),
         "sample_floor": floor,
         "totals": {
             "cash_usd": round(sum(item["cash_usd"] for item in advice), 4),
-            "best_saving_usd": round(best, 4),
+            "best_saving_usd": round(proven + unproven, 4),
+            "proven_saving_usd": round(proven, 4),
+            "unproven_saving_usd": round(unproven, 4),
         },
+        "reliability_margin": SAVINGS_RELIABILITY_MARGIN,
         "period_days": days,
         "period": _period_payload(days, period_start, period_end),
         "definition": (
             "Each model's main-conversation token mix for the period priced on the other models this install has run, with "
             "Hermes' pricing tables, beside their task failure bound from AI Models (95% upper bound, only above the "
-            f"{floor}-task sample floor). It assumes the same cache hit rate on the new route. A subscription route "
-            "is offered only where it is as reliable, since it spends plan quota. Helper tasks are excluded. A ranking "
-            "of options, not a quote."
+            f"{floor}-task sample floor). \"As reliable or better\" allows the new route's bound to sit up to "
+            f"{margin_label} percentage points above the current model's. \"Current model unproven\" means the current "
+            f"model has fewer than {floor} scored tasks, so the two cannot be compared yet. It assumes the same cache hit "
+            "rate on the new route. A subscription route is offered only where it is as reliable, since it spends plan "
+            "quota. Helper tasks are excluded. A ranking of options, not a quote."
         ),
         "generated_at": time.time(),
     }

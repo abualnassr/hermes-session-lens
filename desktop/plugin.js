@@ -6727,6 +6727,22 @@ function savingsVerdictPill(verdict) {
   return { tone: 'neutral', label: 'Current model unproven' }
 }
 
+// Proven savings lead; savings whose current model has no reliability record
+// yet are counted separately so the headline is not an optimistic sum.
+function savingsHeadline(totals) {
+  const spend = formatCost(totals.cash_usd, 'estimated')
+  const proven = Number(totals.proven_saving_usd ?? 0)
+  const unproven = Number(totals.unproven_saving_usd ?? 0)
+  if (totals.proven_saving_usd == null && totals.unproven_saving_usd == null) {
+    return `Up to ${formatCost(totals.best_saving_usd, 'estimated')} of this period's ${spend} conversation spend could have run on a cheaper route.`
+  }
+  const parts = []
+  if (proven > 0) parts.push(`${formatCost(proven, 'estimated')} of this period's ${spend} conversation spend could have run on a route at least as reliable.`)
+  else parts.push(`No route proven as reliable would have cut this period's ${spend} conversation spend.`)
+  if (unproven > 0) parts.push(`Another ${formatCost(unproven, 'estimated')} could be saved on routes where the current model has no reliability record yet, so the two cannot be compared.`)
+  return parts.join(' ')
+}
+
 // The same conversation work priced on the routes this install already
 // runs, beside their measured task failure bound. Loaded after AI Models so
 // it reuses that payload's evidence (and its cache).
@@ -6748,7 +6764,7 @@ function SavingsSection({ ctx, period, enabled }) {
       jsx(SectionHeading, {
         title: 'Cheaper routes with evidence',
         description: rows.length
-          ? `Up to ${formatCost(data.totals.best_saving_usd, 'estimated')} of this period's ${formatCost(data.totals.cash_usd, 'estimated')} conversation spend could have run on a route at least as reliable or already measured. ${data.definition}`
+          ? `${savingsHeadline(data.totals)} ${data.definition}`
           : `No cheaper route with enough evidence for this period's ${formatCost(data.totals?.cash_usd, 'estimated')} of conversation spend. ${data.definition}`
       }),
       rows.length
