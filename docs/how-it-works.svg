@@ -126,10 +126,10 @@
   <text x="1016" y="312" class="tab">◆ FLEET · OPERATIONS · SCHEDULES</text>
   <text x="1016" y="357" class="q">What do I have left, and who used it?</text>
   <text x="1016" y="378" class="tab">◆ AI USAGE · BUDGETS · SERVICES</text>
-  <text x="1016" y="423" class="q">Which model does the work — and cheaper?</text>
-  <text x="1016" y="444" class="tab">◆ AI MODELS · CHEAPER ROUTES</text>
+  <text x="1016" y="423" class="q">Which model wins on what — and cheaper?</text>
+  <text x="1016" y="444" class="tab">◆ AI MODELS · COMPARE · CHEAPER ROUTES</text>
   <text x="1016" y="489" class="q">What keeps failing?</text>
-  <text x="1016" y="510" class="tab">◆ TOOLS · RECURRING FAILURES</text>
+  <text x="1016" y="510" class="tab">◆ TOOLS · RECURRING FAILURES · ASK HERMES</text>
   <text x="1016" y="555" class="q">What do my tools and MCP servers cost?</text>
   <text x="1016" y="576" class="tab">◆ TOOLS · EVERY CONNECTED SERVER</text>
   <text x="1016" y="621" class="q">What did a whole conversation cost?</text>

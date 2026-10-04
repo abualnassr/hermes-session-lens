@@ -55,19 +55,29 @@ The **Trace** tab replays the session in order — user, assistant, reasoning, t
 
 **Why it cost.** A long agent session's bill is rarely new work; it is the same context re-read on every call. A session's **Why it cost** tab reads its API calls from Hermes' agent log and shows the prompt size of every call (the cached part shaded, compressions marked), the cost split between prompt that missed the cache, prompt read from it, and output, which tools' results filled the context, and the helper tasks that ran beside it. Each finding states its numbers and the setting that governs it, with its current value — `compression.threshold_tokens`, `compression.proactive_prune_min_result_chars`, or `auxiliary.<task>.model` for a helper task that ran on an expensive model. **Helper tasks** on Overview totals what titles, vision, approvals, background reviews and compression cost across sessions, and which model each ran on.
 
+![Why it cost on the Kravio rebuild session: the findings — prompt that missed the cache, a background review on Opus, a long session — beside a search for Kravio that matched the title](docs/screenshots/why-it-cost.png)
+
+![Helper tasks on Overview: each background job, the model it ran on, its cost, and the setting that governs it](docs/screenshots/helper-tasks.png)
+
 ### Overview — where the spend goes
 
-![Overview: usage over time and the project rollup](docs/screenshots/overview.png)
+![Overview: usage over time and where the spend goes](docs/screenshots/overview.png)
 
 **Running now** opens the tab: every session that called a model in the last hour, read from Hermes' agent logs and priced with Hermes' own tables — what it burned in that hour (cash, or subscription use at API list price), its calls, and what it has cost so far. A session still running past your alert rate (default $1/h cash, $5/h subscription use; both editable in place) is flagged there, in the attention strip on every tab, and — unless you switch it off — by one desktop notification per session per day, so a runaway is caught while it runs rather than in next week's totals.
+
+![Running now: the session calling a model this hour, its spend so far, and the alert and notification thresholds](docs/screenshots/running-now.png)
 
 Tokens by day, then the spend rolled up by git repository, working directory, or source for sessions that recorded no directory: sessions, tokens, recorded cost with unpriced counts, confirmed failures, top models, last activity. Every row drills through to the filtered session list.
 
 **Conversations across sessions.** A Telegram topic or bot chat that hits `session_reset` continues in a new session Hermes links to the old one, so a long conversation reads as many cheap sessions. Overview walks those links to each conversation's first session and ranks the conversations by what they cost in all — sessions, span, and total, with continuations, subagents and moves to another surface told apart — and a session's detail says which conversation it belongs to ("Session 24 of 24 in one conversation · $9.68 in total").
 
+![Conversations across sessions: chats split into many linked sessions, with the span and total cost of each](docs/screenshots/conversations.png)
+
 ### Fleet — every profile at a glance
 
 One row per Hermes profile on this machine: running (a model call in the last 15 minutes), idle, quiet this week, or dormant; calls in the last hour and day; spend in the last 24 hours, as cash and subscription use at API list price; tool failures and API errors in 24 hours; open sessions; the main model; and gateway state with its platforms. Bot profiles keep sessions open for weeks, so their spend over time is read from each profile's logged API calls, priced per call with Hermes' pricing tables, never from session totals. A profile with a stopped gateway, a platform that needs attention, three or more API errors, or ten or more tool failures in a day is flagged with the reason, and its name opens its sessions.
+
+![Fleet: one row per profile — state, last activity, calls, spend, failures, open sessions, main model, and gateway](docs/screenshots/fleet.png)
 
 ### AI Usage — what you have left, and who used it
 
@@ -87,7 +97,7 @@ Anthropic gets one card per product Hermes holds a credential for: the Claude su
 
 ### AI Models — a verdict per model from two kinds of evidence
 
-![AI Models: best evidence by task type and the model table](docs/screenshots/ai-models1.png)
+![AI Models: best evidence by task type and a two-model comparison](docs/screenshots/ai-models1.png)
 
 An automatic inventory of every model Hermes has ever recorded, with the selected period's requests, token mix, cost or quota burn, fail rate, retry/switch sessions, work evidence, latency, and trend. Each row leads with a one-sentence verdict that fuses two separate layers: the **API layer** (what the bounded local logs say about errors, rate limits, timeouts, and latency) and the **work ledger** (what recorded sessions say about tasks actually completed). A task counts as finished when its session completed or was closed by a Desktop reset or restart with no failure end reason; the bounded logs then decide whether it was clean, recovered, or abandoned on an API failure. Models rank by the lowest 95%-confidence upper bound on their failure rate (a Wilson score) once they clear a configurable sample floor; below it they show plain fractions and a "not rankable yet" banner rather than any percentage, and every excluded task states why.
 
@@ -97,7 +107,11 @@ Expanding a row opens the full evidence card. The scoring rules — how a sessio
 
 **Compare models** puts up to five models side by side: tick them in the AI Models table. Each measure names its own leader instead of one overall winner — cost for the same work (one recorded token mix, the selected models' combined work or any one model's own, priced on every model; a subscription model shows its list price, marked as included in your plan), work reliability above the sample floor, median speed, and cache hit rate. Beside them sits what each model was actually doing — context per call, where it ran, what kind of task — with a plain warning when the workloads differ too much to compare, and a "cheapest model at least as reliable as …" pick. History shows whether tasks finished without model or API failures, not whether the answers were right.
 
+![Compare models: three models side by side, a leader per measure, and the workload each one actually saw](docs/screenshots/compare.png)
+
 **Cheaper routes with evidence** prices each model's main-conversation token mix for the period on the other models this install has actually run, with Hermes' pricing tables, beside each candidate's task failure bound. A candidate is offered only above the sample floor, so a saving on a model nobody has measured is never suggested; a subscription route you already pay for is offered only where it is at least as reliable, since it spends plan quota; helper tasks, which need particular abilities, are left out. "As reliable or better" allows the new route's failure bound to sit up to 3 percentage points above the current model's, and the headline keeps two sums apart: the saving on routes proven as reliable, and the saving where the current model has no reliability record yet, so the two cannot be compared. The estimate assumes the same cache hit rate on the new route — a ranking of options, not a quote.
+
+![Cheaper routes with evidence: the proven and unproven savings apart, each alternative priced on the same work with its reliability verdict](docs/screenshots/cheaper-routes.png)
 
 ### Tools — every tool and MCP server, priced
 
@@ -106,6 +120,8 @@ Expanding a row opens the full evidence card. The scoring rules — how a sessio
 Call volume, sessions, fail rate, p50/p95 latency, and last use for every tool and every MCP server — including connected servers with no calls yet, listed from `config.yaml` with the number of tools each offers (from Hermes' local MCP schema cache) and marked when switched off. Tools Hermes runs through its tool-search bridge (`tool_call`) are credited to the tool that actually ran, and tools of apps linked through Hermes connectors form their own groups. Then per-tool reliability ranked failures-first with a dedicated failed-call inspector. **Context weight** estimates the tokens each tool's results push into model context (recorded result length ÷ 4) and prices them at each session's billing route through Hermes' own pricing tables — direct entry at the input rate plus a carried upper bound for re-sends, "quota" on subscription routes, "unpriced" where Hermes has no rate. Explicit skill invocations are counted from recorded `skill_view` / `skill_manage` calls; available skills are never mislabelled as used.
 
 **Recurring failures** ranks the agent's bad actors: confirmed tool failures from every session in the scope, grouped by what went wrong — the tool plus the error's telling line (a JSON result's error field or its failing output line with the exit code, a traceback's final exception) with paths, URLs, quoted values, ids and numbers neutralised, so the same fault in two repositories is one row. Each row shows its count and share, whether it recurs (three or more days), came in one burst, or happened once, the sessions it hit, a 14-day trend, and whether it happened in the last 24 hours; clicking its session count lists every session it hit, most recent first, with how many times it failed there, each one a click away. Each row's **Ask Hermes** copies a prompt to investigate that fault and opens a new Hermes chat to paste it into: the pattern (count, sessions, days, profiles, the last 14 days), up to five of the most recent distinct cases with the tool call that produced each — the arguments usually hold the cause — and the sessions it hit, bounded to 12,000 characters and secret-redacted. The prompt asks for the root cause, a fix concrete enough to apply today, and how to confirm it worked, and tells the agent to propose changes rather than make them; nothing is sent until you press send.
+
+![Recurring failures: a fault that recurred over eight days, its sessions listed under the row, and an Ask Hermes button per fault](docs/screenshots/recurring-failures.png)
 
 ### Rules — grade your agent against its own instructions
 
@@ -119,17 +135,17 @@ Verdicts are pass, fail, or not applicable; every failure links to the turn; sco
 
 ### Operations and System
 
-![Operations: agent run health per scheduled job](docs/screenshots/operations.png)
+![Operations: runtime health and gateway state per profile](docs/screenshots/operations.png)
 
 **Operations** covers gateway and platform health for every profile, context-compression distress (fallback streaks, ineffective passes, cooldowns), profiles, and schedules — with an agent run-health scoreboard per cron job: latest runs, failures, streaks, average duration and cost, and click-through to the runs. Schedule prompts are never returned.
 
-![System: the plugin's privacy posture, external hosts, and inference probes](docs/screenshots/system.png)
+![System: the read-only data source the plugin opened](docs/screenshots/system.png)
 
 **System** states the plugin's posture at runtime: database connection and schema, the external hosts the backend can contact, the one inference probe it sends, mutation endpoints (zero), redaction, the language limit of its failure signatures, and the plugin version — so compatibility and trust claims are visible after every update.
 
 ### Export, anywhere
 
-![The Export menu on AI Models](docs/screenshots/export-menu.png)
+![The Export menu on AI Usage](docs/screenshots/export-menu.png)
 
 Every data view exports what it shows as CSV (tables), JSON (the full payload behind the tab), or a Markdown digest for the period, as a download through the desktop's Save File dialog or a copy to the clipboard. Exports are assembled in the desktop from the same read-only routes; the backend gains no export route and writes no file.
 
