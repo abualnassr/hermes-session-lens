@@ -6528,7 +6528,7 @@ function RoutingSummary({ models, coverage, onDrill }) {
   })
 }
 
-function AIModelsTable({ models, quotaData, coverage, narrow, onDrill, period }) {
+function AIModelsTable({ models, quotaData, coverage, narrow, onDrill, period, compare = null, onToggleCompare }) {
   // Default to reliability rank: lowest failure bound first, unranked rows after the ranked ones.
   const [sortState, setSortState] = useState({ key: 'work', direction: 'asc' })
   const periodScope = periodScopeLabel(period)
@@ -6588,7 +6588,9 @@ function AIModelsTable({ models, quotaData, coverage, narrow, onDrill, period })
       children: [
         jsx('thead', {
           children: jsx('tr', {
-            children: columns.map(column => jsx('th', {
+            children: [
+              compare ? jsx('th', { scope: 'col', title: `Tick up to ${COMPARE_LIMIT} models to compare`, style: { background: color.surface, borderBottom: border, color: color.tertiary, fontSize: '0.6875rem', fontWeight: 600, padding: '0.5rem 0.4rem 0.5rem 0.65rem', whiteSpace: 'nowrap' }, children: 'Compare' }, 'compare') : null,
+              ...columns.map(column => jsx('th', {
               scope: 'col',
               'aria-sort': sortState.key === column.key ? (sortState.direction === 'asc' ? 'ascending' : 'descending') : 'none',
               style: { background: color.surface, borderBottom: border, padding: 0, whiteSpace: 'nowrap' },
@@ -6622,6 +6624,7 @@ function AIModelsTable({ models, quotaData, coverage, narrow, onDrill, period })
                 ]
               })
             }, column.key))
+            ].filter(Boolean)
           })
         }),
         jsx('tbody', {
@@ -6630,7 +6633,23 @@ function AIModelsTable({ models, quotaData, coverage, narrow, onDrill, period })
             const isExpanded = expanded.has(model.model_id)
             const detailId = `model-detail-${item.index}`
             const verdict = modelVerdict(model, rateSampleThreshold)
+            const ticked = Boolean(compare?.includes(model.model_id))
             const cells = [
+              compare
+                ? jsx('td', {
+                    onClick: event => event.stopPropagation(),
+                    style: { borderBottom: isExpanded ? 'none' : border, padding: '0.66rem 0.4rem 0.62rem 0.65rem', verticalAlign: 'top' },
+                    children: jsx('input', {
+                      type: 'checkbox',
+                      checked: ticked,
+                      disabled: !ticked && compare.length >= COMPARE_LIMIT,
+                      onChange: () => onToggleCompare(model.model_id),
+                      'aria-label': `Compare ${model.display_name}`,
+                      title: !ticked && compare.length >= COMPARE_LIMIT ? `Up to ${COMPARE_LIMIT} models` : `Compare ${model.display_name}`,
+                      style: { accentColor: color.accent, cursor: 'pointer', margin: 0 }
+                    })
+                  }, 'compare')
+                : null,
               jsx('td', {
                 style: { borderBottom: isExpanded ? 'none' : border, minWidth: '17rem', padding: 0, verticalAlign: 'top' },
                 children: jsx('button', {
@@ -6684,12 +6703,12 @@ function AIModelsTable({ models, quotaData, coverage, narrow, onDrill, period })
               jsx('td', { style: { borderBottom: isExpanded ? 'none' : border, padding: '0.58rem 0.65rem', verticalAlign: 'top' }, children: jsx(WorkEvidenceCell, { model }) }, 'work'),
               jsx('td', { title: Number(model.requests) === 0 ? 'activity outside selected period; see the provenance note in the expanded card' : `p95 ${formatSeconds(model.latency?.total_p95_seconds)} · ${model.latency?.samples || 0} bounded-log samples. Hermes does not record time-to-first-token.`, style: { ...tabular, borderBottom: isExpanded ? 'none' : border, minWidth: '6rem', padding: '0.62rem 0.65rem', textAlign: 'right', verticalAlign: 'top' }, children: Number(model.requests) === 0 ? '–' : formatSeconds(model.latency?.total_p50_seconds) }, 'latency'),
               jsx('td', { style: { borderBottom: isExpanded ? 'none' : border, padding: '0.54rem 0.65rem', verticalAlign: 'top' }, children: jsx(TrendBars, { rows: model.trend }) }, 'trend')
-            ]
+            ].filter(Boolean)
             const detail = isExpanded
               ? jsx('tr', {
                   children: jsx('td', {
                     id: detailId,
-                    colSpan: columns.length,
+                    colSpan: columns.length + (compare ? 1 : 0),
                     style: { borderBottom: border, padding: 0 },
                     children: jsx(ModelExpanded, { model, quota: item.quota, coverage, narrow, onDrill })
                   })
@@ -6784,7 +6803,191 @@ function SavingsSection({ ctx, period, enabled }) {
   })
 }
 
+const COMPARE_LIMIT = 5
+const COMPARE_LEADER_LABELS = { cost: 'Cheapest', reliability: 'Most reliable', speed: 'Fastest', cache: 'Best cache' }
+
+function compareShares(items) {
+  if (!items?.length) return '—'
+  return items.map(item => `${item.name} ${Math.round(Number(item.share) * 100)}%`).join(' · ')
+}
+
+function CompareLeader({ kind }) {
+  return jsx('span', { style: { display: 'block', marginTop: '0.2rem' }, children: jsx(Pill, { tone: 'accent', children: COMPARE_LEADER_LABELS[kind] }) })
+}
+
+// Up to five models side by side. Each measure names its own leader instead
+// of one overall winner: the models did different work, and the panel says so.
+function CompareSection({ ctx, period, selected, models, onRemove, onClear }) {
+  const known = new Set((models || []).map(model => model.model_id))
+  const picked = selected.filter(id => known.has(id))
+  const [reference, setReference] = useState('combined')
+  const [baseline, setBaseline] = useState('')
+  const query = useQuery({
+    queryKey: [PLUGIN_ID, 'compare', activeProfilesParam, period.days, period.start_at, period.end_at, picked.join('|')],
+    queryFn: () => pluginRest(ctx, apiPath('/models/compare', { ...period, models: picked.join('|') })),
+    enabled: picked.length >= 2,
+    staleTime: 120_000
+  })
+  if (!picked.length) return null
+  const heading = jsx(SectionHeading, {
+    title: 'Compare models',
+    description: picked.length < 2
+      ? `Tick at least one more model in the table below to compare (up to ${COMPARE_LIMIT}).`
+      : `${picked.length} of ${COMPARE_LIMIT} models. Each measure names its own leader; the workload rows show what each model was actually doing.`,
+    action: jsx('button', {
+      type: 'button',
+      onClick: onClear,
+      style: { background: 'transparent', border, borderRadius: '4px', color: color.secondary, cursor: 'pointer', font: 'inherit', fontSize: '0.6875rem', padding: '0.25rem 0.6rem' },
+      children: 'Clear'
+    })
+  })
+  if (picked.length < 2) return jsx('section', { children: heading })
+  if (query.isError) return jsxs('section', { children: [heading, jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'The comparison is unavailable' })] })
+  if (!query.data) return jsxs('section', { children: [heading, jsx(LoadingBlock, { rows: 6 })] })
+  const data = query.data
+  const columns = data.models || []
+  const leaders = data.leaders || {}
+  const ref = (data.references || []).includes(reference) ? reference : 'combined'
+  const nameOf = id => columns.find(model => model.model_id === id)?.display_name || id
+  const proven = columns.filter(model => model.reliability?.proven)
+  const base = proven.find(model => model.model_id === baseline) || proven[0]
+  const pick = base ? data.picks?.[base.model_id] : undefined
+  const cell = (children, extra = {}) => ({ children, style: { ...tabular, borderBottom: border, padding: '0.5rem 0.65rem', verticalAlign: 'top', ...extra } })
+  const sameWork = model => {
+    const item = model.same_work?.[ref]
+    if (!item || item.cost_usd === null || item.cost_usd === undefined) return jsx('span', { style: { color: color.tertiary }, children: 'No price in Hermes' })
+    if (item.included) return jsxs('span', { children: [`${formatCost(item.cost_usd, 'estimated')} list`, jsx('span', { style: { color: color.tertiary, display: 'block', fontSize: '0.625rem' }, children: 'included in your plan · uses quota' })] })
+    return formatCost(item.cost_usd, 'estimated')
+  }
+  const rows = [
+    {
+      label: 'Route',
+      render: model => jsxs('span', { children: [model.route_label || '—', model.subscription ? jsx('span', { style: { color: color.tertiary, display: 'block', fontSize: '0.625rem' }, children: 'subscription' }) : null] })
+    },
+    {
+      label: 'Cost for the same work',
+      hint: ref === 'combined' ? 'all selected models’ work combined' : `${nameOf(ref)}’s work`,
+      render: model => jsxs('span', { children: [sameWork(model), leaders.cost?.[ref] === model.model_id ? jsx(CompareLeader, { kind: 'cost' }) : null] })
+    },
+    { label: 'Recorded spend', hint: 'what it actually cost in this period', render: model => model.subscription && !model.cash_usd ? 'Included' : formatCost(model.cash_usd, 'estimated') },
+    {
+      label: 'Work reliability',
+      hint: `fails at most (95% bound), from ${data.sample_floor}+ tasks`,
+      render: model => model.reliability?.proven
+        ? jsxs('span', { children: [`≤ ${formatPercent(model.reliability.failure_upper_bound)}`, jsx('span', { style: { color: color.tertiary, display: 'block', fontSize: '0.625rem' }, children: `${formatCount(model.reliability.eligible_tasks)} tasks` }), leaders.reliability === model.model_id ? jsx(CompareLeader, { kind: 'reliability' }) : null] })
+        : jsx('span', { style: { color: color.tertiary }, children: `Not enough data (${formatCount(model.reliability?.eligible_tasks || 0)} tasks)` })
+    },
+    {
+      label: 'Speed',
+      hint: 'median total time per call (p95)',
+      render: model => model.latency?.p50_seconds
+        ? jsxs('span', { children: [`${formatSeconds(model.latency.p50_seconds)} (${formatSeconds(model.latency.p95_seconds)})`, leaders.speed === model.model_id ? jsx(CompareLeader, { kind: 'speed' }) : null] })
+        : jsx('span', { style: { color: color.tertiary }, children: 'No logged calls' })
+    },
+    {
+      label: 'Cache hit rate',
+      hint: 'prompt read from cache',
+      render: model => model.cache_hit_rate === null || model.cache_hit_rate === undefined
+        ? '—'
+        : jsxs('span', { children: [formatPercent(model.cache_hit_rate), leaders.cache === model.model_id ? jsx(CompareLeader, { kind: 'cache' }) : null] })
+    },
+    { label: 'Context per call', hint: 'prompt tokens sent each call', render: model => model.workload?.context_per_call ? formatCount(model.workload.context_per_call) : '—' },
+    { label: 'Output per call', render: model => model.workload?.output_per_call ? formatCount(model.workload.output_per_call) : '—' },
+    { label: 'Calls · sessions', render: model => `${formatCount(model.workload?.calls)} · ${formatCount(model.workload?.sessions)}` },
+    { label: 'Where it ran', render: model => compareShares(model.workload?.sources) },
+    { label: 'What it did', render: model => compareShares(model.workload?.task_types) }
+  ]
+  return jsxs('section', {
+    style: { display: 'grid', gap: '0.6rem' },
+    children: [
+      heading,
+      jsx(NativeSelect, {
+        label: 'Price the same work as',
+        value: ref,
+        onChange: setReference,
+        children: (data.references || []).map(key => jsx('option', { value: key, children: key === 'combined' ? 'All selected models combined' : `${nameOf(key)}’s work` }, key))
+      }),
+      jsx('div', {
+        style: { border, borderRadius: '6px', overflowX: 'auto' },
+        children: jsx('table', {
+          style: { borderCollapse: 'collapse', fontSize: '0.75rem', minWidth: `${12 + columns.length * 11}rem`, width: '100%' },
+          children: [
+            jsx('thead', {
+              children: jsx('tr', {
+                children: [
+                  jsx('th', { scope: 'col', style: { background: color.surface, borderBottom: border, color: color.tertiary, fontSize: '0.6875rem', fontWeight: 600, padding: '0.5rem 0.65rem', textAlign: 'left' }, children: 'Measure' }, 'measure'),
+                  ...columns.map(model => jsx('th', {
+                    scope: 'col',
+                    style: { background: color.surface, borderBottom: border, padding: '0.45rem 0.65rem', textAlign: 'left', verticalAlign: 'top' },
+                    children: jsxs('span', {
+                      style: { alignItems: 'flex-start', display: 'flex', gap: '0.4rem', justifyContent: 'space-between' },
+                      children: [
+                        jsx('span', { style: { color: color.primary, fontWeight: 650, overflowWrap: 'anywhere' }, children: model.display_name }),
+                        jsx('button', {
+                          type: 'button',
+                          onClick: () => onRemove(model.model_id),
+                          'aria-label': `Remove ${model.display_name} from the comparison`,
+                          title: 'Remove from the comparison',
+                          style: { background: 'transparent', border: 'none', color: color.tertiary, cursor: 'pointer', padding: 0 },
+                          children: jsx(Codicon, { name: 'close', size: '0.7rem' })
+                        })
+                      ]
+                    })
+                  }, model.model_id))
+                ]
+              })
+            }),
+            jsx('tbody', {
+              children: rows.map(row => jsx('tr', {
+                children: [
+                  jsx('th', {
+                    scope: 'row',
+                    style: { borderBottom: border, color: color.secondary, fontWeight: 600, padding: '0.5rem 0.65rem', textAlign: 'left', verticalAlign: 'top', whiteSpace: 'nowrap' },
+                    children: jsxs('span', { children: [row.label, row.hint ? jsx('span', { style: { color: color.quaternary, display: 'block', fontSize: '0.625rem', fontWeight: 500 }, children: row.hint }) : null] })
+                  }),
+                  ...columns.map(model => jsx('td', cell(row.render(model)), model.model_id))
+                ]
+              }, row.label))
+            })
+          ]
+        })
+      }),
+      data.warnings?.length
+        ? jsx('div', {
+            role: 'status',
+            style: { background: color.warningSoft, borderRadius: '5px', color: color.warning, display: 'grid', fontSize: '0.6875rem', gap: '0.25rem', lineHeight: 1.5, padding: '0.5rem 0.65rem' },
+            children: data.warnings.map(warning => jsx('span', { children: warning }, warning))
+          })
+        : null,
+      proven.length
+        ? jsxs('div', {
+            style: { alignItems: 'center', display: 'flex', flexWrap: 'wrap', fontSize: '0.75rem', gap: '0.5rem' },
+            children: [
+              jsx(NativeSelect, {
+                label: 'Cheapest model that is at least as reliable as',
+                value: base.model_id,
+                onChange: setBaseline,
+                children: proven.map(model => jsx('option', { value: model.model_id, children: model.display_name }, model.model_id))
+              }),
+              jsx('span', {
+                style: { color: color.primary },
+                children: pick
+                  ? `${nameOf(pick.model_id)}: ${pick.uses_plan_quota ? 'included in your plan (uses quota)' : formatCost(pick.cost_usd, 'estimated')} for ${base.display_name}’s work, against ${formatCost(pick.baseline_cost_usd, 'estimated')} now.`
+                  : `Nothing cheaper here is as reliable as ${base.display_name}.`
+              })
+            ]
+          })
+        : jsx('span', { style: { color: color.tertiary, fontSize: '0.6875rem' }, children: `A cheaper-and-as-reliable pick needs a model with at least ${data.sample_floor} scored tasks.` }),
+      jsx('p', { style: { color: color.tertiary, fontSize: '0.6875rem', lineHeight: 1.5, margin: 0 }, children: data.definition })
+    ]
+  })
+}
+
 function AIModelsView({ query, quotaQuery, narrow, refreshError, onDrill, period, ctx }) {
+  const [compare, setCompare] = useState([])
+  const toggleCompare = modelId => setCompare(current => current.includes(modelId)
+    ? current.filter(id => id !== modelId)
+    : current.length >= COMPARE_LIMIT ? current : [...current, modelId])
   if (queryPending(query)) return jsx(LoadingBlock, { rows: 9 })
   if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'AI model analytics are unavailable' })
   const data = query.data
@@ -6797,7 +7000,7 @@ function AIModelsView({ query, quotaQuery, narrow, refreshError, onDrill, period
       children: [
         jsx(SectionHeading, {
           title: 'Model performance and efficiency',
-          description: 'Each row states a verdict from two separate evidence layers: the API layer (logged calls) and the work ledger (eligible finished tasks). Rows sort by reliability rank; click a row for the full evidence card.',
+          description: 'Each row states a verdict from two separate evidence layers: the API layer (logged calls) and the work ledger (eligible finished tasks). Rows sort by reliability rank; click a row for the full evidence card, or tick up to five models to compare them side by side.',
           action: jsxs('div', {
             style: { alignItems: 'center', display: 'flex', flexShrink: 0, gap: '0.5rem' },
             children: [
@@ -6832,7 +7035,8 @@ function AIModelsView({ query, quotaQuery, narrow, refreshError, onDrill, period
           ? jsx('div', { role: 'status', style: { background: color.warningSoft, borderRadius: '5px', color: color.warning, fontSize: '0.6875rem', padding: '0.5rem 0.6rem' }, children: 'OAuth quota burn is temporarily unavailable; recorded model analytics remain visible.' })
           : null,
         jsx(RoutingSummary, { models: data.models, coverage: data.coverage, onDrill }),
-        jsx(AIModelsTable, { models: data.models, quotaData: quotaQuery?.data, coverage: data.coverage, narrow, onDrill, period }),
+        ctx ? jsx(CompareSection, { ctx, period, selected: compare, models: data.models, onRemove: toggleCompare, onClear: () => setCompare([]) }) : null,
+        jsx(AIModelsTable, { models: data.models, quotaData: quotaQuery?.data, coverage: data.coverage, narrow, onDrill, period, compare: ctx ? compare : null, onToggleCompare: toggleCompare }),
         ctx ? jsx(SavingsSection, { ctx, period, enabled: Boolean(data) }) : null,
         jsxs('div', {
           style: { alignItems: 'flex-start', borderTop: border, color: color.tertiary, display: 'flex', fontSize: '0.6875rem', gap: '0.5rem', lineHeight: 1.5, paddingTop: '0.75rem' },

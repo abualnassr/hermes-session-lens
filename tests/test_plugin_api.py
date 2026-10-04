@@ -1323,6 +1323,75 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertIn("function savingsHeadline(totals)", source)
         self.assertIn("pluginRest(ctx, apiPath('/savings', period))", source)
 
+    def test_model_comparison_names_a_leader_per_measure_and_flags_unlike_work(self):
+        from dashboard import _compare as compare_mod
+
+        connection = sqlite3.connect(self.db_path)
+        rows = [
+            # model, provider, task, input, cache_read, output, calls, cost, status
+            ("big/model", "openrouter", "", 1_000_000, 9_000_000, 50_000, 50, 5.00, "estimated"),
+            ("big/model", "openrouter", "vision", 500_000, 0, 10_000, 40, 0.90, "estimated"),
+            ("cheap/model", "deepseek", "", 200_000, 800_000, 10_000, 100, 0.10, "estimated"),
+            ("plan/model", "openai-codex", "", 100_000, 0, 5_000, 30, 0.0, "included"),
+        ]
+        for model, provider, task, inp, cached, out, calls, cost, status in rows:
+            connection.execute(
+                """
+                INSERT INTO session_model_usage (session_id, model, billing_provider, task, api_call_count, input_tokens,
+                                                 output_tokens, cache_read_tokens, cache_write_tokens, reasoning_tokens,
+                                                 estimated_cost_usd, actual_cost_usd, cost_status, first_seen, last_seen)
+                VALUES ('session-1', ?, ?, ?, ?, ?, ?, ?, 0, 0, ?, 0, ?, 1800000000, 1800000100)
+                """,
+                (model, provider, task, calls, inp, out, cached, cost, status),
+            )
+        connection.commit()
+        connection.close()
+
+        def evidence(model_id, eligible, bound, p50, samples, cost_kind="estimated"):
+            return {"model_id": model_id, "display_name": model_id, "route_label": "Route", "cost_kind": cost_kind,
+                    "work_reliability": {"eligible_tasks": eligible, "failure_rate_upper_bound_95": bound},
+                    "latency": {"total_p50_seconds": p50, "total_p95_seconds": p50 * 2, "samples": samples},
+                    "task_types": [{"task_type": "Coding", "sessions": 3}]}
+
+        payload = {"models": [
+            evidence("big/model", 40, 0.06, 9.0, 50),
+            evidence("cheap/model", 60, 0.05, 3.0, 120),
+            evidence("plan/model", 30, 0.02, 5.0, 30, cost_kind="subscription"),
+        ]}
+        prices = {("big/model", "openrouter"): (1e-6, 4e-6, 0.1e-6, 1e-6),
+                  ("cheap/model", "deepseek"): (0.2e-6, 0.4e-6, 0.02e-6, 0.2e-6),
+                  ("plan/model", "openrouter"): (0.5e-6, 2e-6, 0.05e-6, 0.5e-6)}
+        wanted = ["big/model", "cheap/model", "plan/model", "a", "b", "c", "d"]
+        with patch.object(compare_mod, "_mix_rates", side_effect=lambda model, provider: prices.get((model, provider))):
+            result = api._compare_sync(wanted, 0, models_payload=payload, sample_floor=20)
+        self.assertEqual(len(result["models"]), 5)  # at most five
+        by_id = {model["model_id"]: model for model in result["models"]}
+        self.assertTrue(by_id["plan/model"]["subscription"])
+        self.assertEqual(by_id["big/model"]["workload"]["calls"], 50)  # the vision helper task is not counted
+        self.assertEqual(by_id["big/model"]["workload"]["context_per_call"], 200_000)
+        # cheap/model doing big/model's work: 1M x $0.2/M + 9M x $0.02/M + 50k x $0.4/M = $0.40
+        self.assertAlmostEqual(by_id["cheap/model"]["same_work"]["big/model"]["cost_usd"], 0.40, places=4)
+        # A plan model is priced at the list price of another route and marked included.
+        self.assertTrue(by_id["plan/model"]["same_work"]["combined"]["included"])
+        self.assertIsNotNone(by_id["plan/model"]["same_work"]["combined"]["cost_usd"])
+        leaders = result["leaders"]
+        self.assertEqual(leaders["cost"]["combined"], "cheap/model")  # plan routes are not crowned on cash
+        self.assertEqual(leaders["reliability"], "plan/model")
+        self.assertEqual(leaders["speed"], "cheap/model")
+        self.assertFalse(by_id["a"]["reliability"]["proven"])
+        pick = result["picks"]["big/model"]
+        self.assertEqual(pick["model_id"], "plan/model")
+        self.assertTrue(pick["uses_plan_quota"])
+        self.assertTrue(any("different-sized jobs" in warning for warning in result["warnings"]))
+        self.assertTrue(any("No main-conversation work recorded" in warning for warning in result["warnings"]))
+        self.assertIn("not whether the answers were right", result["definition"])
+
+        routes_source = (MODULE_PATH.parents[1] / "dashboard" / "_routes.py").read_text(encoding="utf-8")
+        self.assertIn('@router.get("/models/compare")', routes_source)
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        self.assertIn("function CompareSection({ ctx, period, selected, models, onRemove, onClear })", source)
+        self.assertIn("apiPath('/models/compare', { ...period, models: picked.join('|') })", source)
+
     def test_collector_threads_inherit_the_request_context(self):
         import contextvars
         from concurrent.futures import ThreadPoolExecutor

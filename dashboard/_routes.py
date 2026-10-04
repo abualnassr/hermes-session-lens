@@ -17,6 +17,7 @@ try:
     from ._anatomy import *
     from ._chains import *
     from ._savings import *
+    from ._compare import *
 except ImportError:  # pragma: no cover - direct Hermes file loading
     from _common import *
     from _logparse import *
@@ -30,6 +31,7 @@ except ImportError:  # pragma: no cover - direct Hermes file loading
     from _anatomy import *
     from _chains import *
     from _savings import *
+    from _compare import *
 
 router = APIRouter()
 
@@ -3621,6 +3623,27 @@ async def savings(
     profiles: str = Query(""),
 ) -> Dict[str, Any]:
     return await asyncio.to_thread(_scoped_call, profiles, _savings_route_sync, days, start_at, end_at)
+
+
+def _compare_route_sync(
+    models: str, days: int, start_at: Optional[float] = None, end_at: Optional[float] = None
+) -> Dict[str, Any]:
+    """Side-by-side comparison with the AI Models evidence for the same period (its cache serves a warm tab)."""
+    wanted = [item for item in models.split("|") if item.strip()]
+    if not wanted:
+        raise HTTPException(status_code=400, detail="Pick at least one model to compare")
+    return _compare_sync(wanted, days, start_at, end_at, models_payload=_ai_models_sync(days, start_at, end_at))
+
+
+@router.get("/models/compare")
+async def compare_models(
+    models: str = Query("", max_length=2000),
+    days: int = Query(30, ge=0, le=3650),
+    start_at: Optional[float] = Query(None, ge=0),
+    end_at: Optional[float] = Query(None, ge=0),
+    profiles: str = Query(""),
+) -> Dict[str, Any]:
+    return await asyncio.to_thread(_scoped_call, profiles, _compare_route_sync, models, days, start_at, end_at)
 
 
 @router.get("/ai-models")

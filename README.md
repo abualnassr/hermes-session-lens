@@ -6,7 +6,7 @@
 
 It installs as one Hermes plugin: a native Desktop page plus its namespaced Python API. No iframe, no separate server, no telemetry service, and no write path — the backend defines zero mutation routes and never touches a credential store.
 
-This documentation describes Hermes Session Lens `0.52.2`, verified on Hermes Agent `0.21.5` (2026-10-02 build). MIT licensed. A community plugin, not affiliated with or endorsed by Nous Research.
+This documentation describes Hermes Session Lens `0.53.0`, verified on Hermes Agent `0.21.5` (2026-10-02 build). MIT licensed. A community plugin, not affiliated with or endorsed by Nous Research.
 
 ![How Session Lens works: what it reads, what it answers, and what it never does](docs/how-it-works.svg)
 
@@ -94,6 +94,8 @@ An automatic inventory of every model Hermes has ever recorded, with the selecte
 ![An expanded model row: API layer pane and work ledger pane](docs/screenshots/ai-models2.png)
 
 Expanding a row opens the full evidence card. The scoring rules — how a session gets its task type, what counts as completed, clean, or recovered, and what can never improve a rate — are written down in [DESIGN.md](DESIGN.md#ai-models).
+
+**Compare models** puts up to five models side by side: tick them in the AI Models table. Each measure names its own leader instead of one overall winner — cost for the same work (one recorded token mix, the selected models' combined work or any one model's own, priced on every model; a subscription model shows its list price, marked as included in your plan), work reliability above the sample floor, median speed, and cache hit rate. Beside them sits what each model was actually doing — context per call, where it ran, what kind of task — with a plain warning when the workloads differ too much to compare, and a "cheapest model at least as reliable as …" pick. History shows whether tasks finished without model or API failures, not whether the answers were right.
 
 **Cheaper routes with evidence** prices each model's main-conversation token mix for the period on the other models this install has actually run, with Hermes' pricing tables, beside each candidate's task failure bound. A candidate is offered only above the sample floor, so a saving on a model nobody has measured is never suggested; a subscription route you already pay for is offered only where it is at least as reliable, since it spends plan quota; helper tasks, which need particular abilities, are left out. "As reliable or better" allows the new route's failure bound to sit up to 3 percentage points above the current model's, and the headline keeps two sums apart: the saving on routes proven as reliable, and the saving where the current model has no reliability record yet, so the two cannot be compared. The estimate assumes the same cache hit rate on the new route — a ranking of options, not a quote.
 
