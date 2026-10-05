@@ -14,12 +14,8 @@ it is a ranking of options, not a quote.
 
 from __future__ import annotations
 
-try:
-    from ._common import *
-    from ._watch import _is_subscription_route
-except ImportError:  # pragma: no cover - direct Hermes file loading
-    from _common import *
-    from _watch import _is_subscription_route
+from ._common import *
+from ._watch import _is_subscription_route
 
 SAVINGS_MIN_SPEND_USD = 0.25
 SAVINGS_MIN_SHARE = 0.15

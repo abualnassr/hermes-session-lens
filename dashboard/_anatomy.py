@@ -11,16 +11,10 @@ from __future__ import annotations
 
 import statistics
 
-try:
-    from ._common import *
-    from ._logparse import *
-    from ._watch import _call_cost, _call_rates, _is_subscription_route
-    from ._services import _cached_file_parse
-except ImportError:  # pragma: no cover - direct Hermes file loading
-    from _common import *
-    from _logparse import *
-    from _watch import _call_cost, _call_rates, _is_subscription_route
-    from _services import _cached_file_parse
+from ._common import *
+from ._logparse import *
+from ._watch import _call_cost, _call_rates, _is_subscription_route
+from ._services import _cached_file_parse
 
 ANATOMY_MAX_POINTS = 160
 ANATOMY_COMPRESSION_DROP = 0.3

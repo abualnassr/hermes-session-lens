@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-try:
-    from ._common import *
-except ImportError:  # pragma: no cover
-    from _common import *
+from ._common import *
 
 def _timestamp_from_log(value: str) -> float:
     # "YYYY-MM-DD HH:MM:SS,mmm" in local time. strptime per line dominated

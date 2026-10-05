@@ -6,16 +6,10 @@ card, instead of listing a bare key name.
 
 from __future__ import annotations
 
-try:
-    from .._common import *
-    from .._hermes_compat import *
-    from .._providers.shared import *
-    from .shared import *
-except ImportError:  # pragma: no cover
-    from _common import *
-    from _hermes_compat import *
-    from _providers.shared import *
-    from _services.shared import *
+from .._common import *
+from .._hermes_compat import *
+from .._providers.shared import *
+from .shared import *
 
 register_service(
     "typesafe", "TypeSafe", "Hermes .env key",

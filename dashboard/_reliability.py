@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-try:
-    from ._common import *
-except ImportError:  # pragma: no cover
-    from _common import *
+from ._common import *
 
 _WORK_RELIABILITY_ELIGIBLE_STATUSES = {"clean", "completed", "recovered", "unrecovered"}
 

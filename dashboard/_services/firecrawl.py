@@ -4,16 +4,10 @@ from __future__ import annotations
 
 import os
 
-try:
-    from .._common import *
-    from .._hermes_compat import *
-    from .._providers.shared import *
-    from .shared import *
-except ImportError:  # pragma: no cover
-    from _common import *
-    from _hermes_compat import *
-    from _providers.shared import *
-    from _services.shared import *
+from .._common import *
+from .._hermes_compat import *
+from .._providers.shared import *
+from .shared import *
 
 
 _FIRECRAWL_CLOUD_HOST = "api.firecrawl.dev"

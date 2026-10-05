@@ -6,16 +6,10 @@ import json
 import shutil
 import subprocess
 
-try:
-    from .._common import *
-    from .._hermes_compat import *
-    from .._providers.shared import *
-    from .shared import *
-except ImportError:  # pragma: no cover
-    from _common import *
-    from _hermes_compat import *
-    from _providers.shared import *
-    from _services.shared import *
+from .._common import *
+from .._hermes_compat import *
+from .._providers.shared import *
+from .shared import *
 
 
 # The CLI aborts above ~100 runs per page on Windows; one page is plenty for a month.

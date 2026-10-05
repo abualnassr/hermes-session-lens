@@ -2,10 +2,7 @@
 
 from __future__ import annotations
 
-try:
-    from ._common import *
-except ImportError:  # pragma: no cover
-    from _common import *
+from ._common import *
 
 def _tool_text(call: Mapping[str, Any]) -> str:
     arguments = call.get("arguments") if isinstance(call.get("arguments"), Mapping) else {}

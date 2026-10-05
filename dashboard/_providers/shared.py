@@ -2,14 +2,9 @@
 
 from __future__ import annotations
 
-try:
-    from .._common import *
-    from .._hermes_compat import *
-    from .._adapters import *
-except ImportError:  # pragma: no cover
-    from _common import *
-    from _hermes_compat import *
-    from _adapters import *
+from .._common import *
+from .._hermes_compat import *
+from .._adapters import *
 
 _collect_state: Dict[str, bool] = {"fresh": False}
 

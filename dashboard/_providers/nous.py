@@ -5,14 +5,9 @@ from __future__ import annotations
 import re
 import time
 
-try:
-    from .._common import *
-    from .._hermes_compat import *
-    from .shared import *
-except ImportError:  # pragma: no cover
-    from _common import *
-    from _hermes_compat import *
-    from _providers.shared import *
+from .._common import *
+from .._hermes_compat import *
+from .shared import *
 
 def _collect_nous_usage() -> Dict[str, Any]:
     try:

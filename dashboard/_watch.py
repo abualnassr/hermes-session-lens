@@ -12,12 +12,8 @@ burn is measured at API list price — the scale of the subscription use.
 
 from __future__ import annotations
 
-try:
-    from ._common import *
-    from ._logparse import *
-except ImportError:  # pragma: no cover - direct Hermes file loading
-    from _common import *
-    from _logparse import *
+from ._common import *
+from ._logparse import *
 
 WATCH_WINDOW_SECONDS = 3600
 WATCH_ACTIVE_SECONDS = 900

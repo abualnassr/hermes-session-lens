@@ -4,14 +4,9 @@ from __future__ import annotations
 
 import os
 
-try:
-    from .._common import *
-    from .._hermes_compat import *
-    from .._providers.shared import *
-except ImportError:  # pragma: no cover
-    from _common import *
-    from _hermes_compat import *
-    from _providers.shared import *
+from .._common import *
+from .._hermes_compat import *
+from .._providers.shared import *
 
 
 def _service_env_keys() -> Dict[str, str]:

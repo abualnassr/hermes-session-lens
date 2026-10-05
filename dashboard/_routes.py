@@ -4,34 +4,19 @@ from __future__ import annotations
 
 import bisect
 
-try:
-    from ._common import *
-    from ._logparse import *
-    from ._classify import *
-    from ._reliability import *
-    from ._adapters import *
-    from ._providers import *
-    from ._services import *
-    from ._rules import *
-    from ._watch import *
-    from ._anatomy import *
-    from ._chains import *
-    from ._savings import *
-    from ._compare import *
-except ImportError:  # pragma: no cover - direct Hermes file loading
-    from _common import *
-    from _logparse import *
-    from _classify import *
-    from _reliability import *
-    from _adapters import *
-    from _providers import *
-    from _services import *
-    from _rules import *
-    from _watch import *
-    from _anatomy import *
-    from _chains import *
-    from _savings import *
-    from _compare import *
+from ._common import *
+from ._logparse import *
+from ._classify import *
+from ._reliability import *
+from ._adapters import *
+from ._providers import *
+from ._services import *
+from ._rules import *
+from ._watch import *
+from ._anatomy import *
+from ._chains import *
+from ._savings import *
+from ._compare import *
 
 router = APIRouter()
 

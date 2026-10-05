@@ -26,14 +26,9 @@ import time
 from collections import defaultdict
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Tuple
 
-try:
-    from ._common import *
-    from ._reliability import _wilson_upper_bound
-    from ._services import _mcp_inventory, _sanitize_mcp_component
-except ImportError:  # pragma: no cover - direct Hermes file loading
-    from _common import *
-    from _reliability import _wilson_upper_bound
-    from _services import _mcp_inventory, _sanitize_mcp_component
+from ._common import *
+from ._reliability import _wilson_upper_bound
+from ._services import _mcp_inventory, _sanitize_mcp_component
 
 RULES_MAX_RULES = 40
 RULES_MAX_CLAUSES = 12
@@ -1157,10 +1152,7 @@ def _serving_profile_name_safe() -> Optional[str]:
     try:
         from ._routes import _serving_profile_name  # type: ignore
     except Exception:
-        try:
-            from _routes import _serving_profile_name  # type: ignore
-        except Exception:
-            return None
+        return None
     try:
         return _serving_profile_name()
     except Exception:

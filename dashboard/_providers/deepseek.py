@@ -2,14 +2,9 @@
 
 from __future__ import annotations
 
-try:
-    from .._common import *
-    from .._hermes_compat import *
-    from .shared import *
-except ImportError:  # pragma: no cover
-    from _common import *
-    from _hermes_compat import *
-    from _providers.shared import *
+from .._common import *
+from .._hermes_compat import *
+from .shared import *
 
 def _deepseek_payload(payload: Mapping[str, Any]) -> Dict[str, Any]:
     windows: List[Dict[str, Any]] = []

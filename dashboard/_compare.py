@@ -21,14 +21,9 @@ answers were right; that limit is stated with the result.
 
 from __future__ import annotations
 
-try:
-    from ._common import *
-    from ._savings import SAVINGS_RELIABILITY_MARGIN, _mix_rates, _price_mix
-    from ._watch import _is_subscription_route
-except ImportError:  # pragma: no cover - direct Hermes file loading
-    from _common import *
-    from _savings import SAVINGS_RELIABILITY_MARGIN, _mix_rates, _price_mix
-    from _watch import _is_subscription_route
+from ._common import *
+from ._savings import SAVINGS_RELIABILITY_MARGIN, _mix_rates, _price_mix
+from ._watch import _is_subscription_route
 
 COMPARE_MAX_MODELS = 5
 COMPARE_CONTEXT_GAP = 3.0

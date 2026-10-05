@@ -20,16 +20,10 @@ import importlib
 import pkgutil
 import shutil
 
-try:
-    from .._common import *
-    from .._hermes_compat import *
-    from .._providers.shared import *
-    from .shared import *
-except ImportError:  # pragma: no cover
-    from _common import *
-    from _hermes_compat import *
-    from _providers.shared import *
-    from _services.shared import *
+from .._common import *
+from .._hermes_compat import *
+from .._providers.shared import *
+from .shared import *
 
 for _module_info in pkgutil.iter_modules(__path__):
     if _module_info.name.startswith("_") or _module_info.name == "shared":

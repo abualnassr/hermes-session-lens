@@ -2,14 +2,9 @@
 
 from __future__ import annotations
 
-try:
-    from .._common import *
-    from .._hermes_compat import *
-    from .shared import *
-except ImportError:  # pragma: no cover
-    from _common import *
-    from _hermes_compat import *
-    from _providers.shared import *
+from .._common import *
+from .._hermes_compat import *
+from .shared import *
 
 def _kimi_plan_label(payload: Mapping[str, Any]) -> Optional[str]:
     user = payload.get("user")

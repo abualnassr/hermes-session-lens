@@ -717,26 +717,22 @@ def _anthropic_pool_oauth_accounts() -> List[Dict[str, str]]:
     return accounts
 
 
-def _resolve_anthropic_claude_code_oauth() -> str:
-    """Fresh OAuth token from Claude Code's credential store, read-only.
+# Providers whose Hermes secret resolver can shell out or reach the network
+# (Copilot runs `gh auth token`, which may contact api.github.com). Session
+# Lens only asks whether their key is set.
+_ENV_PRESENCE_ONLY_PROVIDERS = frozenset({"copilot"})
 
-    Claude Code refreshes its own token during normal use, so on a machine
-    where Claude Code runs regularly this is the most reliably fresh
-    Anthropic OAuth available. Never refreshes: an expired record returns ""
-    rather than racing Hermes or Claude Code for the single-use refresh
-    token (a lost race kills the login with refresh_token_reused).
-    """
+
+def _hermes_env_present(name: str) -> bool:
+    """True when ``name`` is set for the active profile (its .env or the process), value unread here."""
     try:
-        from agent import anthropic_credentials
+        from agent.secret_scope import get_secret_str
 
-        creds = anthropic_credentials.read_claude_code_credentials()
-        if creds and anthropic_credentials.is_claude_code_token_valid(creds):
-            token = str(creds.get("accessToken") or "").strip()
-            if token and anthropic_credentials._is_oauth_token(token):
-                return token
+        if str(get_secret_str(name, "") or "").strip():
+            return True
     except Exception:
         pass
-    return ""
+    return bool(str(os.environ.get(name) or "").strip())
 
 
 def _hermes_configured_provider_ids() -> List[str]:
@@ -765,6 +761,10 @@ def _hermes_configured_provider_ids() -> List[str]:
         for provider_id, pconfig in registry.items():
             try:
                 if str(getattr(pconfig, "auth_type", "") or "") == "api_key":
+                    if str(provider_id) in _ENV_PRESENCE_ONLY_PROVIDERS:
+                        if any(_hermes_env_present(name) for name in getattr(pconfig, "api_key_env_vars", ()) or ()):
+                            configured.append(str(provider_id))
+                        continue
                     if not callable(secret_resolver):
                         continue
                     token, _source = secret_resolver(provider_id, pconfig)

@@ -4,16 +4,10 @@ from __future__ import annotations
 
 import base64
 
-try:
-    from .._common import *
-    from .._hermes_compat import *
-    from .._providers.shared import *
-    from .shared import *
-except ImportError:  # pragma: no cover
-    from _common import *
-    from _hermes_compat import *
-    from _providers.shared import *
-    from _services.shared import *
+from .._common import *
+from .._hermes_compat import *
+from .._providers.shared import *
+from .shared import *
 
 TWILIO_API = "https://api.twilio.com/2010-04-01/Accounts"
 

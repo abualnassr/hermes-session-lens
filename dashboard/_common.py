@@ -51,10 +51,7 @@ except ImportError:  # pragma: no cover - supports dependency-free compatibility
     def Query(default: Any, **_constraints: Any) -> Any:  # type: ignore[misc]
         return default
 
-try:
-    from ._hermes_compat import *
-except ImportError:  # pragma: no cover - direct Hermes file loading
-    from _hermes_compat import *
+from ._hermes_compat import *
 
 def _plugin_version() -> str:
     try:
@@ -64,7 +61,7 @@ def _plugin_version() -> str:
             return match.group(1)
     except OSError:
         pass
-    return "0.53.1"
+    return "0.53.2"
 
 
 PLUGIN_VERSION = _plugin_version()

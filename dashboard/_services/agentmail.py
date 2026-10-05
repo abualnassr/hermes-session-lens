@@ -2,16 +2,10 @@
 
 from __future__ import annotations
 
-try:
-    from .._common import *
-    from .._hermes_compat import *
-    from .._providers.shared import *
-    from .shared import *
-except ImportError:  # pragma: no cover
-    from _common import *
-    from _hermes_compat import *
-    from _providers.shared import *
-    from _services.shared import *
+from .._common import *
+from .._hermes_compat import *
+from .._providers.shared import *
+from .shared import *
 
 
 _AGENTMAIL_USAGE_TYPES = ("message_count", "thread_count", "inbox_count", "storage_bytes")

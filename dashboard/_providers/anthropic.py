@@ -32,14 +32,9 @@ import hashlib
 import threading
 import time
 
-try:
-    from .._common import *
-    from .._hermes_compat import *
-    from .shared import *
-except ImportError:  # pragma: no cover
-    from _common import *
-    from _hermes_compat import *
-    from _providers.shared import *
+from .._common import *
+from .._hermes_compat import *
+from .shared import *
 
 _ANTHROPIC_USAGE_WINDOWS = (
     ("five_hour", "Current session"),
@@ -138,7 +133,6 @@ def _anthropic_credentials() -> List[Dict[str, str]]:
         add(value, _ANTHROPIC_ENV_SOURCES.get(name, name))
     resolved, _is_oauth = _resolve_anthropic_oauth()
     add(resolved, "Hermes credential")
-    add(_resolve_anthropic_claude_code_oauth(), "Claude Code OAuth login", usage_endpoint=True)
     for entry in _anthropic_pool_oauth_accounts():
         add(entry.get("token"), "Hermes OAuth login", account=str(entry.get("label") or ""), usage_endpoint=True)
     return found[:_ANTHROPIC_MAX_CREDENTIALS]

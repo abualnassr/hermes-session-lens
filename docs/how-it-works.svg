@@ -199,9 +199,9 @@
   <text x="56" y="870" class="t">Writes nothing</text>
   <text x="56" y="891" class="s12">no cache file, no export file,</text>
   <text x="56" y="909" class="s12">no config edit, no session change</text>
-  <text x="323" y="870" class="t">Refreshes no login</text>
-  <text x="323" y="891" class="s12">an expired Anthropic login is</text>
-  <text x="323" y="909" class="s12">reported as expired, not renewed</text>
+  <text x="323" y="870" class="t">Renews no login itself</text>
+  <text x="323" y="891" class="s12">Hermes' own code may renew</text>
+  <text x="323" y="909" class="s12">its Grok, Codex and Nous logins</text>
   <text x="590" y="870" class="t">Reads no browser cookies</text>
   <text x="590" y="891" class="s12">and no credential file outside</text>
   <text x="590" y="909" class="s12 mono">$HERMES_HOME</text>

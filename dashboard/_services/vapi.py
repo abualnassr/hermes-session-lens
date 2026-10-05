@@ -4,16 +4,10 @@ from __future__ import annotations
 
 import datetime as _dt
 
-try:
-    from .._common import *
-    from .._hermes_compat import *
-    from .._providers.shared import *
-    from .shared import *
-except ImportError:  # pragma: no cover
-    from _common import *
-    from _hermes_compat import *
-    from _providers.shared import *
-    from _services.shared import *
+from .._common import *
+from .._hermes_compat import *
+from .._providers.shared import *
+from .shared import *
 
 
 def _vapi_month_query(now: Optional[_dt.datetime] = None) -> Dict[str, Any]:

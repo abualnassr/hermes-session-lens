@@ -1392,6 +1392,42 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertIn("function CompareSection({ ctx, period, selected, models, onRemove, onClear })", source)
         self.assertIn("apiPath('/models/compare', { ...period, models: picked.join('|') })", source)
 
+    def test_hermes_loads_the_api_as_one_uniquely_named_package(self):
+        # Catalog review: no bare `_common` / `_routes` modules on sys.path.
+        import subprocess
+
+        script = "\n".join([
+            "import importlib.util, sys",
+            f"spec = importlib.util.spec_from_file_location('hermes_plugin_api', r'{MODULE_PATH.parent / 'plugin_api.py'}')",
+            "module = importlib.util.module_from_spec(spec)",
+            "spec.loader.exec_module(module)",
+            "bare = sorted(name for name in sys.modules if name.split('.')[0] in ('_common', '_routes', '_providers', '_services', '_hermes_compat'))",
+            "print(hasattr(module, 'router'), 'session_lens_dashboard._routes' in sys.modules, bare)",
+        ])
+        completed = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=120)
+        self.assertEqual(completed.returncode, 0, completed.stderr[-2000:])
+        self.assertEqual(completed.stdout.strip().splitlines()[-1], "True True []")
+
+    def test_copilot_is_listed_by_key_presence_without_its_cli_resolver(self):
+        def resolver(provider_id, _config):
+            if provider_id == "copilot":
+                raise AssertionError("the Copilot resolver may run `gh auth token`")
+            return ("sk-test", "env")
+
+        auth = SimpleNamespace(
+            PROVIDER_REGISTRY={
+                "copilot": SimpleNamespace(auth_type="api_key", api_key_env_vars=("COPILOT_GITHUB_TOKEN", "GH_TOKEN")),
+                "deepseek": SimpleNamespace(auth_type="api_key", api_key_env_vars=("DEEPSEEK_API_KEY",)),
+            },
+            _resolve_api_key_provider_secret=resolver,
+        )
+        package = SimpleNamespace(auth=auth)
+        with patch.dict(sys.modules, {"hermes_cli": package, "hermes_cli.auth": auth}):
+            with patch.dict(os.environ, {"GH_TOKEN": ""}, clear=False):
+                self.assertEqual(hermes_compat._hermes_configured_provider_ids(), ["deepseek"])
+            with patch.dict(os.environ, {"GH_TOKEN": "gho_x"}, clear=False):
+                self.assertEqual(hermes_compat._hermes_configured_provider_ids(), ["copilot", "deepseek"])
+
     def test_collector_threads_inherit_the_request_context(self):
         import contextvars
         from concurrent.futures import ThreadPoolExecutor
@@ -3471,7 +3507,7 @@ process.stdout.write(JSON.stringify(out))
     }
 
     @contextlib.contextmanager
-    def _anthropic_sources(self, env=(), resolver="", claude_code="", pool=(), probe_enabled=True):
+    def _anthropic_sources(self, env=(), resolver="", pool=(), probe_enabled=True):
         """Stub every read-only Anthropic credential source and clear the probe cache."""
         from dashboard._providers import anthropic as anthropic_provider
 
@@ -3479,10 +3515,9 @@ process.stdout.write(JSON.stringify(out))
         provider_shared._set_collect_fresh(False)
         with patch.object(anthropic_provider, "_anthropic_env_credentials", return_value=list(env)):
             with patch.object(anthropic_provider, "_resolve_anthropic_oauth", return_value=(resolver, bool(resolver))):
-                with patch.object(anthropic_provider, "_resolve_anthropic_claude_code_oauth", return_value=claude_code):
-                    with patch.object(anthropic_provider, "_anthropic_pool_oauth_accounts", return_value=list(pool)):
-                        with patch.object(anthropic_provider, "_anthropic_probe_enabled", return_value=probe_enabled):
-                            yield anthropic_provider
+                with patch.object(anthropic_provider, "_anthropic_pool_oauth_accounts", return_value=list(pool)):
+                    with patch.object(anthropic_provider, "_anthropic_probe_enabled", return_value=probe_enabled):
+                        yield anthropic_provider
 
     def test_anthropic_setup_token_reads_subscription_windows_from_message_headers(self):
         oat = "sk-ant-oat01-setup-token"
@@ -3627,14 +3662,17 @@ process.stdout.write(JSON.stringify(out))
 
         # Hermes' delegated fetch returning nothing is not "no Anthropic usage".
         nothing = api._provider_payload("anthropic", status="unavailable", message="Hermes returned None")
-        with self._anthropic_sources(claude_code="sk-ant-oat01-claude-code") as ap:
+        with self._anthropic_sources(pool=[{"label": "work", "token": "sk-ant-oat01-pool-login"}]) as ap:
             with patch.object(ap, "_collect_anthropic_direct", return_value=dict(nothing)):
                 with patch.object(
                     ap, "_anthropic_probe_request", return_value=(200, dict(self._ANTHROPIC_UNIFIED_HEADERS), {})
                 ):
                     result = ap._collect_anthropic_usage()
         self.assertEqual(result["status"], "ok")
-        self.assertEqual(result["auth_source"], "Claude Code OAuth login")
+        self.assertEqual(result["auth_source"], "Hermes OAuth login")
+        # Claude Code's own login store is never read (catalog review).
+        dashboard_source = "".join(path.read_text(encoding="utf-8") for path in (MODULE_PATH.parent).rglob("*.py"))
+        self.assertNotIn("read_claude_code_credentials", dashboard_source)
 
     def test_anthropic_probe_outcomes_are_cached_and_rate_limits_are_not_retried(self):
         oat = "sk-ant-oat01-setup"
@@ -3700,7 +3738,7 @@ process.stdout.write(JSON.stringify(out))
             ("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-s"),
         ]
         pool = [{"label": "w", "token": "eyJ-jwt"}, {"label": "x", "token": "sk-ant-admin01-a"}]
-        with self._anthropic_sources(env=env, resolver="sk-ant-oat01-s", claude_code="sk-ant-oat01-s", pool=pool) as ap:
+        with self._anthropic_sources(env=env, resolver="sk-ant-oat01-s", pool=pool) as ap:
             creds = ap._anthropic_credentials()
         self.assertEqual(
             [(item["kind"], item["source"], item["usage_endpoint"]) for item in creds],
