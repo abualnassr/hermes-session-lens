@@ -24,7 +24,7 @@ import {
   useQueryClient,
   useValue
 } from '@hermes/plugin-sdk'
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { Fragment, jsx, jsxs } from 'react/jsx-runtime'
 
 const PLUGIN_ID = 'session-lens'
@@ -2386,10 +2386,30 @@ function useStoredChoice(ctx, key, options, fallback) {
   return [value, update]
 }
 
-// One floating label for a grid of cells, positioned over the hovered cell.
+// One floating label for a grid of cells. The grids scroll sideways, and a
+// box that scrolls on one axis clips the other too, so the label measures
+// itself before paint: above the cell when it fits, below it otherwise, and
+// slid sideways to stay inside the visible part of the grid.
 function ActivityTip({ tip }) {
+  const ref = useRef(null)
+  useLayoutEffect(() => {
+    const element = ref.current
+    if (!element || !tip) return
+    const width = element.offsetWidth
+    const height = element.offsetHeight
+    const center = (tip.left + tip.right) / 2
+    const minLeft = tip.viewLeft + 2
+    const maxLeft = Math.max(minLeft, tip.viewLeft + tip.viewWidth - width - 2)
+    const left = Math.min(maxLeft, Math.max(minLeft, center - width / 2))
+    const above = tip.top - height - 6
+    const top = above >= tip.viewTop ? above : tip.bottom + 6
+    element.style.left = `${left}px`
+    element.style.top = `${top}px`
+    element.style.visibility = 'visible'
+  }, [tip])
   if (!tip) return null
   return jsx('div', {
+    ref,
     style: {
       background: 'var(--popover, var(--ui-bg-tertiary))',
       border,
@@ -2397,12 +2417,12 @@ function ActivityTip({ tip }) {
       boxShadow: '0 4px 14px rgba(0,0,0,0.25)',
       color: color.primary,
       fontSize: '0.6875rem',
-      left: tip.x,
+      left: 0,
       padding: '0.25rem 0.5rem',
       pointerEvents: 'none',
       position: 'absolute',
-      top: tip.y - 6,
-      transform: 'translate(-50%, -100%)',
+      top: 0,
+      visibility: 'hidden',
       whiteSpace: 'nowrap',
       zIndex: 10,
       ...tabular
@@ -2419,7 +2439,18 @@ function useActivityTip(wrapRef) {
     if (!cell || !wrap) return
     const box = wrap.getBoundingClientRect()
     const rect = cell.getBoundingClientRect()
-    setTip({ text: cell.dataset.tip, x: rect.left - box.left + rect.width / 2 + wrap.scrollLeft, y: rect.top - box.top + wrap.scrollTop })
+    const offsetX = wrap.scrollLeft - box.left
+    const offsetY = wrap.scrollTop - box.top
+    setTip({
+      text: cell.dataset.tip,
+      left: rect.left + offsetX,
+      right: rect.right + offsetX,
+      top: rect.top + offsetY,
+      bottom: rect.bottom + offsetY,
+      viewLeft: wrap.scrollLeft,
+      viewTop: wrap.scrollTop,
+      viewWidth: wrap.clientWidth
+    })
   }
   return { tip, show, hide: () => setTip(null) }
 }
