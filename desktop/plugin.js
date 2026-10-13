@@ -2897,8 +2897,6 @@ function OverviewView({ query, ctx, period, watch, onOpenDay }) {
       style: { display: 'grid', gap: '1.5rem', margin: '0 auto', maxWidth: '84rem' },
       children: [
         watch ? jsx(RunningNowPanel, { ctx, ...watch }) : null,
-        jsx(HelperTasksSection, { ctx, period }),
-        watch?.onOpenSession ? jsx(ConversationChainsSection, { ctx, period, onOpenSession: watch.onOpenSession }) : null,
         jsx(ActivityCalendarSection, {
           ctx,
           onOpenDay,
@@ -2919,6 +2917,8 @@ function OverviewView({ query, ctx, period, watch, onOpenDay }) {
           })
         }),
         jsx(ActivityHoursSection, { ctx, period }),
+        jsx(HelperTasksSection, { ctx, period }),
+        watch?.onOpenSession ? jsx(ConversationChainsSection, { ctx, period, onOpenSession: watch.onOpenSession }) : null,
         jsx(ProjectsSection, { ctx, period }),
         jsxs('section', {
           children: [

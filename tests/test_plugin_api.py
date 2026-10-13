@@ -1324,6 +1324,14 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertIn("jsx(ActivityHoursSection, { ctx, period })", source)
         self.assertIn("queryKey: [PLUGIN_ID, 'activity-calendar', activeProfilesParam]", source)
         self.assertIn("onOpenDay: openDay,", source)
+        # Both grids sit at the top of Overview, right under Running now.
+        order = [source.index(marker) for marker in (
+            "watch ? jsx(RunningNowPanel, { ctx, ...watch }) : null,",
+            "jsx(ActivityCalendarSection, {",
+            "jsx(ActivityHoursSection, { ctx, period }),",
+            "jsx(HelperTasksSection, { ctx, period }),",
+        )]
+        self.assertEqual(order, sorted(order))
 
     def test_activity_helpers_shade_by_quartile_and_lay_out_weeks(self):
         """Run the pure activity helpers under node: quartile levels and the week grid."""
