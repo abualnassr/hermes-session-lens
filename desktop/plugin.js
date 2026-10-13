@@ -2265,27 +2265,382 @@ function useDebounced(value, delay) {
 // OVERVIEW AND OPERATIONS
 // ============================================================================
 
-function DailyBars({ rows }) {
-  if (!rows?.length) return jsx(EmptyState, { title: 'No daily activity', description: 'No session was active in this period.' })
-  const max = Math.max(...rows.map(row => Number(row.total_tokens) || 0), 1)
+// ── Activity helpers (pure; a test runs this block under node)
+// Calendar grid and hour-of-week punchcard. The idea and the quartile
+// shading come from hermes-activity (MIT, github.com/hassan-kamel/hermes-activity).
+const ACTIVITY_WEEKDAYS = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat']
+const ACTIVITY_MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+
+// Shade by quartiles of the non-zero values, not by share of the maximum:
+// one runaway day would otherwise wash every other cell out.
+function activityThresholds(values) {
+  const known = values.map(Number).filter(value => value > 0).sort((a, b) => a - b)
+  const at = fraction => (known.length ? known[Math.min(known.length - 1, Math.floor(known.length * fraction))] : 0)
+  return [at(0.25), at(0.5), at(0.75)]
+}
+
+function activityLevel(value, thresholds) {
+  const number = Number(value) || 0
+  if (number <= 0) return 0
+  if (number <= thresholds[0]) return 1
+  if (number <= thresholds[1]) return 2
+  if (number <= thresholds[2]) return 3
+  return 4
+}
+
+// The hour grid is dense — most hours have some activity — so quartiles
+// would shade it like a checkerboard. Square-root share of the busiest hour
+// keeps the quiet hours visible without letting the peak flatten them.
+function activityShareLevel(value, max) {
+  const number = Number(value) || 0
+  if (number <= 0 || !(max > 0)) return 0
+  return Math.max(1, Math.min(4, Math.ceil(Math.sqrt(number / max) * 4)))
+}
+
+function activityParseDay(day) {
+  const [year, month, date] = String(day).split('-').map(Number)
+  return new Date(year, month - 1, date)
+}
+
+function activityIsoDay(date) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`
+}
+
+// Sunday-first week columns covering start..end; cells outside the range are
+// null so the first and last columns stay ragged like a contribution graph.
+function activityCalendarColumns(start, end, valueOf) {
+  const first = activityParseDay(start)
+  const last = activityParseDay(end)
+  const cursor = new Date(first)
+  cursor.setDate(first.getDate() - first.getDay())
+  const columns = []
+  let previousMonth = -1
+  while (cursor <= last) {
+    const cells = []
+    let month = ''
+    for (let weekday = 0; weekday < 7; weekday++) {
+      const inRange = cursor >= first && cursor <= last
+      if (inRange && cursor.getMonth() !== previousMonth) {
+        if (!month) month = ACTIVITY_MONTHS[cursor.getMonth()]
+        previousMonth = cursor.getMonth()
+      }
+      const day = activityIsoDay(cursor)
+      cells.push(inRange ? { day, value: Number(valueOf(day)) || 0 } : null)
+      cursor.setDate(cursor.getDate() + 1)
+    }
+    columns.push({ month, cells })
+  }
+  // A month label is wider than one column: drop the first if the next month starts right after it.
+  if (columns[0]?.month && (columns[1]?.month || columns[2]?.month)) columns[0].month = ''
+  return columns
+}
+
+function activityValueLabel(value, metric, shorten) {
+  const number = Number(value) || 0
+  if (metric === 'cost_usd') return number > 0 ? `$${number < 0.01 ? number.toFixed(4) : number.toFixed(2)}` : '$0'
+  const text = shorten ? shorten(number) : number.toLocaleString('en-US')
+  if (metric === 'total_tokens') return `${text} tokens`
+  const nouns = { sessions: 'session', failures: 'failure', messages: 'message', tool_calls: 'tool result' }
+  const noun = nouns[metric] || 'item'
+  return `${text} ${number === 1 ? noun : `${noun}s`}`
+}
+// ── End activity helpers
+
+const ACTIVITY_CELL = 11
+const ACTIVITY_GAP = 3
+const ACTIVITY_METRICS = [
+  { id: 'total_tokens', label: 'Tokens' },
+  { id: 'cost_usd', label: 'Cost' },
+  { id: 'sessions', label: 'Sessions' },
+  { id: 'failures', label: 'Failures' }
+]
+const ACTIVITY_HOUR_METRICS = [
+  { id: 'messages', label: 'Messages' },
+  { id: 'tool_calls', label: 'Tool results' },
+  { id: 'sessions', label: 'Session starts' }
+]
+
+function activityColor(level, tone = 'accent') {
+  if (level === 0) return 'color-mix(in srgb, currentColor 9%, transparent)'
+  const base = tone === 'danger' ? color.danger : color.accent
+  return `color-mix(in srgb, ${base} ${[0, 30, 52, 76, 100][level]}%, transparent)`
+}
+
+function activityDayLabel(day) {
+  try {
+    return new Intl.DateTimeFormat(undefined, { weekday: 'short', month: 'short', day: 'numeric', year: 'numeric' }).format(activityParseDay(day))
+  } catch {
+    return day
+  }
+}
+
+function useStoredChoice(ctx, key, options, fallback) {
+  const [value, setValue] = useState(() => {
+    const stored = ctx.storage.get(key)
+    return options.some(option => option.id === stored) ? stored : fallback
+  })
+  const update = next => {
+    setValue(next)
+    ctx.storage.set(key, next)
+  }
+  return [value, update]
+}
+
+// One floating label for a grid of cells, positioned over the hovered cell.
+function ActivityTip({ tip }) {
+  if (!tip) return null
   return jsx('div', {
-    style: { alignItems: 'end', borderBottom: border, display: 'flex', gap: '0.25rem', height: '11rem', overflowX: 'auto', padding: '0.75rem 0.25rem 0' },
-    children: rows.map(row => {
-      const height = Math.max(3, ((Number(row.total_tokens) || 0) / max) * 100)
-      return jsxs('div', {
-        title: `${row.day}: ${formatCount(row.total_tokens)} tokens · ${row.sessions} sessions last active this day · ${formatCost(row.cost_usd, 'estimated')}`,
-        style: { alignItems: 'center', display: 'flex', flex: '1 0 0.8rem', flexDirection: 'column', height: '100%', justifyContent: 'end', minWidth: '0.55rem' },
+    style: {
+      background: 'var(--popover, var(--ui-bg-tertiary))',
+      border,
+      borderRadius: '0.375rem',
+      boxShadow: '0 4px 14px rgba(0,0,0,0.25)',
+      color: color.primary,
+      fontSize: '0.6875rem',
+      left: tip.x,
+      padding: '0.25rem 0.5rem',
+      pointerEvents: 'none',
+      position: 'absolute',
+      top: tip.y - 6,
+      transform: 'translate(-50%, -100%)',
+      whiteSpace: 'nowrap',
+      zIndex: 10,
+      ...tabular
+    },
+    children: tip.text
+  })
+}
+
+function useActivityTip(wrapRef) {
+  const [tip, setTip] = useState(null)
+  const show = event => {
+    const cell = event.target?.closest?.('[data-tip]')
+    const wrap = wrapRef.current
+    if (!cell || !wrap) return
+    const box = wrap.getBoundingClientRect()
+    const rect = cell.getBoundingClientRect()
+    setTip({ text: cell.dataset.tip, x: rect.left - box.left + rect.width / 2 + wrap.scrollLeft, y: rect.top - box.top + wrap.scrollTop })
+  }
+  return { tip, show, hide: () => setTip(null) }
+}
+
+function ActivityLegend({ tone }) {
+  return jsxs('span', {
+    style: { alignItems: 'center', color: color.tertiary, display: 'inline-flex', fontSize: '0.625rem', gap: '0.25rem' },
+    children: [
+      'Less',
+      ...[0, 1, 2, 3, 4].map(level =>
+        jsx('span', { style: { background: activityColor(level, tone), borderRadius: 2, color: color.primary, display: 'inline-block', height: ACTIVITY_CELL, width: ACTIVITY_CELL } }, level)
+      ),
+      'More'
+    ]
+  })
+}
+
+function useElementWidth(ref) {
+  const [width, setWidth] = useState(0)
+  useEffect(() => {
+    const element = ref.current
+    if (!element || typeof ResizeObserver === 'undefined') return undefined
+    const observer = new ResizeObserver(entries => setWidth(entries[0]?.contentRect?.width || 0))
+    observer.observe(element)
+    return () => observer.disconnect()
+  }, [ref])
+  return width
+}
+
+function ActivityCalendar({ data, metric, onOpenDay }) {
+  const wrapRef = useRef(null)
+  const { tip, show, hide } = useActivityTip(wrapRef)
+  const width = useElementWidth(wrapRef)
+  const tone = metric === 'failures' ? 'danger' : 'accent'
+  const model = useMemo(() => {
+    const byDay = new Map((data.days || []).map(row => [row.day, row]))
+    const thresholds = activityThresholds((data.days || []).map(row => row[metric]))
+    const columns = activityCalendarColumns(data.start, data.end, day => byDay.get(day)?.[metric] || 0)
+    return { byDay, thresholds, columns }
+  }, [data, metric])
+  // Weekday labels take ~34 px; the rest is shared by the week columns.
+  const size = width
+    ? Math.max(ACTIVITY_CELL, Math.min(20, Math.floor((width - 34) / Math.max(1, model.columns.length) - ACTIVITY_GAP)))
+    : ACTIVITY_CELL
+  const rows = `14px repeat(7, ${size}px)`
+  const open = event => {
+    const day = event.target?.closest?.('[data-day]')?.dataset?.day
+    if (day && onOpenDay) onOpenDay(day)
+  }
+  return jsxs('div', {
+    ref: wrapRef,
+    onMouseLeave: hide,
+    style: { color: color.primary, overflowX: 'auto', paddingBottom: '0.25rem', position: 'relative' },
+    children: [
+      jsxs('div', {
+        style: { display: 'flex', width: 'max-content' },
         children: [
-          jsx('div', {
-            style: { background: color.accent, borderRadius: '2px 2px 0 0', height: `${height}%`, minHeight: '3px', opacity: 0.75, width: '100%' }
+          jsxs('div', {
+            'aria-hidden': true,
+            style: { display: 'grid', gap: ACTIVITY_GAP, gridTemplateRows: rows, marginRight: 6 },
+            children: [
+              jsx('span', {}, 'blank'),
+              ...ACTIVITY_WEEKDAYS.map((name, index) =>
+                jsx('span', { style: { color: color.tertiary, fontSize: '0.5625rem', lineHeight: `${size}px` }, children: index % 2 === 1 ? name : '' }, name)
+              )
+            ]
           }),
-          jsx('span', {
-            style: { color: color.quaternary, fontSize: '0.5625rem', marginTop: '0.25rem', writingMode: rows.length > 18 ? 'vertical-rl' : 'horizontal-tb' },
-            children: row.day.slice(5)
+          jsx('div', {
+            role: 'grid',
+            'aria-label': 'Activity by day, last 12 months',
+            onMouseOver: show,
+            onFocus: show,
+            onClick: open,
+            onKeyDown: event => {
+              if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault()
+                open(event)
+              }
+            },
+            style: { display: 'grid', gap: ACTIVITY_GAP, gridAutoColumns: size, gridAutoFlow: 'column', gridTemplateRows: rows },
+            children: model.columns.flatMap((column, columnIndex) => [
+              jsx('span', { style: { color: color.tertiary, fontSize: '0.5625rem', lineHeight: '14px', overflow: 'visible', whiteSpace: 'nowrap' }, children: column.month }, `m${columnIndex}`),
+              ...column.cells.map((cell, weekday) => {
+                if (!cell) return jsx('span', {}, `e${columnIndex}-${weekday}`)
+                const row = model.byDay.get(cell.day)
+                const text = `${activityValueLabel(cell.value, metric)} · ${activityDayLabel(cell.day)}${row && metric !== 'sessions' ? ` · ${activityValueLabel(row.sessions, 'sessions')}` : ''}`
+                return jsx('span', {
+                  role: 'gridcell',
+                  tabIndex: 0,
+                  'aria-label': text,
+                  'data-day': cell.day,
+                  'data-tip': text,
+                  style: { background: activityColor(activityLevel(cell.value, model.thresholds), tone), borderRadius: 2, cursor: 'pointer', height: size, width: size }
+                }, cell.day)
+              })
+            ])
           })
         ]
-      }, row.day)
-    })
+      }),
+      jsx(ActivityTip, { tip })
+    ]
+  })
+}
+
+function ActivityCalendarSection({ ctx, onOpenDay, exportMenu }) {
+  const [metric, setMetric] = useStoredChoice(ctx, 'activityMetric', ACTIVITY_METRICS, 'total_tokens')
+  const query = useQuery({
+    queryKey: [PLUGIN_ID, 'activity-calendar', activeProfilesParam],
+    queryFn: () => pluginRest(ctx, apiPath('/activity/calendar')),
+    refetchInterval: 300_000
+  })
+  const data = query.data
+  const totals = data?.totals || {}
+  const busiest = data ? [...(data.days || [])].sort((a, b) => (Number(b[metric]) || 0) - (Number(a[metric]) || 0))[0] : null
+  const summary = data
+    ? [
+        `${activityValueLabel(totals[metric], metric, formatCount)} in the last 12 months`,
+        `${formatCount(totals.active_days)} active days`,
+        busiest && Number(busiest[metric]) > 0 ? `busiest ${activityDayLabel(busiest.day)} (${activityValueLabel(busiest[metric], metric, formatCount)})` : null
+      ].filter(Boolean).join(' · ')
+    : 'The last 12 months, one cell per local day.'
+  return jsxs('section', {
+    children: [
+      jsx(SectionHeading, {
+        title: 'Activity',
+        description: `${summary}. Always the last 12 months, whatever period is picked above. A session counts on the day it was last active; a failure on the day it happened. Click a day to list its sessions.`,
+        action: jsxs('div', {
+          style: { alignItems: 'center', display: 'flex', flexWrap: 'wrap', gap: '0.5rem', justifyContent: 'flex-end' },
+          children: [jsx(SegmentedControl, { options: ACTIVITY_METRICS, value: metric, onChange: setMetric }), exportMenu]
+        })
+      }),
+      queryPending(query)
+        ? jsx(LoadingBlock, { rows: 3 })
+        : query.isError
+          ? jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'Activity calendar unavailable' })
+          : jsxs('div', {
+              style: { display: 'grid', gap: '0.5rem' },
+              children: [
+                jsx(ActivityCalendar, { data, metric, onOpenDay }),
+                jsx('div', { style: { display: 'flex', justifyContent: 'flex-end' }, children: jsx(ActivityLegend, { tone: metric === 'failures' ? 'danger' : 'accent' }) })
+              ]
+            })
+    ]
+  })
+}
+
+function ActivityHours({ data, metric }) {
+  const wrapRef = useRef(null)
+  const { tip, show, hide } = useActivityTip(wrapRef)
+  const model = useMemo(() => {
+    const at = new Map((data.cells || []).map(cell => [`${cell.weekday}:${cell.hour}`, Number(cell[metric]) || 0]))
+    return { at, max: Math.max(0, ...at.values()) }
+  }, [data, metric])
+  return jsxs('div', {
+    ref: wrapRef,
+    onMouseLeave: hide,
+    style: { color: color.primary, overflowX: 'auto', position: 'relative' },
+    children: [
+      jsx('div', {
+        role: 'grid',
+        'aria-label': 'Activity by weekday and hour',
+        onMouseOver: show,
+        style: { display: 'grid', gap: ACTIVITY_GAP, gridTemplateColumns: '2rem repeat(24, minmax(11px, 1fr))', maxWidth: '52rem', minWidth: '24rem' },
+        children: [
+          jsx('span', {}, 'corner'),
+          ...Array.from({ length: 24 }, (_, hour) =>
+            jsx('span', { style: { color: color.tertiary, fontSize: '0.5625rem', textAlign: 'center', ...tabular }, children: hour % 3 === 0 ? String(hour).padStart(2, '0') : '' }, `h${hour}`)
+          ),
+          ...ACTIVITY_WEEKDAYS.flatMap((name, weekday) => [
+            jsx('span', { style: { color: color.tertiary, fontSize: '0.5625rem', lineHeight: '18px' }, children: name }, `w${weekday}`),
+            ...Array.from({ length: 24 }, (_, hour) => {
+              const value = model.at.get(`${weekday}:${hour}`) || 0
+              const text = `${activityValueLabel(value, metric)} · ${name} ${String(hour).padStart(2, '0')}:00–${String(hour).padStart(2, '0')}:59`
+              return jsx('span', {
+                role: 'gridcell',
+                'aria-label': text,
+                'data-tip': text,
+                style: { background: activityColor(activityShareLevel(value, model.max)), borderRadius: 2, height: 18 }
+              }, `${weekday}:${hour}`)
+            })
+          ])
+        ]
+      }),
+      jsx(ActivityTip, { tip })
+    ]
+  })
+}
+
+function ActivityHoursSection({ ctx, period }) {
+  const [metric, setMetric] = useStoredChoice(ctx, 'activityHoursMetric', ACTIVITY_HOUR_METRICS, 'messages')
+  const query = useQuery({
+    queryKey: [PLUGIN_ID, 'activity-hours', activeProfilesParam, period.days, period.start_at, period.end_at],
+    queryFn: () => pluginRest(ctx, apiPath('/activity/hours', period)),
+    refetchInterval: 120_000
+  })
+  const data = query.data
+  const busiest = data ? [...(data.cells || [])].sort((a, b) => (Number(b[metric]) || 0) - (Number(a[metric]) || 0))[0] : null
+  const busiestText = busiest && Number(busiest[metric]) > 0
+    ? ` Busiest hour: ${ACTIVITY_WEEKDAYS[busiest.weekday]} ${String(busiest.hour).padStart(2, '0')}:00 (${activityValueLabel(busiest[metric], metric, formatCount)}).`
+    : ''
+  return jsxs('section', {
+    children: [
+      jsx(SectionHeading, {
+        title: 'When work happens',
+        description: `Messages, tool results, and session starts by local weekday and hour for the selected period, read from their own timestamps — a long bot session spreads across the hours it actually ran.${busiestText}`,
+        action: jsx(SegmentedControl, { options: ACTIVITY_HOUR_METRICS, value: metric, onChange: setMetric })
+      }),
+      queryPending(query)
+        ? jsx(LoadingBlock, { rows: 3 })
+        : query.isError
+          ? jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'Hour-of-week activity unavailable' })
+          : !(Number(data.totals?.[metric]) > 0)
+            ? jsx(EmptyState, { title: 'Nothing recorded', description: 'No activity of this kind in the selected period.' })
+            : jsxs('div', {
+                style: { display: 'grid', gap: '0.5rem' },
+                children: [
+                  jsx(ActivityHours, { data, metric }),
+                  jsx('div', { style: { display: 'flex', justifyContent: 'flex-end', maxWidth: '52rem' }, children: jsx(ActivityLegend, { tone: 'accent' }) })
+                ]
+              })
+    ]
   })
 }
 
@@ -2501,7 +2856,7 @@ function RunningNowPanel({ ctx, rates, onRatesChange, notify, onNotifyChange, on
   })
 }
 
-function OverviewView({ query, ctx, period, watch }) {
+function OverviewView({ query, ctx, period, watch, onOpenDay }) {
   if (queryPending(query)) return jsx(LoadingBlock, { rows: 8 })
   if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'Overview unavailable' })
   const data = query.data
@@ -2513,30 +2868,26 @@ function OverviewView({ query, ctx, period, watch }) {
         watch ? jsx(RunningNowPanel, { ctx, ...watch }) : null,
         jsx(HelperTasksSection, { ctx, period }),
         watch?.onOpenSession ? jsx(ConversationChainsSection, { ctx, period, onOpenSession: watch.onOpenSession }) : null,
-        jsxs('section', {
-          children: [
-            jsx(SectionHeading, {
-              title: 'Usage over time',
-              description: 'Total recorded input, output, and cache tokens by local calendar day.',
-              action: jsx(ExportMenu, {
-                title: 'Export the digest or the overview tables for the selected period',
-                items: [
-                  digestExportItem(ctx, period),
-                  {
-                    id: 'overview-models-csv',
-                    label: 'Models (CSV)',
-                    hint: 'Per-model sessions, tokens, and recorded cost for this period',
-                    filename: exportFilename('overview-models', period, 'csv'),
-                    mime: 'text/csv;charset=utf-8',
-                    build: () => toCsv(OVERVIEW_MODEL_EXPORT_COLUMNS, data.models || [])
-                  },
-                  jsonExportItem('overview-json', 'Overview payload (JSON)', 'Daily bars, models, sources, and outcomes', 'overview', period, data)
-                ]
-              })
-            }),
-            jsx(DailyBars, { rows: data.daily })
-          ]
+        jsx(ActivityCalendarSection, {
+          ctx,
+          onOpenDay,
+          exportMenu: jsx(ExportMenu, {
+            title: 'Export the digest or the overview tables for the selected period',
+            items: [
+              digestExportItem(ctx, period),
+              {
+                id: 'overview-models-csv',
+                label: 'Models (CSV)',
+                hint: 'Per-model sessions, tokens, and recorded cost for this period',
+                filename: exportFilename('overview-models', period, 'csv'),
+                mime: 'text/csv;charset=utf-8',
+                build: () => toCsv(OVERVIEW_MODEL_EXPORT_COLUMNS, data.models || [])
+              },
+              jsonExportItem('overview-json', 'Overview payload (JSON)', 'Daily rows, models, sources, and outcomes', 'overview', period, data)
+            ]
+          })
         }),
+        jsx(ActivityHoursSection, { ctx, period }),
         jsx(ProjectsSection, { ctx, period }),
         jsxs('section', {
           children: [
@@ -5499,6 +5850,15 @@ function SessionLensPage({ ctx }) {
     setTab('sessions')
   }
   const openSessionById = id => drillToSessions({ search: String(id || '') })
+  // A calendar day opens Sessions with the period set to that one day, so the
+  // picker shows what the list is filtered to and one click undoes it.
+  const openDay = day => {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(String(day || ''))) return
+    setCustomStart(day)
+    setCustomEnd(day)
+    setDaysText('custom')
+    drillToSessions({ search: '' })
+  }
   // Runaway watch: the alert rates are the user's own numbers, kept on this
   // desktop and sent with /attention and /watch like the budget caps.
   const [watchRates, setWatchRates] = useState(() => {
@@ -5559,6 +5919,7 @@ function SessionLensPage({ ctx }) {
       query: overviewQuery,
       ctx,
       period,
+      onOpenDay: openDay,
       watch: { rates: watchRates, onRatesChange: setWatchRates, notify: watchNotify, onNotifyChange: setWatchNotify, onOpenSession: openSessionById }
     })
   }

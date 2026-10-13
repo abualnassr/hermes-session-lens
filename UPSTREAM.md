@@ -11,6 +11,7 @@ Its product behavior was informed by:
 - [CodexBar](https://github.com/steipete/CodexBar), by Peter Steinberger and contributors, MIT licensed — Kimi Code Plan response-shape and rolling-window behavior reference.
 - [Agentic Usage Meter](https://github.com/prime-radiant-inc/agentic-usage-meter), by Prime Radiant — provider-qualification reference for the Kimi and Z.AI quota surfaces.
 - [Hermes ResetWatch](https://github.com/Adolanium/hermes-resetwatch), by Adolanium, MIT licensed — behavior reference for per-account Claude quota cards (walking pooled logins and rendering one card per account).
+- [hermes-activity](https://github.com/hassan-kamel/hermes-activity), by Hassan Kamel, MIT licensed — the contribution-style activity calendar with quartile shading and the weekday-by-hour punchcard on Overview (reimplemented, no code copied).
 
 No upstream logo is reused, and this project does not imply endorsement by any upstream author or Nous Research. Source code should carry file-level notices if a future change copies or substantially adapts an upstream implementation.
 

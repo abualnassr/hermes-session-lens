@@ -17,6 +17,7 @@ from ._anatomy import *
 from ._chains import *
 from ._savings import *
 from ._compare import *
+from ._activity import *
 
 router = APIRouter()
 
@@ -2372,6 +2373,21 @@ async def overview(
     profiles: str = Query(""),
 ) -> Dict[str, Any]:
     return await asyncio.to_thread(_scoped_call, profiles, _overview_sync, days, start_at, end_at)
+
+
+@router.get("/activity/calendar")
+async def activity_calendar(profiles: str = Query("")) -> Dict[str, Any]:
+    return await asyncio.to_thread(_scoped_call, profiles, _activity_calendar_sync)
+
+
+@router.get("/activity/hours")
+async def activity_hours(
+    days: int = Query(30, ge=0, le=3650),
+    start_at: Optional[float] = Query(None, ge=0),
+    end_at: Optional[float] = Query(None, ge=0),
+    profiles: str = Query(""),
+) -> Dict[str, Any]:
+    return await asyncio.to_thread(_scoped_call, profiles, _activity_hours_sync, days, start_at, end_at)
 
 
 _MODEL_ROUTE_META: Dict[str, Dict[str, Any]] = {

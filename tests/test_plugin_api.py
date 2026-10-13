@@ -1259,6 +1259,119 @@ class SessionLensApiTests(unittest.TestCase):
         self.assertIn("function ConversationChainsSection({ ctx, period, onOpenSession })", source)
         self.assertIn("jsx(ChainNote, { ctx, sessionId: session.id, profile })", source)
 
+    def test_activity_calendar_covers_a_fixed_year_by_last_active_day(self):
+        connection = sqlite3.connect(self.db_path)
+        # Older than twelve months: outside the calendar however the page period is set.
+        connection.execute(
+            "INSERT INTO sessions (id, source, started_at, last_activity_at, input_tokens, output_tokens) "
+            "VALUES ('ancient', 'cli', ?, ?, 999, 1)",
+            (1_800_000_000 - 400 * 86400, 1_800_000_000 - 400 * 86400 + 60),
+        )
+        connection.commit()
+        connection.close()
+
+        data = api._activity_calendar_sync(now=1_800_000_200)
+        today = datetime.fromtimestamp(1_800_000_200).date()
+        self.assertEqual(data["end"], today.isoformat())
+        self.assertEqual((today - datetime.fromisoformat(data["start"]).date()).days, 364)
+        day = datetime.fromtimestamp(1_800_000_120).date().isoformat()
+        self.assertEqual([row["day"] for row in data["days"]], [day])
+        row = data["days"][0]
+        self.assertEqual(row["sessions"], 1)
+        self.assertEqual(row["total_tokens"], 1750)
+        self.assertAlmostEqual(row["cost_usd"], 0.012)
+        self.assertEqual(row["failures"], 1)  # the permission-denied tool result
+        self.assertEqual(data["totals"]["active_days"], 1)
+        self.assertEqual(data["totals"]["failures"], 1)
+
+    def test_activity_hours_bucket_messages_by_their_own_timestamps(self):
+        connection = sqlite3.connect(self.db_path)
+        # A message an hour later in the same session lands in its own hour, not the start hour.
+        connection.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp, active) VALUES ('session-1', 'assistant', 'later', ?, 1)",
+            (1_800_003_700,),
+        )
+        connection.execute(
+            "INSERT INTO messages (session_id, role, content, timestamp, active) VALUES ('session-1', 'assistant', 'gone', ?, 0)",
+            (1_800_003_700,),
+        )
+        connection.commit()
+        connection.close()
+
+        data = api._activity_hours_sync(0)
+
+        def key(stamp):
+            moment = datetime.fromtimestamp(stamp)
+            return ((moment.weekday() + 1) % 7, moment.hour)
+
+        cells = {(cell["weekday"], cell["hour"]): cell for cell in data["cells"]}
+        start = cells[key(1_800_000_001)]
+        self.assertEqual(start["messages"], 3)  # two user messages and one assistant
+        self.assertEqual(start["tool_calls"], 2)
+        self.assertEqual(start["sessions"], 1)
+        later = cells[key(1_800_003_700)]
+        self.assertEqual((later["messages"], later["tool_calls"], later["sessions"]), (1, 0, 0))
+        self.assertEqual(data["totals"], {"messages": 4, "tool_calls": 2, "sessions": 1})
+        # The period applies to message timestamps.
+        self.assertEqual(api._activity_hours_sync(0, 1_800_003_000, 1_800_004_000)["totals"]["messages"], 1)
+
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        routes = MODULE_PATH.read_text(encoding="utf-8")
+        self.assertIn('@router.get("/activity/calendar")', routes)
+        self.assertIn('@router.get("/activity/hours")', routes)
+        self.assertNotIn("function DailyBars", source)
+        self.assertIn("jsx(ActivityCalendarSection, {", source)
+        self.assertIn("jsx(ActivityHoursSection, { ctx, period })", source)
+        self.assertIn("queryKey: [PLUGIN_ID, 'activity-calendar', activeProfilesParam]", source)
+        self.assertIn("onOpenDay: openDay,", source)
+
+    def test_activity_helpers_shade_by_quartile_and_lay_out_weeks(self):
+        """Run the pure activity helpers under node: quartile levels and the week grid."""
+        import shutil
+        import subprocess
+
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node is not installed")
+        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
+        start = source.index("// ── Activity helpers")
+        end = source.index("// ── End activity helpers")
+        script = source[start:end] + r"""
+const values = [0, 1, 2, 3, 4, 5, 6, 7, 8, 1000]
+const thresholds = activityThresholds(values)
+const columns = activityCalendarColumns('2026-01-01', '2026-01-10', day => (day === '2026-01-05' ? 7 : 0))
+const out = {
+  thresholds,
+  levels: values.map(value => activityLevel(value, thresholds)),
+  empty: activityThresholds([0, 0]),
+  columnCount: columns.length,
+  firstColumn: columns[0].cells.map(cell => (cell ? cell.day : null)),
+  months: columns.map(column => column.month),
+  monday: columns[1].cells[1],
+  share: [0, 1, 25, 100].map(value => activityShareLevel(value, 100)),
+  shortLabel: activityValueLabel(3400000, 'total_tokens', n => `${n / 1e6}M`),
+  labels: [activityValueLabel(1, 'sessions'), activityValueLabel(2, 'failures'), activityValueLabel(0.004, 'cost_usd'), activityValueLabel(12345, 'total_tokens')]
+}
+process.stdout.write(JSON.stringify(out))
+"""
+        copy = Path(self.temp.name) / "activity_helpers.mjs"
+        copy.write_text(script, encoding="utf-8")
+        completed = subprocess.run([node, str(copy)], capture_output=True, text=True, timeout=60)
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        result = json.loads(completed.stdout)
+        self.assertEqual(result["thresholds"], [3, 5, 7])
+        # One runaway value takes the top level alone; it does not flatten the rest.
+        self.assertEqual(result["levels"], [0, 1, 1, 1, 2, 2, 3, 3, 4, 4])
+        self.assertEqual(result["empty"], [0, 0, 0])
+        self.assertEqual(result["columnCount"], 2)
+        # 2026-01-01 is a Thursday: Sunday-first column, four blank cells before it.
+        self.assertEqual(result["firstColumn"], [None, None, None, None, "2026-01-01", "2026-01-02", "2026-01-03"])
+        self.assertEqual(result["months"], ["Jan", ""])
+        self.assertEqual(result["monday"], {"day": "2026-01-05", "value": 7})
+        self.assertEqual(result["share"], [0, 1, 2, 4])
+        self.assertEqual(result["shortLabel"], "3.4M tokens")
+        self.assertEqual(result["labels"], ["1 session", "2 failures", "$0.0040", "12,345 tokens"])
+
     def test_savings_advisor_offers_only_evidenced_cheaper_routes(self):
         from dashboard import _savings as savings_mod
 
