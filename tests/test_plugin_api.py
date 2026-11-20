@@ -5138,7 +5138,7 @@ process.stdout.write(JSON.stringify(out))
         self.assertEqual(api._provider_adapters()["grok"].hosts, ())
 
     def test_nous_card_parses_hermes_published_credits_view(self):
-        lines = ["📈 Account limits", "Provider: nous (Plus)", "Subscription: 40% remaining (60% used) • $6.00 of $10.00 left",
+        lines = ["📈 Account limits", "Nous credits", "Provider: nous (Plus)", "Subscription: 40% remaining (60% used) • $6.00 of $10.00 left",
                  "Subscription credits: $6.00", "Top-up credits: $1.89", "Total usable: $7.89",
                  "Renews: 2026-11-23", "Top up: https://portal.nousresearch.com/topup", "(or run /topup)"]
         card = nous_provider._nous_payload_from_lines(lines)
@@ -5147,7 +5147,7 @@ process.stdout.write(JSON.stringify(out))
         self.assertEqual((balance["kind"], balance["remaining"]), ("balance", 7.89))
         self.assertIn("$1.89 top-up", balance["detail"])
         self.assertEqual(quota["percentage_used"], 60.0)
-        self.assertFalse(any("Top up" in item for item in card["details"]))
+        self.assertFalse(any("Top up" in item or item == "Nous credits" for item in card["details"]))
         self.assertEqual(nous_provider._collect_nous_usage()["status"], "not_configured")
 
     def test_hermes_reported_cards_cover_any_provider_with_a_usage_reader(self):

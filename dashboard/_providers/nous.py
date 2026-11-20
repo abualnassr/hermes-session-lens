@@ -39,7 +39,7 @@ def _nous_payload_from_lines(lines: List[str]) -> Dict[str, Any]:
     renews: Optional[str] = None
     for line in lines:
         clean = line.lstrip("📈").strip().strip("*").strip()
-        if not clean or clean in {"Account limits", "Nous Portal"} or clean.startswith(("Top up", "(or run")):
+        if not clean or clean.lower() in {"account limits", "nous portal", "nous credits"} or clean.startswith(("Top up", "(or run")):
             continue
         provider_match = re.match(r"^Provider:\s*\S+\s*(?:\((?P<plan>[^)]+)\))?", clean)
         if provider_match:
