@@ -3780,7 +3780,13 @@ function TurnsView({ ctx, period, onOpenSession }) {
     return jsx(EmptyState, { title: 'No gateway turns in this period', description: 'Hermes 0.23 and later record one ledger row per gateway turn. Turns run outside the gateway are not in the ledger.' })
   }
   const summary = data.summary
-  const problems = summary.failed + summary.interrupted + summary.partial + (data.problems || []).filter(row => (row.flags || []).includes('iteration cap')).length
+  const problems = summary.problems ?? (summary.failed + summary.interrupted + summary.partial)
+  const problemParts = [
+    summary.interrupted ? `${summary.interrupted} interrupted` : null,
+    summary.failed ? `${summary.failed} failed` : null,
+    summary.partial ? `${summary.partial} partial` : null,
+    summary.iteration_cap ? `${summary.iteration_cap} hit the iteration cap` : null
+  ].filter(Boolean)
   const when = row => formatShortDate(row.at)
   return jsxs('div', {
     style: { display: 'grid', gap: '1.5rem' },
@@ -3789,7 +3795,7 @@ function TurnsView({ ctx, period, onOpenSession }) {
         { label: 'Gateway turns', value: formatCount(summary.turns), detail: `${summary.avg_api_calls} API calls each on average` },
         { label: 'Median turn cost', value: summary.median_cost_usd === null ? '—' : formatCost(summary.median_cost_usd, 'estimated'), detail: `${formatCost(summary.cost_usd, 'estimated')} in the period` },
         { label: 'Turn duration', value: formatDuration(summary.duration_p50_seconds), detail: `p95 ${formatDuration(summary.duration_p95_seconds)}` },
-        { label: 'Turns with a problem', value: formatCount(problems), detail: `${summary.interrupted} interrupted · ${summary.failed} failed`, danger: summary.failed > 0 }
+        { label: 'Turns with a problem', value: formatCount(problems), detail: problemParts.join(' · ') || 'none', danger: summary.failed > 0 }
       ]),
       jsxs('section', {
         children: [
@@ -4080,7 +4086,7 @@ function GatewayHistory({ ctx, period }) {
       jsx(SimpleTable, {
         columns: [
           { key: 'profile', label: 'Profile' },
-          { key: 'running', label: 'Now', render: row => jsx(Pill, { tone: row.running ? 'accent' : 'neutral', children: row.running ? `up ${formatDuration(row.current_uptime_seconds)}` : 'not running' }), sortValue: row => (row.running ? 1 : 0) },
+          { key: 'running', label: 'Now', render: row => jsx(Pill, { tone: row.running || row.served_by_shared_gateway ? 'accent' : 'neutral', children: row.running ? `up ${formatDuration(row.current_uptime_seconds)}` : row.served_by_shared_gateway ? 'served by the shared gateway' : 'not running' }), sortValue: row => (row.running ? 2 : row.served_by_shared_gateway ? 1 : 0) },
           { key: 'starts', label: 'Starts', align: 'right', render: row => `${formatCount(row.starts)} (${formatCount(row.starts_all_time)} all time)`, sortValue: row => row.starts },
           { key: 'median_uptime_seconds', label: 'Typical run', align: 'right', render: row => formatDuration(row.median_uptime_seconds) },
           { key: 'downtime_seconds', label: 'Down between runs', align: 'right', render: row => formatDuration(row.downtime_seconds) },
@@ -4093,7 +4099,7 @@ function GatewayHistory({ ctx, period }) {
           { key: 'started_at', label: 'Started', render: row => formatShortDate(row.started_at), sortValue: row => row.started_at, muted: true },
           { key: 'profile', label: 'Profile' },
           { key: 'pid', label: 'PID', align: 'right', muted: true },
-          { key: 'uptime_seconds', label: 'Ran for', align: 'right', render: row => row.alive ? `${formatDuration(row.uptime_seconds)} (running)` : formatDuration(row.uptime_seconds) },
+          { key: 'uptime_seconds', label: 'Ran for', align: 'right', render: row => row.uptime_seconds === null || row.uptime_seconds === undefined ? '—' : row.alive ? `${formatDuration(row.uptime_seconds)} (running)` : formatDuration(row.uptime_seconds) },
           { key: 'gap_after_seconds', label: 'Down after', align: 'right', render: row => formatDuration(row.gap_after_seconds) }
         ],
         rows: data.timeline

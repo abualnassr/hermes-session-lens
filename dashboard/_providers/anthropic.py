@@ -35,7 +35,8 @@ _ANTHROPIC_BILLING_KEYS = (
 )
 _ANTHROPIC_NO_ROUTE = (
     "Hermes could not read Claude plan limits for this profile: Anthropic gives them only to a full Claude login, "
-    "never to a setup token. Shown instead: what Hermes recorded on Claude."
+    "not a setup token. Run `claude auth login` (or set the Claude Subscription provider's claude_config_dir to a "
+    "logged-in folder). Shown instead: what Hermes recorded on Claude."
 )
 
 

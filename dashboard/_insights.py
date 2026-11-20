@@ -110,7 +110,47 @@ _TURN_FIELDS = (
     ("compression_exhausted", "$.result.compression_exhausted"), ("usage_limit", "$.result.usage_limit"),
     ("error", "$.result.error"), ("user_row", "$.result.persisted_turn.user_row_id"),
     ("final_row", "$.result.persisted_turn.final_assistant_row_id"),
+    # The result's token and cost fields are running totals for the agent that served the session;
+    # the ``usage`` block is this turn alone (input includes cache reads).
+    ("turn_input", "$.usage.input_tokens"), ("turn_output", "$.usage.output_tokens"),
+    ("turn_total", "$.usage.total_tokens"),
 )
+
+
+def _per_turn_figures(rows: List[Dict[str, Any]]) -> None:
+    """Turn the ledger's running totals into per-turn figures, in place.
+
+    Hermes keeps one agent per session across turns, and each turn's result carries that agent's
+    totals so far. A turn continues the previous agent when its total input grew by exactly this
+    turn's own input (the ``usage`` block); otherwise a new agent started (a restart, a model
+    switch) and its totals are this turn's alone.
+    """
+    by_session: Dict[str, List[Dict[str, Any]]] = {}
+    for row in rows:
+        by_session.setdefault(str(row.get("session_id") or ""), []).append(row)
+    for items in by_session.values():
+        items.sort(key=lambda row: (_integer(row.get("user_row")), str(row.get("key"))))
+        previous: Optional[Dict[str, Any]] = None
+        for row in items:
+            total_in = _integer(row.get("input_tokens"))
+            turn_in = row.get("turn_input")
+            continuing = previous is not None and (
+                total_in - _integer(previous.get("input_tokens")) == _integer(turn_in)
+                if turn_in is not None else total_in >= _integer(previous.get("input_tokens"))
+            )
+
+            def delta(name: str, cast: Any) -> Any:
+                current = cast(row.get(name) or 0)
+                if not continuing:
+                    return current
+                return max(cast(0), current - cast(previous.get(name) or 0))
+
+            row["turn_cost"] = delta("cost_usd", float)
+            row["turn_cache_read"] = delta("cache_read_tokens", int)
+            row["turn_input"] = _integer(turn_in) if turn_in is not None else delta("input_tokens", int)
+            row["turn_output"] = _integer(row.get("turn_output")) if row.get("turn_output") is not None else delta("output_tokens", int)
+            row["turn_total"] = _integer(row.get("turn_total")) or row["turn_input"] + row["turn_output"]
+            previous = row
 
 
 def _ledger_rows(connection: sqlite3.Connection) -> List[Dict[str, Any]]:
@@ -182,6 +222,7 @@ def _turns_sync(days: int = 30, start_at: Optional[float] = None, end_at: Option
             sessions = _session_meta(connection, [row.get("session_id") for row in rows])
         finally:
             connection.close()
+        _per_turn_figures(rows)
         for row in rows:
             session = sessions.get(str(row.get("session_id") or "")) or {}
             began = times.get(_integer(row.get("user_row")))
@@ -189,7 +230,6 @@ def _turns_sync(days: int = 30, start_at: Optional[float] = None, end_at: Option
             at = began or finished or _number(session.get("started_at"), None)
             if not _in_period(at, start, end):
                 continue
-            tokens = sum(_integer(row.get(name)) for name in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_write_tokens"))
             turn = {
                 "id": str(row["key"])[len(_LEDGER_PREFIX):][:64],
                 "profile": profile,
@@ -200,11 +240,11 @@ def _turns_sync(days: int = 30, start_at: Optional[float] = None, end_at: Option
                 "duration_seconds": _round(finished - began, 1) if began and finished and finished >= began else None,
                 "model": _clean_text(row.get("model"), 120) or None,
                 "provider": _clean_text(row.get("provider"), 80) or None,
-                "tokens": tokens,
-                "input_tokens": _integer(row.get("input_tokens")),
-                "output_tokens": _integer(row.get("output_tokens")),
-                "cache_read_tokens": _integer(row.get("cache_read_tokens")),
-                "cost_usd": _round(_number(row.get("cost_usd"), 0.0)),
+                "tokens": row["turn_total"],
+                "input_tokens": row["turn_input"],
+                "output_tokens": row["turn_output"],
+                "cache_read_tokens": row["turn_cache_read"],
+                "cost_usd": _round(row["turn_cost"]),
                 "cost_status": _clean_text(row.get("cost_status"), 40) or None,
                 "api_calls": _integer(row.get("api_calls")),
                 "exit_reason": _clean_text(row.get("exit_reason"), 80) or None,
@@ -249,6 +289,8 @@ def _turns_sync(days: int = 30, start_at: Optional[float] = None, end_at: Option
             "failed": sum(1 for turn in turns if "failed" in turn["flags"]),
             "interrupted": sum(1 for turn in turns if "interrupted" in turn["flags"]),
             "partial": sum(1 for turn in turns if "partial" in turn["flags"]),
+            "iteration_cap": sum(1 for turn in turns if "iteration cap" in turn["flags"]),
+            "problems": sum(1 for turn in turns if set(turn["flags"]) & {"failed", "interrupted", "partial", "context full", "usage limit", "iteration cap"}),
             "compacted": sum(1 for turn in turns if turn["flags"] and ("compacted" in turn["flags"] or "context full" in turn["flags"])),
             "cost_usd": round(sum(costs), 4),
             "median_cost_usd": _round(statistics.median(costs)) if costs else None,
@@ -282,10 +324,11 @@ def _prompt_segments(prompt: str) -> List[Dict[str, Any]]:
     """Split a system prompt into labelled parts: headings, banners, the skills index."""
     marks: List[Tuple[int, str]] = [(0, "Identity and preamble")]
     for match in _HEADING_RE.finditer(prompt):
-        marks.append((match.start(), match.group(1).strip()[:60]))
+        label = match.group(1).strip()[:60]
+        marks.append((match.start(), "Skills instructions" if label.lower() == "skills" else label))
     for match in re.finditer(r"^═{6,}\s*\n([A-Z][A-Z /&-]{2,40})", prompt, re.M):
         marks.append((match.start(), match.group(1).strip().title()[:60]))
-    for tag, label in (("<available_skills>", "Skills index"), ("</available_skills>", "After the skills index")):
+    for tag, label in (("<available_skills>", "Skills index"), ("</available_skills>", "Skills instructions")):
         position = prompt.find(tag)
         if position >= 0:
             marks.append((position, label))
@@ -648,6 +691,11 @@ def _cron_job_names(home: Path) -> Dict[str, str]:
     return names
 
 
+def _cron_job_label(names: Mapping[str, str], job_id: str) -> str:
+    """The job's name, or a plain label for a job that is no longer in jobs.json (a removed or one-off job)."""
+    return names.get(job_id) or (f"Removed job · {job_id[:8]}" if job_id else "Unknown job")
+
+
 def _cron_audit(home: Path, start: float, end: Optional[float]) -> Dict[str, Dict[str, Any]]:
     path = home / "cron" / "usage_audit.jsonl"
     totals: Dict[str, Dict[str, Any]] = {}
@@ -713,7 +761,7 @@ def _cron_history_sync(days: int = 30, start_at: Optional[float] = None, end_at:
                     duration = finished - began if began and finished and finished >= began else None
                     job_id = str(row["job_id"] or "")
                     key = (profile, job_id)
-                    item = jobs.setdefault(key, {"profile": profile, "job_id": job_id, "name": names.get(job_id, job_id),
+                    item = jobs.setdefault(key, {"profile": profile, "job_id": job_id, "name": _cron_job_label(names, job_id),
                                                  "runs": 0, "statuses": Counter(), "durations": [], "deliveries": Counter(),
                                                  "last_at": None, "last_status": None, "last_error": None})
                     item["runs"] += 1
@@ -726,7 +774,7 @@ def _cron_history_sync(days: int = 30, start_at: Optional[float] = None, end_at:
                         item["last_at"], item["last_status"] = at, status
                         item["last_error"] = _clean_text(row["error"], 200) or None
                     if len(recent) < 400:
-                        recent.append({"profile": profile, "job_id": job_id, "name": names.get(job_id, job_id), "status": status,
+                        recent.append({"profile": profile, "job_id": job_id, "name": _cron_job_label(names, job_id), "status": status,
                                        "at": at, "duration_seconds": _round(duration, 1),
                                        "delivery": _clean_text(row["delivery_outcome"], 40) or None,
                                        "error": _clean_text(row["error"], 200) or None})
@@ -739,7 +787,7 @@ def _cron_history_sync(days: int = 30, start_at: Optional[float] = None, end_at:
                     open_ = str(row["state"] or "").lower() not in {"resolved", "closed"}
                     if not open_ and not _in_period(last, start, end):
                         continue
-                    incidents.append({"profile": profile, "job_id": row["job_id"], "name": names.get(str(row["job_id"]), row["job_id"]),
+                    incidents.append({"profile": profile, "job_id": row["job_id"], "name": _cron_job_label(names, str(row["job_id"] or "")),
                                       "state": row["state"], "failure_type": row["failure_type"],
                                       "first_seen_at": _iso_epoch(row["first_seen_at"]), "last_seen_at": last,
                                       "closed_at": _iso_epoch(row["closed_at"]), "open": open_,
@@ -748,7 +796,7 @@ def _cron_history_sync(days: int = 30, start_at: Optional[float] = None, end_at:
             connection.close()
         for job_id, totals in audit.items():
             key = (profile, job_id)
-            item = jobs.setdefault(key, {"profile": profile, "job_id": job_id, "name": names.get(job_id, job_id),
+            item = jobs.setdefault(key, {"profile": profile, "job_id": job_id, "name": _cron_job_label(names, job_id),
                                          "runs": 0, "statuses": Counter(), "durations": [], "deliveries": Counter(),
                                          "last_at": None, "last_status": None, "last_error": None})
             item["audit"] = totals
@@ -823,6 +871,13 @@ def _gateway_history_sync(days: int = 30, start_at: Optional[float] = None, end_
                              "started_at": began, "last_heartbeat": last})
         finally:
             connection.close()
+    served: set = set()
+    try:
+        root_state = json.loads((_profile_home_path("default") / "gateway_state.json").read_text(encoding="utf-8"))
+        if isinstance(root_state, dict) and isinstance(root_state.get("served_profiles"), list):
+            served = {str(name) for name in root_state["served_profiles"]}
+    except (OSError, ValueError):
+        served = set()
     runs.sort(key=lambda item: (item["profile"], item["started_at"]))
     by_profile: Dict[str, List[Dict[str, Any]]] = {}
     for run in runs:
@@ -834,7 +889,9 @@ def _gateway_history_sync(days: int = 30, start_at: Optional[float] = None, end_
         downtimes = []
         for index, run in enumerate(items):
             following = items[index + 1] if index + 1 < len(items) else None
-            run["uptime_seconds"] = _round((run["last_heartbeat"] or run["started_at"]) - run["started_at"], 0)
+            # A run that never sent a heartbeat after starting has no measured uptime.
+            beat = run["last_heartbeat"]
+            run["uptime_seconds"] = _round(beat - run["started_at"], 0) if beat and beat - run["started_at"] >= 1 else None
             run["alive"] = following is None and bool(run["last_heartbeat"] and now - run["last_heartbeat"] < _GATEWAY_ALIVE_SECONDS)
             gap = following["started_at"] - run["last_heartbeat"] if following and run["last_heartbeat"] else None
             run["gap_after_seconds"] = _round(gap, 0) if gap is not None and gap > 0 else None
@@ -845,14 +902,17 @@ def _gateway_history_sync(days: int = 30, start_at: Optional[float] = None, end_
                     downtimes.append(run["gap_after_seconds"])
         in_period = [run for run in items if _in_period(run["started_at"], start, end)]
         current = items[-1] if items else None
+        uptimes = [run["uptime_seconds"] for run in in_period if run["uptime_seconds"] is not None]
+        shared = name in served and not (current and current.get("alive"))
         profiles.append({
             "profile": name,
             "starts": len(in_period),
             "starts_all_time": len(items),
             "first_seen": items[0]["started_at"] if items else None,
             "running": bool(current and current.get("alive")),
+            "served_by_shared_gateway": shared,
             "current_uptime_seconds": current["uptime_seconds"] if current and current.get("alive") else None,
-            "median_uptime_seconds": _round(statistics.median([run["uptime_seconds"] for run in in_period]), 0) if in_period else None,
+            "median_uptime_seconds": _round(statistics.median(uptimes), 0) if uptimes else None,
             "downtime_seconds": _round(sum(downtimes), 0),
             "longest_gap_seconds": _round(max(downtimes), 0) if downtimes else None,
         })
@@ -866,7 +926,8 @@ def _gateway_history_sync(days: int = 30, start_at: Optional[float] = None, end_
         "generated_at": now,
         "definition": (
             "Each row of Hermes' gateway_heartbeats table is one gateway run: when it started and its last heartbeat. "
-            "The gap after a run is the time until the next start, when no gateway was running."
+            "The gap after a run is the time until the next start, when no gateway was running. A profile the shared "
+            "(multiplexed) gateway now serves has no runs of its own; its rows are from earlier standalone gateways."
         ),
     }
 

@@ -5230,25 +5230,62 @@ process.stdout.write(JSON.stringify(out))
         now = time.time()
         connection = self._insight_tables()
         connection.execute("INSERT INTO sessions (id, source, title, started_at) VALUES ('t1', 'telegram', 'Ledger session', ?)", (now - 900,))
-        connection.execute("INSERT INTO messages (id, session_id, role, content, timestamp) VALUES (10, 't1', 'user', 'hi', ?)", (now - 600,))
-        connection.execute("INSERT INTO messages (id, session_id, role, content, timestamp) VALUES (11, 't1', 'assistant', 'done', ?)", (now - 540,))
-        result = {"session_id": "t1", "model": "deepseek-flash", "provider": "deepseek", "input_tokens": 1000, "output_tokens": 100,
-                  "cache_read_tokens": 9000, "cache_write_tokens": 0, "estimated_cost_usd": 0.05, "cost_status": "estimated",
-                  "api_calls": 4, "turn_exit_reason": "max_iterations_reached(90/90)", "failed": False, "interrupted": False,
-                  "partial": False, "final_response": "SECRET REPLY TEXT", "messages": [{"content": "SECRET MESSAGE"}],
-                  "persisted_turn": {"user_row_id": 10, "final_assistant_row_id": 11}}
-        connection.execute("INSERT INTO state_meta (key, value) VALUES (?, ?)",
-                           ("gateway.admission.result.v1.abc", json.dumps({"result": result, "usage": {}, "_stored": {"v": 1}})))
+        for row_id, role, at in ((10, "user", 600), (11, "assistant", 540), (20, "user", 300), (21, "assistant", 290), (30, "user", 200), (31, "assistant", 190)):
+            connection.execute("INSERT INTO messages (id, session_id, role, content, timestamp) VALUES (?, 't1', ?, 'x', ?)", (row_id, role, now - at))
+
+        def ledger(key, user_row, final_row, totals, usage, **extra):
+            result = {"session_id": "t1", "model": "deepseek-flash", "provider": "deepseek", "cost_status": "estimated",
+                      "failed": False, "interrupted": False, "partial": False, "final_response": "SECRET REPLY TEXT",
+                      "messages": [{"content": "SECRET MESSAGE"}],
+                      "persisted_turn": {"user_row_id": user_row, "final_assistant_row_id": final_row}, **totals, **extra}
+            connection.execute("INSERT INTO state_meta (key, value) VALUES (?, ?)",
+                               (f"gateway.admission.result.v1.{key}", json.dumps({"result": result, "usage": usage, "_stored": {"v": 1}})))
+
+        # Hermes' result fields are the agent's running totals; usage is the turn alone.
+        ledger("first", 10, 11, {"input_tokens": 10000, "cache_read_tokens": 9000, "output_tokens": 100, "estimated_cost_usd": 0.05, "api_calls": 4},
+               {"input_tokens": 10000, "output_tokens": 100, "total_tokens": 10100}, turn_exit_reason="max_iterations_reached(90/90)")
+        ledger("second", 20, 21, {"input_tokens": 13000, "cache_read_tokens": 11500, "output_tokens": 160, "estimated_cost_usd": 0.07, "api_calls": 1},
+               {"input_tokens": 3000, "output_tokens": 60, "total_tokens": 3060}, turn_exit_reason="text_response(finish_reason=stop)")
+        # A new agent (restart): its totals no longer continue the previous ones.
+        ledger("third", 30, 31, {"input_tokens": 2000, "cache_read_tokens": 1000, "output_tokens": 50, "estimated_cost_usd": 0.01, "api_calls": 1},
+               {"input_tokens": 2000, "output_tokens": 50, "total_tokens": 2050}, turn_exit_reason="text_response(finish_reason=stop)")
         connection.commit()
         connection.close()
         payload = api._turns_sync(7)
-        self.assertEqual(payload["summary"]["turns"], 1)
-        turn = payload["costliest"][0]
-        self.assertEqual((turn["title"], turn["duration_seconds"], turn["api_calls"], turn["tokens"]), ("Ledger session", 60.0, 4, 10100))
-        self.assertEqual(turn["flags"], ["iteration cap"])
-        self.assertEqual(payload["problems"][0]["id"], "abc")
-        serialized = json.dumps(payload)
-        self.assertNotIn("SECRET", serialized)
+        self.assertEqual(payload["summary"]["turns"], 3)
+        self.assertAlmostEqual(payload["summary"]["cost_usd"], 0.08)
+        self.assertEqual((payload["summary"]["problems"], payload["summary"]["iteration_cap"]), (1, 1))
+        turns = {turn["id"]: turn for turn in payload["costliest"]}
+        first, second, third = turns["first"], turns["second"], turns["third"]
+        self.assertEqual((first["title"], first["duration_seconds"], first["api_calls"], first["tokens"], first["cost_usd"]),
+                         ("Ledger session", 60.0, 4, 10100, 0.05))
+        self.assertEqual((second["tokens"], second["cost_usd"], second["cache_read_tokens"]), (3060, 0.02, 2500))
+        self.assertEqual((third["tokens"], third["cost_usd"]), (2050, 0.01))
+        self.assertEqual(first["flags"], ["iteration cap"])
+        self.assertEqual(payload["problems"][0]["id"], "first")
+        self.assertNotIn("SECRET", json.dumps(payload))
+
+    def test_insight_labels_for_skills_removed_jobs_and_shared_gateway_profiles(self):
+        labels = [segment["label"] for segment in api._prompt_segments(
+            "Hi.\n## Skills\nScan them.\n<available_skills>\n  - a: b\n</available_skills>\nAfter.\n# Next\nx\n")]
+        self.assertIn("Skills index", labels)
+        self.assertIn("Skills instructions", labels)
+        self.assertNotIn("Skills", labels)
+        self.assertNotIn("After the skills index", labels)
+        self.assertEqual(api._cron_job_label({"j1": "Daily"}, "j1"), "Daily")
+        self.assertEqual(api._cron_job_label({}, "ec77a14d21ad"), "Removed job · ec77a14d")
+        now = time.time()
+        connection = self._insight_tables()
+        for backend, profile, started, last in (("d1", "default", now - 600, now - 5), ("s1", "solo", now - 9000, now - 9000)):
+            connection.execute("INSERT INTO gateway_heartbeats VALUES (?, 1, ?, ?, ?, 'host')", (backend, started, last, profile))
+        connection.commit()
+        connection.close()
+        (self.home / "gateway_state.json").write_text(json.dumps({"served_profiles": ["default", "solo"]}), encoding="utf-8")
+        profiles = {item["profile"]: item for item in api._gateway_history_sync(7)["profiles"]}
+        self.assertTrue(profiles["default"]["running"])
+        self.assertEqual((profiles["solo"]["running"], profiles["solo"]["served_by_shared_gateway"]), (False, True))
+        self.assertIsNone(profiles["solo"]["median_uptime_seconds"])
+        self.assertIn("Run `claude auth login`", anthropic_provider._ANTHROPIC_NO_ROUTE)
 
     def test_prompt_weight_splits_the_prompt_and_finds_rarely_used_skills(self):
         now = time.time()
