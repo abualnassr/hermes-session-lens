@@ -10,6 +10,7 @@ import sqlite3
 import sys
 import tempfile
 import time
+import types
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -34,6 +35,8 @@ from dashboard import _routes as api
 from dashboard import _services as services
 from dashboard import _rules as rules_mod
 from dashboard._providers import shared as provider_shared
+from dashboard._providers import anthropic as anthropic_provider
+from dashboard._providers import nous as nous_provider
 
 import contextlib
 
@@ -664,29 +667,6 @@ class SessionLensApiTests(unittest.TestCase):
         finally:
             os.environ["HERMES_HOME"] = str(self.home)
 
-    def test_nous_card_names_a_rejected_login_instead_of_no_login(self):
-        from dashboard._providers import nous as nous_mod
-
-        account = SimpleNamespace(logged_in=False)
-        nous_account = SimpleNamespace(get_nous_portal_account_info=lambda force_fresh=False: account)
-        broken = {"last_auth_error": {"provider": "nous", "message": "Invalid refresh token"}}
-        auth = SimpleNamespace(get_provider_auth_state=lambda provider: broken if provider == "nous" else {})
-        modules = {
-            "hermes_cli": SimpleNamespace(nous_account=nous_account, auth=auth),
-            "hermes_cli.nous_account": nous_account,
-            "hermes_cli.auth": auth,
-            "agent": SimpleNamespace(),
-            "agent.account_usage": SimpleNamespace(build_nous_credits_snapshot=lambda account: None),
-        }
-        with patch.dict(sys.modules, modules):
-            self.assertTrue(nous_mod._probe_nous())
-            card = nous_mod._collect_nous_usage()
-            self.assertEqual(card["status"], "expired")
-            self.assertIn("Invalid refresh token", card["message"])
-            broken.clear()
-            self.assertFalse(nous_mod._probe_nous())
-            self.assertEqual(nous_mod._collect_nous_usage()["status"], "not_configured")
-
     def test_nous_top_up_command_hint_is_muted(self):
         kept, muted = api._split_noise_details(
             ["Top up at https://portal.nousresearch.com/billing", "(or run /topup)", "Plan: Free"]
@@ -799,7 +779,7 @@ class SessionLensApiTests(unittest.TestCase):
         os.environ["HIVE_CREDIT_REMAINING"] = "49.926"
         try:
             card = hive._collect_hive()
-            self.assertEqual(card["windows"][0]["label"], "Credit (kept in .env)")
+            self.assertEqual(card["windows"][0]["label"], "Credit (kept as a Hermes setting)")
             self.assertEqual(card["windows"][0]["remaining"], 49.926)
             os.environ.pop("HIVE_CREDIT_REMAINING")
             self.assertEqual(hive._collect_hive()["windows"], [])
@@ -1547,26 +1527,6 @@ process.stdout.write(JSON.stringify(out))
         self.assertEqual(completed.returncode, 0, completed.stderr[-2000:])
         self.assertEqual(completed.stdout.strip().splitlines()[-1], "True True []")
 
-    def test_copilot_is_listed_by_key_presence_without_its_cli_resolver(self):
-        def resolver(provider_id, _config):
-            if provider_id == "copilot":
-                raise AssertionError("the Copilot resolver may run `gh auth token`")
-            return ("sk-test", "env")
-
-        auth = SimpleNamespace(
-            PROVIDER_REGISTRY={
-                "copilot": SimpleNamespace(auth_type="api_key", api_key_env_vars=("COPILOT_GITHUB_TOKEN", "GH_TOKEN")),
-                "deepseek": SimpleNamespace(auth_type="api_key", api_key_env_vars=("DEEPSEEK_API_KEY",)),
-            },
-            _resolve_api_key_provider_secret=resolver,
-        )
-        package = SimpleNamespace(auth=auth)
-        with patch.dict(sys.modules, {"hermes_cli": package, "hermes_cli.auth": auth}):
-            with patch.dict(os.environ, {"GH_TOKEN": ""}, clear=False):
-                self.assertEqual(hermes_compat._hermes_configured_provider_ids(), ["deepseek"])
-            with patch.dict(os.environ, {"GH_TOKEN": "gho_x"}, clear=False):
-                self.assertEqual(hermes_compat._hermes_configured_provider_ids(), ["copilot", "deepseek"])
-
     def test_collector_threads_inherit_the_request_context(self):
         import contextvars
         from concurrent.futures import ThreadPoolExecutor
@@ -2306,7 +2266,7 @@ process.stdout.write(JSON.stringify(out))
         # The definition plus the Overview and AI Usage call sites.
         self.assertEqual(source.count("digestExportItem(ctx, period)"), 3)
         # The views that gained a period-stamped filename receive the period from the page.
-        self.assertIn("function AIUsageView({ ctx, query, servicesQuery, narrow, refreshError, history, ledger, onRefreshProvider, onRefreshService, onDrill, budgets, onBudgetsChange, period })", source)
+        self.assertIn("function AIUsageView({ ctx, query, servicesQuery, narrow, refreshError, history, ledger, onRefreshProvider, onRefreshService, onDrill, budgets, onBudgetsChange, period, picker })", source)
         self.assertIn("function AIModelsView({ query, quotaQuery, narrow, refreshError, onDrill, period, ctx })", source)
         self.assertEqual(source.count("jsx(AIUsageView, {\n    period,"), 1)
         self.assertEqual(source.count("jsx(AIModelsView, {\n    ctx,\n    period,"), 1)
@@ -2678,16 +2638,13 @@ process.stdout.write(JSON.stringify(out))
 
         fake_config = types.ModuleType("hermes_cli.config")
         fake_config.load_config_readonly = lambda: {
-            "plugins": {"entries": {"session-lens": {"settings": {"rate_sample_threshold": 7, "anthropic_usage_probe": False}}}}
+            "plugins": {"entries": {"session-lens": {"settings": {"rate_sample_threshold": 7}}}}
         }
         fake_pkg = types.ModuleType("hermes_cli")
         fake_pkg.config = fake_config
         with patch.dict(sys.modules, {"hermes_cli": fake_pkg, "hermes_cli.config": fake_config}):
-            self.assertEqual(hermes_compat._plugin_settings(), {"rate_sample_threshold": 7, "anthropic_usage_probe": False})
+            self.assertEqual(hermes_compat._plugin_settings(), {"rate_sample_threshold": 7})
             self.assertEqual(api._rate_sample_threshold(), 7)
-            from dashboard._providers import anthropic as anthropic_provider
-
-            self.assertFalse(anthropic_provider._anthropic_probe_enabled())
         # Legacy "config" block and a missing entry both stay quiet.
         fake_config.load_config_readonly = lambda: {"plugins": {"entries": {"session-lens": {"config": {"rate_sample_threshold": 3}}}}}
         with patch.dict(sys.modules, {"hermes_cli": fake_pkg, "hermes_cli.config": fake_config}):
@@ -2955,33 +2912,6 @@ process.stdout.write(JSON.stringify(out))
         grouped = next(entry for entry in entries if len(entry["ids"]) == 4)
         self.assertIn("(+3 endpoints on the same key)", grouped["label"])
         self.assertEqual(sorted(grouped["ids"]), ["alibaba", "alibaba-cn", "dashscope", "dashscope-cn"])
-
-    def test_nous_card_leads_with_a_usable_credits_balance(self):
-        from types import SimpleNamespace
-
-        account = SimpleNamespace(
-            logged_in=True,
-            paid_service_access_info=SimpleNamespace(total_usable_credits=7.89, subscription_credits_remaining=0.0, purchased_credits_remaining=7.89),
-            subscription=SimpleNamespace(current_period_end="2026-09-23T09:39:46.000Z", plan="Free"),
-        )
-        base = api._provider_payload(
-            "nous", status="ok",
-            details=["Subscription credits: $0.00", "Top-up credits: $7.89", "Total usable: $7.89",
-                     "Renews: 2026-09-23T09:39:46.000Z", "Top up: https://portal.nousresearch.com/orgs/x/billing", "(or run /topup)"],
-        )
-        card = api._nous_with_balance(base, account)
-        self.assertEqual(card["windows"][0]["label"], "Usable credits")
-        self.assertEqual(card["windows"][0]["kind"], "balance")
-        self.assertEqual(card["windows"][0]["remaining"], 7.89)
-        self.assertIn("$7.89 top-up", card["windows"][0]["detail"])
-        self.assertIn("renews Sep 23, 2026", card["windows"][0]["detail"])
-        self.assertEqual(card["details"], [])
-        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
-        self.assertIn("function ProviderWindows({ provider, history, ledger, onDrill })", source)
-        self.assertIn("Rate limits per minute: ", source)
-        self.assertIn("Untouched: ", source)
-        self.assertIn("Number(row.share_percent) >= 0.5", source)
-        self.assertIn("summary.next_reset_provider", source)
 
     def test_quota_forecast_needs_a_margin_and_names_its_basis(self):
         now = time.time()
@@ -3396,106 +3326,6 @@ process.stdout.write(JSON.stringify(out))
         self.assertIn("[redacted]", payload["details"][0])
         self.assertNotIn("must-not-leak", json.dumps(payload))
 
-    def test_grok_windows_map_weekly_and_extra_credit_envelopes(self):
-        windows = api._grok_windows_from_payloads(
-            {
-                "config": {
-                    "creditUsagePercent": 42.5,
-                    "currentPeriod": {"end": "2027-01-20T12:00:00Z"},
-                }
-            },
-            {
-                "config": {
-                    "monthlyLimit": {"val": 5000},
-                    "used": {"val": 1250},
-                    "billingPeriodEnd": "2027-02-01T00:00:00Z",
-                }
-            },
-        )
-        self.assertEqual(len(windows), 2)
-        self.assertEqual(windows[0]["percentage_remaining"], 57.5)
-        self.assertEqual(windows[1]["limit"], 50.0)
-        self.assertEqual(windows[1]["used"], 12.5)
-        self.assertEqual(windows[1]["remaining"], 37.5)
-        self.assertEqual(windows[1]["unit"], "credits")
-
-    def test_grok_card_extras_name_tier_topup_and_where_resets_live(self):
-        plan, details, links = api._grok_card_extras({"config": {}}, {})
-        self.assertIsNone(plan)
-        self.assertIn("Auto top-up: not set up.", details)
-        self.assertFalse(any("reset" in item.lower() for item in details))
-        self.assertEqual(links, [])
-
-        plan, details, _links = api._grok_card_extras(
-            {"config": {}, "subscription_tier": "SuperGrok"},
-            {"rule": {"enabled": True, "topupAmount": {"val": 2000}, "minBeforeHittingSl": {"val": 500}, "maxAmountPerMonth": {"val": 10000}}},
-        )
-        self.assertEqual(plan, "SuperGrok")
-        self.assertIn("Auto top-up: on — adds $20.00 when the balance falls below $5.00 (at most $100.00 per month)", details)
-
-        # No top-up response at all (request failed): no claim either way.
-        _plan, details, _links = api._grok_card_extras({"config": {}}, None)
-        self.assertFalse(any(item.startswith("Auto top-up") for item in details))
-
-        # Links are sanitised by the payload builder: only https, label required.
-        payload = api._provider_payload(
-            "grok", status="ok", links=[{"label": "ok", "url": "https://grok.com/?_s=usage"}, {"label": "", "url": "https://x"}, {"label": "bad", "url": "javascript:alert(1)"}]
-        )
-        self.assertEqual(payload["links"], [{"label": "ok", "url": "https://grok.com/?_s=usage"}])
-        source = (MODULE_PATH.parents[1] / "desktop" / "plugin.js").read_text(encoding="utf-8")
-        self.assertIn("provider.links?.length", source)
-        self.assertIn("openExternalLink(ctx, link.url)", source)
-        self.assertIn("function UsageProvider({ ctx, provider, history, ledger, onRefresh, onDrill })", source)
-
-    def test_grok_missing_percent_in_a_confirmed_weekly_period_is_zero_used(self):
-        # The exact shape xAI returned on 2026-09-04 for a unified-billing account:
-        # protobuf JSON drops zero-valued fields, so creditUsagePercent is absent.
-        weekly = {
-            "config": {
-                "currentPeriod": {
-                    "type": "USAGE_PERIOD_TYPE_WEEKLY",
-                    "start": "2026-09-03T23:42:49.371354+00:00",
-                    "end": "2026-09-10T23:42:49.371354+00:00",
-                },
-                "onDemandCap": {"val": 0},
-                "onDemandUsed": {"val": 0},
-                "isUnifiedBillingUser": True,
-                "prepaidBalance": {"val": 0},
-                "topUpMethod": "TOP_UP_METHOD_SAVED_PAYMENT_METHOD",
-                "billingPeriodStart": "2026-09-03T23:42:49.371354+00:00",
-                "billingPeriodEnd": "2026-09-10T23:42:49.371354+00:00",
-            }
-        }
-        monthly = {
-            "config": {
-                "monthlyLimit": {"val": 0},
-                "used": {"val": 0},
-                "billingPeriodEnd": "2026-10-01T00:00:00+00:00",
-            }
-        }
-        windows = api._grok_windows_from_payloads(weekly, monthly)
-        self.assertEqual(len(windows), 1)
-        self.assertEqual(windows[0]["label"], "Weekly allowance")
-        self.assertEqual(windows[0]["percentage_used"], 0.0)
-        self.assertEqual(windows[0]["percentage_remaining"], 100.0)
-        self.assertIn("No usage recorded in this period yet", windows[0]["detail"])
-        self.assertTrue(windows[0]["reset_at"].startswith("2026-09-10"))
-
-        # A purchased balance becomes its own window.
-        weekly["config"]["prepaidBalance"] = {"val": 1500}
-        windows = api._grok_windows_from_payloads(weekly, monthly)
-        self.assertEqual(len(windows), 2)
-        self.assertEqual(windows[1]["label"], "Prepaid credits")
-        self.assertEqual(windows[1]["kind"], "balance")
-        self.assertEqual(windows[1]["remaining"], 15.0)
-
-        # No percentage and no weekly period is still unknown, never a guess.
-        self.assertEqual(api._grok_windows_from_payloads({"config": {"isUnifiedBillingUser": True}}, monthly), [])
-        self.assertEqual(
-            api._grok_windows_from_payloads({"config": {"currentPeriod": {"type": "USAGE_PERIOD_TYPE_MONTHLY", "end": "2026-10-01T00:00:00+00:00"}}}, monthly),
-            [],
-        )
-
     def test_openrouter_keeps_key_usage_when_account_credits_need_management_key(self):
         payload = api._openrouter_payload(
             {
@@ -3601,305 +3431,6 @@ process.stdout.write(JSON.stringify(out))
         self.assertEqual(payload["windows"][0]["percentage_remaining"], 85.0)
         self.assertEqual(payload["windows"][0]["unit"], "tokens")
         self.assertIn("2027", payload["windows"][0]["reset_at"])
-
-    def test_anthropic_usage_payload_mirrors_hermes_window_parsing(self):
-        from dashboard._providers import anthropic as anthropic_provider
-
-        payload = anthropic_provider._anthropic_usage_payload(
-            {
-                "five_hour": {"utilization": 0.42, "resets_at": "2027-01-15T21:00:00+00:00"},
-                "seven_day": {"utilization": 25, "resets_at": "2027-01-19T07:00:00+00:00"},
-                "extra_usage": {"is_enabled": True, "used_credits": 1.5, "monthly_limit": 20, "currency": "USD"},
-            }
-        )
-        self.assertEqual(payload["status"], "ok")
-        self.assertEqual(
-            [(w["label"], w["percentage_used"]) for w in payload["windows"]],
-            [("Current session", 42.0), ("Current week", 25.0)],
-        )
-        self.assertEqual(payload["details"], ["Extra usage: 1.50 / 20.00 USD"])
-
-    _ANTHROPIC_UNIFIED_HEADERS = {
-        "anthropic-ratelimit-unified-status": "allowed",
-        "anthropic-ratelimit-unified-5h-utilization": "0.14",
-        "anthropic-ratelimit-unified-5h-reset": "1790000000",
-        "anthropic-ratelimit-unified-7d-utilization": "0.17",
-        "anthropic-ratelimit-unified-7d-reset": "1790400000",
-        "anthropic-ratelimit-unified-overage-status": "rejected",
-        "anthropic-ratelimit-unified-overage-disabled-reason": "org_level_disabled",
-        "anthropic-organization-id": "org-max",
-    }
-    _ANTHROPIC_CONSOLE_HEADERS = {
-        "anthropic-ratelimit-requests-limit": "10000",
-        "anthropic-ratelimit-requests-remaining": "9999",
-        "anthropic-ratelimit-requests-reset": "2027-01-15T21:00:30Z",
-        "anthropic-ratelimit-input-tokens-limit": "10000000",
-        "anthropic-ratelimit-input-tokens-remaining": "10000000",
-        "anthropic-ratelimit-input-tokens-reset": "2027-01-15T21:00:30Z",
-        "anthropic-ratelimit-output-tokens-limit": "2000000",
-        "anthropic-ratelimit-output-tokens-remaining": "2000000",
-        "anthropic-ratelimit-output-tokens-reset": "2027-01-15T21:00:30Z",
-        "anthropic-ratelimit-tokens-limit": "12000000",
-        "anthropic-ratelimit-tokens-remaining": "12000000",
-        "anthropic-ratelimit-tokens-reset": "2027-01-15T21:00:30Z",
-        "anthropic-organization-id": "org-console",
-    }
-
-    @contextlib.contextmanager
-    def _anthropic_sources(self, env=(), resolver="", pool=(), probe_enabled=True):
-        """Stub every read-only Anthropic credential source and clear the probe cache."""
-        from dashboard._providers import anthropic as anthropic_provider
-
-        anthropic_provider._anthropic_probe_cache.clear()
-        provider_shared._set_collect_fresh(False)
-        with patch.object(anthropic_provider, "_anthropic_env_credentials", return_value=list(env)):
-            with patch.object(anthropic_provider, "_resolve_anthropic_oauth", return_value=(resolver, bool(resolver))):
-                with patch.object(anthropic_provider, "_anthropic_pool_oauth_accounts", return_value=list(pool)):
-                    with patch.object(anthropic_provider, "_anthropic_probe_enabled", return_value=probe_enabled):
-                        yield anthropic_provider
-
-    def test_anthropic_setup_token_reads_subscription_windows_from_message_headers(self):
-        oat = "sk-ant-oat01-setup-token"
-        with self._anthropic_sources(env=[("CLAUDE_CODE_OAUTH_TOKEN", oat)], resolver=oat) as ap:
-            with patch.object(ap, "_collect_anthropic_direct") as direct:
-                with patch.object(
-                    ap, "_anthropic_probe_request", return_value=(200, dict(self._ANTHROPIC_UNIFIED_HEADERS), {"id": "msg"})
-                ) as probe:
-                    result = ap._collect_anthropic_usage()
-        direct.assert_not_called()  # a setup token never touches /api/oauth/usage (403 there is expected)
-        probe.assert_called_once_with(oat, "subscription")
-        self.assertEqual(result["status"], "ok")
-        self.assertEqual(result["provider"], "anthropic")
-        self.assertEqual(result["label"], "Anthropic Claude")
-        self.assertEqual(result["plan"], "Claude subscription")
-        self.assertIn("CLAUDE_CODE_OAUTH_TOKEN", result["auth_source"])
-        self.assertEqual(
-            [(window["label"], window["percentage_used"]) for window in result["windows"]],
-            [("Current session", 14.0), ("Current week", 17.0)],
-        )
-        self.assertTrue(result["windows"][0]["reset_at"].startswith("2026"))
-        self.assertIn("Extra usage: off (org_level_disabled)", result["details"])
-        self.assertIsNone(result["message"])
-        self.assertNotIn("extra_accounts", result)
-        self.assertNotIn("Sign in with Claude", json.dumps(result))
-
-        # Claude Code identity rides on the OAuth lane only; an API key is plain x-api-key.
-        headers = ap._anthropic_probe_headers(oat, "subscription")
-        self.assertTrue(headers["Authorization"].startswith("Bearer "))
-        self.assertTrue(headers["user-agent"].startswith("claude-code/"))
-        self.assertIn("oauth-2025-04-20", headers["anthropic-beta"])
-        self.assertEqual(headers["anthropic-version"], "2023-06-01")
-        key_headers = ap._anthropic_probe_headers("sk-ant-api03-key", "api_key")
-        self.assertEqual(key_headers["x-api-key"], "sk-ant-api03-key")
-        self.assertNotIn("user-agent", key_headers)
-        self.assertNotIn("Authorization", key_headers)
-        body = ap._anthropic_probe_body("subscription")
-        self.assertEqual(body["max_tokens"], 1)
-        self.assertEqual(body["messages"], [{"role": "user", "content": "."}])
-        self.assertIn("Claude Code", body["system"][0]["text"])
-        self.assertNotIn("system", ap._anthropic_probe_body("api_key"))
-
-    def test_anthropic_console_key_reads_per_minute_rate_limits(self):
-        key = "sk-ant-api03-console-key"
-        with self._anthropic_sources(env=[("ANTHROPIC_API_KEY", key)], resolver=key) as ap:
-            with patch.object(
-                ap, "_anthropic_probe_request", return_value=(200, dict(self._ANTHROPIC_CONSOLE_HEADERS), {})
-            ) as probe:
-                result = ap._collect_anthropic_usage()
-        probe.assert_called_once_with(key, "api_key")
-        self.assertEqual(result["status"], "ok")
-        self.assertEqual(result["provider"], "anthropic")
-        self.assertEqual(result["label"], "Anthropic API (console)")
-        self.assertEqual(result["plan"], "Pay per token")
-        self.assertNotIn("Max", json.dumps(result))
-        windows = {window["label"]: window for window in result["windows"]}
-        self.assertEqual(
-            set(windows),
-            {"Requests per minute", "Input tokens per minute", "Output tokens per minute", "Tokens per minute"},
-        )
-        requests = windows["Requests per minute"]
-        self.assertEqual(requests["kind"], "rate_limit")
-        self.assertEqual(
-            (requests["limit"], requests["remaining"], requests["used"], requests["unit"]),
-            (10000.0, 9999.0, 1.0, "requests"),
-        )
-        self.assertAlmostEqual(requests["percentage_used"], 0.01)
-        self.assertIn("2027", requests["reset_at"])
-        self.assertEqual(windows["Input tokens per minute"]["unit"], "tokens")
-        self.assertTrue(any("Admin API key" in line for line in result["details"]))
-
-    def test_anthropic_subscription_and_console_key_become_two_cards(self):
-        oat, key = "sk-ant-oat01-setup", "sk-ant-api03-key"
-        responses = {
-            oat: (200, dict(self._ANTHROPIC_UNIFIED_HEADERS), {}),
-            key: (200, dict(self._ANTHROPIC_CONSOLE_HEADERS), {}),
-        }
-        with self._anthropic_sources(
-            env=[("CLAUDE_CODE_OAUTH_TOKEN", oat), ("ANTHROPIC_API_KEY", key)], resolver=oat
-        ) as ap:
-            with patch.object(ap, "_anthropic_probe_request", side_effect=lambda token, kind: responses[token]) as probe:
-                result = ap._collect_anthropic_usage()
-        self.assertEqual(probe.call_count, 2)
-        self.assertEqual(result["provider"], "anthropic")
-        self.assertEqual(result["label"], "Anthropic Claude")
-        extras = result["extra_accounts"]
-        self.assertEqual(len(extras), 1)
-        self.assertEqual(extras[0]["provider"], "anthropic:1")
-        self.assertEqual(extras[0]["base_provider"], "anthropic")
-        self.assertTrue(extras[0]["account_extra"])
-        self.assertEqual(extras[0]["label"], "Anthropic API (console)")
-        self.assertEqual(extras[0]["status"], "ok")
-        self.assertNotIn("organization_id", result)
-        self.assertNotIn("organization_id", extras[0])
-
-        # A second credential for the SAME organisation is one card, not two.
-        twin = "sk-ant-oat01-same-org-twin"
-        with self._anthropic_sources(env=[("ANTHROPIC_TOKEN", oat), ("CLAUDE_CODE_OAUTH_TOKEN", twin)], resolver=oat) as ap:
-            with patch.object(
-                ap, "_anthropic_probe_request", return_value=(200, dict(self._ANTHROPIC_UNIFIED_HEADERS), {})
-            ):
-                result = ap._collect_anthropic_usage()
-        self.assertEqual(result["status"], "ok")
-        self.assertNotIn("extra_accounts", result)
-
-    def test_anthropic_full_login_tries_usage_endpoint_then_falls_back_to_headers(self):
-        pool = [{"label": "work", "token": "sk-ant-oat01-pool-login"}]
-        forbidden = api._provider_payload("anthropic", status="forbidden", message="HTTP 403")
-        okay = api._provider_payload(
-            "anthropic", status="ok", windows=[api._usage_window("Current week", used_percent=25)]
-        )
-        expired = api._provider_payload("anthropic", status="expired", message="expired")
-
-        # 403 (no user:profile scope): fall through to the header probe.
-        with self._anthropic_sources(pool=pool) as ap:
-            with patch.object(ap, "_collect_anthropic_direct", return_value=dict(forbidden)) as direct:
-                with patch.object(
-                    ap, "_anthropic_probe_request", return_value=(200, dict(self._ANTHROPIC_UNIFIED_HEADERS), {})
-                ) as probe:
-                    result = ap._collect_anthropic_usage()
-        direct.assert_called_once_with("sk-ant-oat01-pool-login")
-        probe.assert_called_once()
-        self.assertEqual(result["status"], "ok")
-        self.assertEqual(result["account"], "work")
-        self.assertEqual(result["auth_source"], "Hermes OAuth login")
-
-        # The usage endpoint answering is the whole story: no message is sent.
-        with self._anthropic_sources(pool=pool) as ap:
-            with patch.object(ap, "_collect_anthropic_direct", return_value=dict(okay)):
-                with patch.object(ap, "_anthropic_probe_request") as probe:
-                    result = ap._collect_anthropic_usage()
-        probe.assert_not_called()
-        self.assertEqual(result["status"], "ok")
-
-        # An expired login is expired on both paths; no probe either.
-        with self._anthropic_sources(pool=pool) as ap:
-            with patch.object(ap, "_collect_anthropic_direct", return_value=dict(expired)):
-                with patch.object(ap, "_anthropic_probe_request") as probe:
-                    result = ap._collect_anthropic_usage()
-        probe.assert_not_called()
-        self.assertEqual(result["status"], "expired")
-
-        # Hermes' delegated fetch returning nothing is not "no Anthropic usage".
-        nothing = api._provider_payload("anthropic", status="unavailable", message="Hermes returned None")
-        with self._anthropic_sources(pool=[{"label": "work", "token": "sk-ant-oat01-pool-login"}]) as ap:
-            with patch.object(ap, "_collect_anthropic_direct", return_value=dict(nothing)):
-                with patch.object(
-                    ap, "_anthropic_probe_request", return_value=(200, dict(self._ANTHROPIC_UNIFIED_HEADERS), {})
-                ):
-                    result = ap._collect_anthropic_usage()
-        self.assertEqual(result["status"], "ok")
-        self.assertEqual(result["auth_source"], "Hermes OAuth login")
-        # Claude Code's own login store is never read (catalog review).
-        dashboard_source = "".join(path.read_text(encoding="utf-8") for path in (MODULE_PATH.parent).rglob("*.py"))
-        self.assertNotIn("read_claude_code_credentials", dashboard_source)
-
-    def test_anthropic_probe_outcomes_are_cached_and_rate_limits_are_not_retried(self):
-        oat = "sk-ant-oat01-setup"
-        limited = (429, {"retry-after": "30"}, {"error": {"type": "rate_limit_error", "message": "slow down"}})
-        with self._anthropic_sources(env=[("CLAUDE_CODE_OAUTH_TOKEN", oat)]) as ap:
-            with patch.object(ap, "_anthropic_probe_request", return_value=limited) as probe:
-                first = ap._collect_anthropic_usage()
-                second = ap._collect_anthropic_usage()
-                provider_shared._set_collect_fresh(True)
-                try:
-                    third = ap._collect_anthropic_usage()
-                finally:
-                    provider_shared._set_collect_fresh(False)
-        self.assertEqual(first["status"], "unavailable")
-        self.assertIn("429", first["message"])
-        self.assertEqual(probe.call_count, 2)  # cached until the TTL; a manual refresh re-probes
-        self.assertIn("probe_cached_at", second)
-        self.assertNotIn("probe_cached_at", third)
-
-        # A 429 that still carries the headers is a reading, not a failure.
-        card = ap._anthropic_probe_card("subscription", 429, dict(self._ANTHROPIC_UNIFIED_HEADERS), {})
-        self.assertEqual(card["status"], "ok")
-        self.assertTrue(any("HTTP 429" in line for line in card["details"]))
-        # 401 is expired; 403 without headers is forbidden with Anthropic's own reason.
-        self.assertEqual(ap._anthropic_probe_card("subscription", 401, {}, {})["status"], "expired")
-        denied = ap._anthropic_probe_card("api_key", 403, {}, {"error": {"message": "permission denied"}})
-        self.assertEqual((denied["status"], denied["message"]), ("forbidden", "permission denied"))
-        # A 400 with no headers (e.g. out of extra usage) states Anthropic's reason.
-        bad = ap._anthropic_probe_card("subscription", 400, {}, {"error": {"message": "out of extra usage"}})
-        self.assertEqual(bad["status"], "unavailable")
-        self.assertIn("out of extra usage", bad["message"])
-
-    def test_anthropic_probe_can_be_turned_off_in_settings(self):
-        oat = "sk-ant-oat01-setup"
-        pool = [{"label": "work", "token": "sk-ant-oat01-pool"}]
-        okay = api._provider_payload(
-            "anthropic", status="ok", windows=[api._usage_window("Current week", used_percent=25)]
-        )
-        with self._anthropic_sources(env=[("CLAUDE_CODE_OAUTH_TOKEN", oat)], pool=pool, probe_enabled=False) as ap:
-            with patch.object(ap, "_collect_anthropic_direct", return_value=dict(okay)) as direct:
-                with patch.object(ap, "_anthropic_probe_request") as probe:
-                    result = ap._collect_anthropic_usage()
-        probe.assert_not_called()
-        direct.assert_called_once_with("sk-ant-oat01-pool")
-        # The full login still answers through the usage endpoint and leads the cards ...
-        self.assertEqual(result["status"], "ok")
-        self.assertEqual(result["auth_source"], "Hermes OAuth login")
-        # ... while the setup token says plainly why it has no reading.
-        off = result["extra_accounts"][0]
-        self.assertEqual(off["status"], "not_configured")
-        self.assertIn("anthropic_usage_probe", off["message"])
-
-        from dashboard._providers import anthropic as anthropic_provider
-
-        for value, expected in (({}, False), ({"anthropic_usage_probe": "off"}, False), ({"anthropic_usage_probe": False}, False), ({"anthropic_usage_probe": "yes"}, True)):
-            with patch.object(anthropic_provider, "_plugin_settings", return_value=value):
-                self.assertEqual(anthropic_provider._anthropic_probe_enabled(), expected, value)
-
-    def test_anthropic_credential_inventory_classifies_and_deduplicates(self):
-        env = [
-            ("ANTHROPIC_TOKEN", "not-an-anthropic-token"),
-            ("ANTHROPIC_API_KEY", "sk-ant-api03-k"),
-            ("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-s"),
-        ]
-        pool = [{"label": "w", "token": "eyJ-jwt"}, {"label": "x", "token": "sk-ant-admin01-a"}]
-        with self._anthropic_sources(env=env, resolver="sk-ant-oat01-s", pool=pool) as ap:
-            creds = ap._anthropic_credentials()
-        self.assertEqual(
-            [(item["kind"], item["source"], item["usage_endpoint"]) for item in creds],
-            [
-                ("api_key", "API key (ANTHROPIC_API_KEY)", False),
-                ("subscription", "OAuth token (CLAUDE_CODE_OAUTH_TOKEN)", False),
-                ("subscription", "Hermes OAuth login", True),
-                ("admin", "Hermes OAuth login", True),
-            ],
-        )
-        # Only an Admin key: nothing to probe, and the card says so.
-        with self._anthropic_sources(env=[("ANTHROPIC_API_KEY", "sk-ant-admin01-a")]) as ap:
-            with patch.object(ap, "_anthropic_probe_request") as probe:
-                result = ap._collect_anthropic_usage()
-        probe.assert_not_called()
-        self.assertEqual(result["status"], "not_configured")
-        self.assertIn("Admin API key", result["message"])
-        # Nothing at all: the registry's not-configured message.
-        with self._anthropic_sources() as ap:
-            result = ap._collect_anthropic_usage()
-        self.assertEqual(result["status"], "not_configured")
-        self.assertIn("No Anthropic credential", result["message"])
 
     def test_zai_no_coding_plan_is_nothing_to_monitor_not_a_fault(self):
         payload = api._zai_payload({"code": 500, "msg": "当前用户不存在coding plan", "success": False})
@@ -4031,27 +3562,14 @@ process.stdout.write(JSON.stringify(out))
         def explode():
             raise RuntimeError("api_key=must-not-leak")
 
-        with patch.multiple(
-            api,
-            _collect_codex_usage=explode,
-            _collect_anthropic_usage=Mock(
-                return_value=api._provider_payload("anthropic", status="not_configured")
-            ),
-            _collect_nous_usage=Mock(return_value=api._provider_payload("nous", status="not_configured")),
-            _collect_openrouter_usage=Mock(
-                return_value=api._provider_payload("openrouter", status="not_configured")
-            ),
-            _collect_deepseek_usage=Mock(
-                return_value=api._provider_payload("deepseek", status="not_configured")
-            ),
-            _collect_grok_usage=Mock(return_value=api._provider_payload("grok", status="not_configured")),
-            _collect_kimi_usage=Mock(return_value=api._provider_payload("kimi", status="not_configured")),
-            _collect_zai_usage=Mock(return_value=api._provider_payload("zai", status="not_configured")),
-        ):
+        quiet = {name: Mock(return_value=api._provider_payload(name, status="not_configured"))
+                 for name in ("anthropic", "nous", "openrouter", "deepseek", "grok", "kimi", "zai")}
+        with _provider_collectors({"codex": explode, **quiet}):
             payload = api._ai_usage_sync(True)
         codex = next(item for item in payload["providers"] if item["provider"] == "codex")
         self.assertEqual(codex["status"], "unavailable")
         self.assertNotIn("must-not-leak", json.dumps(codex))
+        self.assertEqual(sum(1 for item in payload["providers"] if item["status"] == "not_configured"), len(quiet))
 
     def test_ai_usage_probe_skips_collectors_for_unconfigured_providers(self):
         def ok(provider):
@@ -5309,22 +4827,26 @@ process.stdout.write(JSON.stringify(out))
 
 
     def _write_services_home(self):
-        (self.home / ".env").write_text(
-            "\n".join(
-                [
-                    "# OPENROUTER_API_KEY=commented-out",
-                    "OPENROUTER_API_KEY=llm-key-belongs-to-providers",
-                    "FIRECRAWL_API_KEY=fc-main",
-                    "export FIRECRAWL_API_KEY_N8N=fc-n8n",
-                    "FIRECRAWL_API_URL=https://api.firecrawl.dev",
-                    "BRAVE_SEARCH_API_KEY=brave",
-                    "TELEGRAM_BOT_TOKEN=tg",
-                    "WEIRD_SERVICE_API_KEY=x",
-                    "SCRAPECREATORS_API_KEY=sc",
-                ]
-            ),
-            encoding="utf-8",
-        )
+        # Hermes hands a profile's secrets to plugins through its secret scope (get_secret), which
+        # outside Hermes is the process environment. A .env file is written too, to prove it is
+        # never read: its extra key must not show up anywhere.
+        (self.home / ".env").write_text("DOTENV_ONLY_API_KEY=must-not-be-read\n", encoding="utf-8")
+        keep = {name: value for name, value in os.environ.items()
+                if name.upper() in {"PATH", "SYSTEMROOT", "SYSTEMDRIVE", "TEMP", "TMP", "HOME", "USERPROFILE",
+                                     "HERMES_HOME", "LOCALAPPDATA", "APPDATA", "COMSPEC", "PATHEXT", "WINDIR"}}
+        environment = patch.dict(os.environ, {
+            **keep,
+            "OPENROUTER_API_KEY": "llm-key-belongs-to-providers",
+            "FIRECRAWL_API_KEY": "fc-main",
+            "FIRECRAWL_API_KEY_N8N": "fc-n8n",
+            "FIRECRAWL_API_URL": "https://api.firecrawl.dev",
+            "BRAVE_SEARCH_API_KEY": "brave",
+            "TELEGRAM_BOT_TOKEN": "tg",
+            "WEIRD_SERVICE_API_KEY": "x",
+            "SCRAPECREATORS_API_KEY": "sc",
+        }, clear=True)
+        environment.start()
+        self.addCleanup(environment.stop)
         (self.home / "config.yaml").write_text(
             "\n".join(
                 [
@@ -5370,8 +4892,9 @@ process.stdout.write(JSON.stringify(out))
         monid = inventory["monid"]
         self.assertEqual(monid["sources"], ["cli:monid"])
         self.assertEqual(monid["cli_path"], r"C:\npm\monid.cmd")
-        # Values are never part of the inventory.
+        # Values are never part of the inventory, and the .env file is never opened.
         self.assertNotIn("fc-main", json.dumps(inventory))
+        self.assertNotIn("dotenv_only", inventory)
 
     def test_service_adapters_parse_verified_response_shapes(self):
         firecrawl = services._firecrawl_payload(
@@ -5500,6 +5023,320 @@ process.stdout.write(JSON.stringify(out))
         self.assertEqual(completed.returncode, 0, completed.stderr[-800:])
 
 
+    # ── 0.55: catalog rule 11, public Hermes APIs, Hermes 0.23 records ───────
+
+    def test_no_private_hermes_imports_and_no_credential_files(self):
+        """Every Hermes import is on the published plugin API; nothing opens .env, auth.json or a vendor login."""
+        import ast
+
+        public = {
+            "agent.account_usage", "agent.secret_scope", "agent.credential_pool", "hermes_constants",
+            "hermes_cli.config", "persistence_assembly", "sqlite_support", "hermes_state", "tools.registry",
+        }
+        root = MODULE_PATH.parent
+        for path in root.rglob("*.py"):
+            tree = ast.parse(path.read_text(encoding="utf-8"))
+            for node in ast.walk(tree):
+                if isinstance(node, ast.ImportFrom) and node.module and node.level == 0:
+                    top = node.module.split(".")[0]
+                    if top in {"agent", "hermes_cli", "hermes_constants", "hermes_state", "persistence_assembly",
+                               "sqlite_support", "gateway", "tools", "tui_gateway", "providers"}:
+                        self.assertIn(node.module, public, f"{path.name}:{node.lineno} {node.module}")
+                        if node.module == "hermes_state":
+                            self.assertEqual([alias.name for alias in node.names], ["SessionDB"])
+            source = path.read_text(encoding="utf-8")
+            code = "\n".join(line for line in source.splitlines() if not line.strip().startswith("#"))
+            for needle in ('/ ".env"', "'.env'", '"auth.json"', ".credentials.json", "_read_codex_tokens",
+                           "resolve_xai_oauth_runtime_credentials", "anthropic_credentials", "from agent.usage_pricing"):
+                self.assertNotIn(needle, code, f"{path.name}: {needle}")
+
+    def test_secret_names_come_from_hermes_scope_never_the_env_file(self):
+        (self.home / ".env").write_text("DOTENV_ONLY_API_KEY=x\n", encoding="utf-8")
+        with patch.dict(os.environ, {"FIRECRAWL_API_KEY_TEAM": "fc"}, clear=False):
+            names = hermes_compat._secret_names()
+        self.assertIn("FIRECRAWL_API_KEY_TEAM", names)
+        self.assertNotIn("DOTENV_ONLY_API_KEY", names)
+        # Inside Hermes the published scope supplies names, and get_secret decides what this profile sees.
+        fake_scope = types.ModuleType("agent.secret_scope")
+        fake_scope.current_secret_scope = lambda: {"SCOPED_API_KEY": "v", "OTHER_PROFILE_KEY": "w"}
+        fake_scope.get_secret = lambda name, default=None: {"SCOPED_API_KEY": "v"}.get(name, default)
+        with patch.dict(sys.modules, {"agent": types.ModuleType("agent"), "agent.secret_scope": fake_scope}):
+            names = hermes_compat._secret_names()
+        self.assertIn("SCOPED_API_KEY", names)
+        self.assertNotIn("OTHER_PROFILE_KEY", names)
+
+    def test_api_key_providers_resolve_through_the_scope_with_hermes_base_urls(self):
+        with patch.dict(os.environ, {"DEEPSEEK_API_KEY": "sk-d", "KIMI_API_KEY": "sk-kimi-abc", "GLM_API_KEY": ""}, clear=False):
+            self.assertEqual(hermes_compat._resolve_hermes_api_key("deepseek"), ("sk-d", "https://api.deepseek.com/v1"))
+            self.assertEqual(hermes_compat._resolve_hermes_api_key("kimi-coding"), ("sk-kimi-abc", "https://api.kimi.com/coding/v1"))
+            with patch.dict(os.environ, {"KIMI_BASE_URL": "https://api.moonshot.ai/v1"}):
+                self.assertEqual(hermes_compat._resolve_hermes_api_key("kimi-coding")[1], "https://api.moonshot.ai/v1")
+            self.assertEqual(hermes_compat._resolve_hermes_api_key("zai")[0], "")
+            self.assertIn("deepseek", hermes_compat._hermes_configured_provider_ids())
+        with self.assertRaises(RuntimeError):
+            hermes_compat._resolve_hermes_api_key("not-a-provider")
+
+    def _fake_account_usage(self, snapshots):
+        module = types.ModuleType("agent.account_usage")
+        calls = []
+
+        def fetch_account_usage(provider, *, read_only=False, **_kw):
+            calls.append((provider, read_only))
+            return snapshots.get(provider)
+
+        module.fetch_account_usage = fetch_account_usage
+        return module, calls
+
+    def test_anthropic_card_reads_plan_limits_through_hermes_and_never_holds_the_token(self):
+        window = SimpleNamespace(label="Current session", used_percent=42.0, reset_at=datetime(2026, 11, 21, tzinfo=timezone.utc), detail=None)
+        snapshot = SimpleNamespace(windows=(window,), details=("Extra usage: off",), plan=None, unavailable_reason=None, title="Claude plan limits")
+        module, calls = self._fake_account_usage({"claude-subscription-directsdk-experimental": snapshot})
+        with patch.dict(sys.modules, {"agent": types.ModuleType("agent"), "agent.account_usage": module}):
+            card = anthropic_provider._collect_anthropic_usage()
+        self.assertEqual(card["status"], "ok")
+        self.assertEqual(card["usage_route"], "claude-subscription-directsdk-experimental")
+        self.assertEqual(card["windows"][0]["percentage_used"], 42.0)
+        self.assertEqual(calls[0], ("claude-subscription-directsdk-experimental", True))
+
+    def test_anthropic_setup_token_without_a_route_shows_what_hermes_recorded(self):
+        now = time.time()
+        connection = sqlite3.connect(self.db_path)
+        connection.execute("INSERT INTO sessions (id, source, started_at) VALUES ('claude-s', 'telegram', ?)", (now - 600,))
+        connection.execute(
+            "INSERT INTO session_model_usage (session_id, model, billing_provider, input_tokens, output_tokens, first_seen, last_seen) "
+            "VALUES ('claude-s', 'claude-opus-5-5', 'claude-subscription-directsdk-experimental', 1000, 500, ?, ?)", (now - 600, now - 300))
+        connection.commit()
+        connection.close()
+        reason = SimpleNamespace(windows=(), details=(), plan=None, unavailable_reason="no Claude subscription login found", title="Claude plan limits")
+        module, _calls = self._fake_account_usage({"claude-subscription-directsdk-experimental": reason})
+        with patch.dict(sys.modules, {"agent": types.ModuleType("agent"), "agent.account_usage": module}), \
+             patch.dict(os.environ, {"CLAUDE_CODE_OAUTH_TOKEN": "sk-ant-oat01-test"}, clear=False):
+            card = anthropic_provider._collect_anthropic_usage()
+        self.assertEqual((card["status"], card["plan"], card["local_windows"]), ("ok", "Recorded by Hermes", True))
+        self.assertIn("CLAUDE_CODE_OAUTH_TOKEN", card["details"][0])
+        self.assertIn("no Claude subscription login found", card["details"][1])
+        self.assertNotIn("sk-ant-oat01-test", json.dumps(card))
+        windows = api._recorded_use_windows(api._USAGE_BILLING_KEYS["anthropic"])
+        self.assertEqual([window["kind"] for window in windows], ["local", "local"])
+        self.assertEqual(windows[0]["used"], 1500)
+        self.assertEqual(windows[0]["trailing_seconds"], 5 * 3600)
+        since, until, basis = api._usage_window_bounds(windows[0])
+        self.assertEqual((until, basis), (None, "trailing"))
+
+    def test_grok_card_falls_back_to_recorded_use_without_holding_the_xai_login(self):
+        self.assertEqual(api._collect_grok_usage()["status"], "not_configured")
+        now = time.time()
+        connection = sqlite3.connect(self.db_path)
+        connection.execute(
+            "INSERT INTO session_model_usage (session_id, model, billing_provider, input_tokens, first_seen, last_seen) "
+            "VALUES ('g', 'grok-4.7', 'xai-oauth', 10, ?, ?)", (now - 60, now - 30))
+        connection.commit()
+        connection.close()
+        card = api._collect_grok_usage()
+        self.assertEqual((card["status"], card["local_windows"]), ("ok", True))
+        self.assertIn("no reader for an xAI sign-in", card["message"])
+        self.assertEqual(api._provider_adapters()["grok"].hosts, ())
+
+    def test_nous_card_parses_hermes_published_credits_view(self):
+        lines = ["📈 Account limits", "Provider: nous (Plus)", "Subscription: 40% remaining (60% used) • $6.00 of $10.00 left",
+                 "Subscription credits: $6.00", "Top-up credits: $1.89", "Total usable: $7.89",
+                 "Renews: 2026-11-23", "Top up: https://portal.nousresearch.com/topup", "(or run /topup)"]
+        card = nous_provider._nous_payload_from_lines(lines)
+        self.assertEqual((card["status"], card["plan"]), ("ok", "Plus"))
+        balance, quota = card["windows"]
+        self.assertEqual((balance["kind"], balance["remaining"]), ("balance", 7.89))
+        self.assertIn("$1.89 top-up", balance["detail"])
+        self.assertEqual(quota["percentage_used"], 60.0)
+        self.assertFalse(any("Top up" in item for item in card["details"]))
+        self.assertEqual(nous_provider._collect_nous_usage()["status"], "not_configured")
+
+    def test_hermes_reported_cards_cover_any_provider_with_a_usage_reader(self):
+        now = time.time()
+        connection = sqlite3.connect(self.db_path)
+        connection.execute(
+            "INSERT INTO session_model_usage (session_id, model, billing_provider, input_tokens, first_seen, last_seen) "
+            "VALUES ('o', 'glm', 'opencode-go', 10, ?, ?)", (now - 60, now - 30))
+        connection.commit()
+        connection.close()
+        window = SimpleNamespace(label="Weekly", used_percent=12.5, reset_at=None, detail=None)
+        snapshot = SimpleNamespace(windows=(window,), details=(), plan=None, unavailable_reason=None, title="Account limits")
+        module, _calls = self._fake_account_usage({"opencode-go": snapshot})
+        self.assertIn("opencode-go", api._hermes_reported_candidates())
+        with patch.dict(sys.modules, {"agent": types.ModuleType("agent"), "agent.account_usage": module}):
+            card = api._hermes_reported_card("opencode-go")
+        self.assertEqual((card["provider"], card["status"], card["auth_source"]), ("hermes:opencode-go", "ok", "Hermes usage reader"))
+        self.assertEqual(card["billing_keys"], ["opencode-go"])
+        self.assertEqual(api._card_hermes_ids(card), ["opencode-go"])
+        self.assertIsNone(api._hermes_reported_card("nothing-here"))
+
+    def test_fitted_pricing_reproduces_hermes_recorded_costs(self):
+        connection = sqlite3.connect(self.db_path)
+        rates = (0.15, 0.6, 0.003)
+        for index in range(12):
+            tokens = (1000 * (index + 1), 200 * (index % 5 + 1), 5000 * (index % 3 + 1))
+            cost = sum(count / 1e6 * rate for count, rate in zip(tokens, rates))
+            connection.execute(
+                "INSERT INTO session_model_usage (session_id, model, billing_provider, input_tokens, output_tokens, cache_read_tokens, "
+                "estimated_cost_usd, first_seen, last_seen) VALUES (?, 'fit-model', 'deepseek', ?, ?, ?, ?, ?, ?)",
+                (f"fit-{index}", *tokens, cost, 1000 + index, 1000 + index))
+        connection.commit()
+        connection.close()
+        from dashboard import _pricing as pricing
+
+        pricing._rate_cache.clear()
+        entry = pricing._recorded_pricing_entry("fit-model", "deepseek")
+        self.assertAlmostEqual(entry.input_cost_per_million, 0.15, places=6)
+        self.assertAlmostEqual(entry.output_cost_per_million, 0.6, places=6)
+        self.assertAlmostEqual(entry.cache_read_cost_per_million, 0.003, places=6)
+        self.assertIsNone(entry.cache_write_cost_per_million)
+        self.assertIsNone(pricing._recorded_pricing_entry("never-run", "deepseek"))
+        # Rows that no single price explains are refused, not averaged into a wrong price.
+        self.assertIsNone(pricing._best_fit([(1000, 100, 0, 0, 1.0), (1000, 100, 0, 0, 0.001), (2000, 50, 0, 0, 0.5), (10, 10, 0, 0, 3.0)]))
+
+    def test_gateway_state_reads_the_multiplexed_gateway_not_stale_profile_files(self):
+        (self.home / "gateway_state.json").write_text(json.dumps({
+            "pid": 13296, "kind": "hermes-gateway", "gateway_state": "running", "active_agents": 2,
+            "served_profiles": ["default", "claude"], "parked_profiles": {"dana": "token missing"},
+            "platforms": {"telegram": {"state": "connected"}, "claude:telegram": {"state": "connected"}, "sms": {"state": "fatal", "needs_attention": True}},
+            "updated_at": "2026-11-20T20:00:00+00:00",
+        }), encoding="utf-8")
+        for name, state in (("claude", "stopped"), ("solo", "running")):
+            folder = self.home / "profiles" / name
+            folder.mkdir(parents=True, exist_ok=True)
+            (folder / "gateway_state.json").write_text(json.dumps({"gateway_state": state, "platforms": {}}), encoding="utf-8")
+        gateways = {item["profile"]: item for item in api._gateway_sync()["gateways"]}
+        self.assertEqual(gateways["default"]["state"], "running")
+        self.assertEqual([item["name"] for item in gateways["default"]["platforms"]], ["telegram", "sms"])
+        self.assertEqual(gateways["claude"]["state"], "running")  # the stale per-profile "stopped" file is ignored
+        self.assertEqual([item["name"] for item in gateways["claude"]["platforms"]], ["telegram"])
+        self.assertIsNone(gateways["claude"]["active_agents"])
+        self.assertEqual((gateways["dana"]["state"], gateways["dana"]["exit_reason"]), ("parked", "token missing"))
+        self.assertEqual((gateways["solo"]["state"], gateways["solo"]["served_by"]), ("running", None))
+
+    def _insight_tables(self):
+        connection = sqlite3.connect(self.db_path)
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS state_meta (key TEXT PRIMARY KEY, value TEXT);
+            CREATE TABLE IF NOT EXISTS system_prompts (hash TEXT PRIMARY KEY, prompt TEXT);
+            CREATE TABLE IF NOT EXISTS gateway_heartbeats (backend_id TEXT, pid INTEGER, started_at REAL, last_heartbeat REAL, profile TEXT, host TEXT);
+            ALTER TABLE sessions ADD COLUMN tool_names TEXT;
+            ALTER TABLE sessions ADD COLUMN prompt_cache_clock TEXT;
+            """
+        )
+        return connection
+
+    def test_turns_view_reads_the_ledger_without_reply_text(self):
+        now = time.time()
+        connection = self._insight_tables()
+        connection.execute("INSERT INTO sessions (id, source, title, started_at) VALUES ('t1', 'telegram', 'Ledger session', ?)", (now - 900,))
+        connection.execute("INSERT INTO messages (id, session_id, role, content, timestamp) VALUES (10, 't1', 'user', 'hi', ?)", (now - 600,))
+        connection.execute("INSERT INTO messages (id, session_id, role, content, timestamp) VALUES (11, 't1', 'assistant', 'done', ?)", (now - 540,))
+        result = {"session_id": "t1", "model": "deepseek-flash", "provider": "deepseek", "input_tokens": 1000, "output_tokens": 100,
+                  "cache_read_tokens": 9000, "cache_write_tokens": 0, "estimated_cost_usd": 0.05, "cost_status": "estimated",
+                  "api_calls": 4, "turn_exit_reason": "max_iterations_reached(90/90)", "failed": False, "interrupted": False,
+                  "partial": False, "final_response": "SECRET REPLY TEXT", "messages": [{"content": "SECRET MESSAGE"}],
+                  "persisted_turn": {"user_row_id": 10, "final_assistant_row_id": 11}}
+        connection.execute("INSERT INTO state_meta (key, value) VALUES (?, ?)",
+                           ("gateway.admission.result.v1.abc", json.dumps({"result": result, "usage": {}, "_stored": {"v": 1}})))
+        connection.commit()
+        connection.close()
+        payload = api._turns_sync(7)
+        self.assertEqual(payload["summary"]["turns"], 1)
+        turn = payload["costliest"][0]
+        self.assertEqual((turn["title"], turn["duration_seconds"], turn["api_calls"], turn["tokens"]), ("Ledger session", 60.0, 4, 10100))
+        self.assertEqual(turn["flags"], ["iteration cap"])
+        self.assertEqual(payload["problems"][0]["id"], "abc")
+        serialized = json.dumps(payload)
+        self.assertNotIn("SECRET", serialized)
+
+    def test_prompt_weight_splits_the_prompt_and_finds_rarely_used_skills(self):
+        now = time.time()
+        connection = self._insight_tables()
+        prompt = ("You are Hermes.\n# Execution discipline\nBe careful.\n## Skills\nScan the skills.\n<available_skills>\n"
+                  "  - used-skill: Does a thing people use.\n  - idle-skill: Never touched by anyone at all.\n</available_skills>\n"
+                  "══════════\nMEMORY (notes)\n══════════\nRemember this.\n")
+        bundle = json.dumps({"version": "0.23.3", "tools": [{"type": "function", "function": {"name": "terminal", "description": "x" * 400}}]})
+        connection.execute("INSERT INTO system_prompts VALUES ('p1', ?)", (prompt,))
+        connection.execute("INSERT INTO system_prompts VALUES ('b1', ?)", (bundle,))
+        connection.execute(
+            "INSERT INTO sessions (id, source, title, started_at, last_activity_at, system_prompt_hash, tool_names, api_call_count, input_tokens, cache_read_tokens) "
+            "VALUES ('w1', 'telegram', 'Weighty', ?, ?, 'p1', 'b1', 10, 1000, 9000)", (now - 600, now - 60))
+        connection.execute(
+            "INSERT INTO session_model_usage (session_id, model, billing_provider, task, api_call_count, input_tokens, estimated_cost_usd, first_seen, last_seen) "
+            "VALUES ('w1', 'm', 'deepseek', 'background_review', 3, 500, 0.02, ?, ?)", (now - 300, now - 200))
+        connection.commit()
+        connection.close()
+        (self.home / "skills").mkdir(exist_ok=True)
+        (self.home / "skills" / ".usage.json").write_text(json.dumps({
+            "used-skill": {"use_count": 9, "last_used_at": datetime.now(timezone.utc).isoformat()},
+            "idle-skill": {"use_count": 0, "last_used_at": None},
+        }), encoding="utf-8")
+        payload = api._prompt_weight_sync(7)
+        latest = payload["latest"]
+        labels = [segment["label"] for segment in latest["segments"]]
+        self.assertIn("Skills index", labels)
+        self.assertIn("Memory", labels)
+        self.assertIn("Execution discipline", labels)
+        self.assertEqual([row["name"] for row in latest["skills"]["rows"]], ["idle-skill"])
+        self.assertEqual(latest["skills"]["listed"], 2)
+        self.assertEqual(latest["tools"]["largest"][0]["name"], "terminal")
+        self.assertGreater(payload["summary"]["resent_tokens"], 0)
+        self.assertLessEqual(payload["summary"]["resent_tokens"], 10000)
+        self.assertEqual(payload["auxiliary"][0]["task"], "background_review")
+
+    def test_prompt_cache_cron_and_gateway_history_read_hermes_records(self):
+        now = time.time()
+        connection = self._insight_tables()
+        clock = {"route": ["deepseek", "https://api.deepseek.com/v1", "deepseek-flash"], "tier": "30m", "read_tokens": 1200,
+                 "sent_at": now - 60, "guaranteed_until": now + 600}
+        connection.execute("INSERT INTO sessions (id, source, title, started_at, last_activity_at, prompt_cache_clock) VALUES ('c1', 'cli', 'Cached', ?, ?, ?)",
+                           (now - 300, now - 60, json.dumps(clock)))
+        connection.execute(
+            "INSERT INTO session_model_usage (session_id, model, billing_provider, task, api_call_count, input_tokens, cache_read_tokens, estimated_cost_usd, first_seen, last_seen) "
+            "VALUES ('c1', 'deepseek-flash', 'deepseek', '', 5, 100, 900, 0.01, ?, ?)", (now - 300, now - 60))
+        connection.execute(
+            "INSERT INTO session_model_usage (session_id, model, billing_provider, task, api_call_count, cache_read_tokens, estimated_cost_usd, first_seen, last_seen) "
+            "VALUES ('c1', 'deepseek-flash', 'deepseek', 'cache_warm', 2, 500, 0.001, ?, ?)", (now - 300, now - 60))
+        for pid, started, last in ((1, now - 7200, now - 3700), (2, now - 3600, now - 10)):
+            connection.execute("INSERT INTO gateway_heartbeats VALUES (?, ?, ?, ?, 'default', 'host')", (f"b{pid}", pid, started, last))
+        connection.commit()
+        connection.close()
+        cache = api._prompt_cache_sync(7)
+        self.assertEqual(cache["summary"]["warm_sessions"], 1)
+        self.assertEqual(cache["summary"]["keepalive_calls"], 2)
+        flash = next(row for row in cache["models"] if row["model"] == "deepseek-flash")
+        self.assertEqual(flash["hit_ratio"], 0.9)
+
+        cron = self.home / "cron"
+        cron.mkdir(exist_ok=True)
+        (cron / "jobs.json").write_text(json.dumps({"jobs": [{"id": "j1", "name": "Daily brief"}]}), encoding="utf-8")
+        iso = lambda ts: datetime.fromtimestamp(ts, timezone.utc).isoformat()
+        executions = sqlite3.connect(cron / "executions.db")
+        executions.executescript(
+            "CREATE TABLE executions (id TEXT, job_id TEXT, status TEXT, claimed_at TEXT, started_at TEXT, finished_at TEXT, error TEXT, delivery_outcome TEXT, scheduled_instant TEXT);"
+            "CREATE TABLE cron_incidents (id TEXT, job_id TEXT, state TEXT, failure_type TEXT, first_seen_at TEXT, last_seen_at TEXT, closed_at TEXT, error TEXT);"
+        )
+        executions.execute("INSERT INTO executions VALUES ('e1', 'j1', 'completed', ?, ?, ?, NULL, 'delivered', ?)", (iso(now - 900), iso(now - 900), iso(now - 840), iso(now - 900)))
+        executions.execute("INSERT INTO executions VALUES ('e2', 'j1', 'missed', ?, NULL, NULL, 'gateway down', NULL, ?)", (iso(now - 500), iso(now - 500)))
+        executions.execute("INSERT INTO cron_incidents VALUES ('i1', 'j1', 'open', 'script', ?, ?, NULL, 'boom')", (iso(now - 500), iso(now - 400)))
+        executions.commit()
+        executions.close()
+        (cron / "usage_audit.jsonl").write_text(json.dumps({"ts": iso(now - 850), "job_id": "j1", "total_tokens": 4000, "duration_ms": 60000, "model": "m"}) + "\n", encoding="utf-8")
+        history = api._cron_history_sync(7)
+        job = history["jobs"][0]
+        self.assertEqual((job["name"], job["runs"], job["problems"], job["avg_tokens_per_fire"]), ("Daily brief", 2, 1, 4000))
+        self.assertEqual(history["summary"]["open_incidents"], 1)
+        self.assertEqual(history["recent"][0]["status"], "missed")
+
+        gateway = api._gateway_history_sync(7)
+        profile = gateway["profiles"][0]
+        self.assertEqual((profile["starts"], profile["running"]), (2, True))
+        self.assertEqual(gateway["timeline"][1]["gap_after_seconds"], 100.0)
+        routes = {getattr(route, "path", None) for route in api.router.routes}
+        self.assertTrue({"/turns", "/prompt-weight", "/prompt-cache", "/cron-history", "/gateway-history"} <= routes)
+
+
 class AdapterRegistryTests(unittest.TestCase):
     """Vendors live in one module each and register themselves; dispatchers read the registry."""
 
@@ -5525,7 +5362,7 @@ class AdapterRegistryTests(unittest.TestCase):
         self.assertTrue({"openai-codex", "claude", "moonshot", "zai-coding"} <= api._USAGE_COVERED_PROVIDER_IDS)
         self.assertEqual(api._budget_provider_label("monid"), "Monid")
         self.assertEqual(api._budget_provider_label("zai"), "Z.AI GLM Coding Plan")
-        self.assertEqual(api._provider_payload("grok", status="ok")["auth_source"], "Hermes xAI OAuth")
+        self.assertEqual(api._provider_payload("grok", status="ok")["auth_source"], "Hermes")
         self.assertEqual(api._provider_not_configured_message("deepseek"), "No Hermes DeepSeek API key was found.")
         self.assertIsNone(api._provider_not_configured_message("nope"))
         with self.assertRaises(KeyError):
@@ -5540,7 +5377,7 @@ class AdapterRegistryTests(unittest.TestCase):
         self.assertEqual(services._service_for_env_key("BRIGHT_DATA_API_KEY"), ("brightdata", None))
         self.assertEqual(services._service_for_env_key("FIRECRAWL_API_KEY_N8N"), ("firecrawl", "n8n"))
         with self.assertRaises(ValueError):
-            api.register_service("nothing", "Nothing", "Hermes .env key")
+            api.register_service("nothing", "Nothing", "Hermes secret")
         self.assertNotIn("nothing", api._service_ids())
 
     def test_probe_dispatches_to_the_adapter(self):
@@ -5549,10 +5386,14 @@ class AdapterRegistryTests(unittest.TestCase):
             self.assertFalse(api._probe_usage_provider("codex"))
         with patch.object(codex, "probe", Mock(side_effect=RuntimeError("boom"))):
             self.assertTrue(api._probe_usage_provider("codex"))
-        with patch.object(provider_shared, "_resolve_hermes_api_key", return_value=("", None)):
-            self.assertFalse(api._probe_usage_provider("openrouter"))
-        with patch.object(provider_shared, "_resolve_hermes_api_key", return_value=("sk-x", None)):
-            self.assertTrue(api._probe_usage_provider("openrouter"))
+        self.assertTrue(api._probe_usage_provider("openrouter"))  # Hermes' secret reader missing: unknown -> run
+        fake_scope = types.ModuleType("agent.secret_scope")
+        fake_scope.get_secret = lambda name, default=None: default
+        with patch.dict(sys.modules, {"agent": types.ModuleType("agent"), "agent.secret_scope": fake_scope}):
+            with patch.object(provider_shared, "_resolve_hermes_api_key", return_value=("", None)):
+                self.assertFalse(api._probe_usage_provider("openrouter"))
+            with patch.object(provider_shared, "_resolve_hermes_api_key", return_value=("sk-x", None)):
+                self.assertTrue(api._probe_usage_provider("openrouter"))
 
     def test_adapters_route_docs_and_readme_declare_every_host(self):
         self.assertIn("/adapters", {getattr(route, "path", None) for route in api.router.routes})
@@ -5582,14 +5423,13 @@ class AdapterRegistryTests(unittest.TestCase):
         self.assertIn("['External hosts',", plugin_source)
         self.assertIn("English error text", plugin_source)
         anthropic = next(item for item in payload["providers"] if item["id"] == "anthropic")
-        self.assertEqual(anthropic["request_kind"], "inference_probe")
-        self.assertIn("one-token", anthropic["note"])
-        self.assertEqual([item["id"] for item in api._inference_probe_adapters()], ["anthropic"])
+        self.assertEqual((anthropic["request_kind"], anthropic["via"]), ("usage_endpoint", "hermes"))
+        self.assertEqual(api._inference_probe_adapters(), [])
         for item in payload["providers"] + payload["services"]:
             self.assertIn(item["request_kind"], {"usage_endpoint", "inference_probe"})
-        self.assertIn("one-token", readme)
-        self.assertIn("anthropic_usage_probe", readme)
-        self.assertIn("inference_probe", adapters_doc)
+        self.assertNotIn("anthropic_usage_probe", readme)
+        self.assertIn("rule 11", readme)
+        self.assertIn("rule 11", adapters_doc)
         self.assertIn('"inference_probes": _inference_probe_adapters(),', routes_source)
         self.assertIn("['Inference probes',", plugin_source)
 

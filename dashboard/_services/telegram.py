@@ -9,7 +9,7 @@ from .shared import *
 
 
 register_service(
-    "telegram", "Telegram bot", "Hermes .env token",
+    "telegram", "Telegram bot", "Hermes secret",
     env_keys=("TELEGRAM_BOT_TOKEN",),
     note="A bot token has nothing to meter.",
     order=70, module=__name__,

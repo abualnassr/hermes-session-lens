@@ -53,7 +53,7 @@ def _collect_vapi() -> Dict[str, Any]:
 
 
 register_service(
-    "vapi", "Vapi", "Hermes .env key", collect=_collect_vapi,
+    "vapi", "Vapi", "Hermes secret", collect=_collect_vapi,
     env_keys=("VAPI_API_KEY",),
     mcp_hints=("vapi",),
     hosts=("api.vapi.ai",), order=67, module=__name__,

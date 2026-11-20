@@ -32,7 +32,15 @@ def _provider_not_configured_message(provider: str) -> Optional[str]:
 
 
 def _default_key_probe(provider: str) -> bool:
-    """Probe for key-based providers: does Hermes resolve an API key for this id?"""
+    """Probe for key-based providers: does Hermes resolve an API key for this id?
+
+    Outside Hermes (its secret reader missing) the answer is unknown, so the
+    probe says yes and the collector reports its own status.
+    """
+    try:
+        import agent.secret_scope  # noqa: F401 — presence check only
+    except Exception:
+        return True
     token, _base_url = _resolve_hermes_api_key(provider)
     return bool(token)
 
@@ -119,8 +127,10 @@ def _provider_payload(
     message: Optional[str] = None,
     partial: bool = False,
     links: Optional[List[Mapping[str, Any]]] = None,
+    label: Optional[str] = None,
+    auth_source: Optional[str] = None,
 ) -> Dict[str, Any]:
-    meta = _provider_meta(provider)
+    meta = {"label": label, "auth_source": auth_source or "Hermes"} if label else _provider_meta(provider)
     kept_details, muted_details = _split_noise_details(
         [_clean_text(item, 320) for item in (details or []) if _clean_text(item, 320)]
     )
@@ -181,16 +191,17 @@ def _usage_window(
     }
 
 
-def _account_usage_payload(provider: str, snapshot: Any) -> Dict[str, Any]:
+def _account_usage_payload(provider: str, snapshot: Any, **meta: Any) -> Dict[str, Any]:
     if snapshot is None:
         return _provider_payload(
             provider,
             status="unavailable",
             message="Hermes did not return account-usage data for this provider.",
+            **meta,
         )
     unavailable = _clean_text(getattr(snapshot, "unavailable_reason", None), 240)
     if unavailable:
-        return _provider_payload(provider, status="unavailable", message=unavailable)
+        return _provider_payload(provider, status="unavailable", message=unavailable, **meta)
     windows = []
     for raw in tuple(getattr(snapshot, "windows", ()) or ()):
         label = _clean_text(getattr(raw, "label", None), 120) or "Usage"
@@ -208,6 +219,7 @@ def _account_usage_payload(provider: str, snapshot: Any) -> Dict[str, Any]:
             provider,
             status="unavailable",
             message="The provider returned no quota windows or balance details.",
+            **meta,
         )
     return _provider_payload(
         provider,
@@ -215,7 +227,68 @@ def _account_usage_payload(provider: str, snapshot: Any) -> Dict[str, Any]:
         plan=getattr(snapshot, "plan", None),
         windows=windows,
         details=[str(item) for item in details],
+        **meta,
     )
+
+
+# ── Recorded use: what Hermes logged, for accounts no route can read ─────
+# Some subscriptions (a Claude setup token, an xAI sign-in) have no usage
+# reading any plugin may make: Anthropic answers its usage endpoint only for
+# full OAuth logins, and Hermes ships no reader for xAI sign-ins. For those
+# the card shows what Hermes itself recorded in state.db — tokens and the
+# estimated cost per trailing window — and says plainly that it is not the
+# provider's own allowance figure.
+
+_LOCAL_WINDOWS = ((5 * 3600, "Last 5 hours"), (7 * 86400, "Last 7 days"))
+
+
+def _recorded_use(billing_keys: Iterable[str], since: float) -> Dict[str, Any]:
+    keys = [str(key).lower() for key in billing_keys if key]
+    if not keys:
+        return {"tokens": 0, "cost_usd": 0.0, "sessions": 0, "last_seen": None}
+    placeholders = ",".join("?" for _ in keys)
+    with _database() as db:
+        row = _db_connection(db).execute(
+            f"""
+            SELECT SUM(u.input_tokens + u.output_tokens + u.cache_read_tokens + u.cache_write_tokens),
+                   SUM(CASE WHEN u.actual_cost_usd > 0 THEN u.actual_cost_usd ELSE u.estimated_cost_usd END),
+                   COUNT(DISTINCT u.session_id),
+                   MAX(COALESCE(u.last_seen, u.first_seen))
+            FROM session_model_usage u
+            WHERE LOWER(u.billing_provider) IN ({placeholders})
+              AND COALESCE(u.last_seen, u.first_seen, 0) >= ?
+            """,
+            (*keys, since),
+        ).fetchone()
+    return {
+        "tokens": int(row[0] or 0) if row else 0,
+        "cost_usd": float(row[1] or 0.0) if row else 0.0,
+        "sessions": int(row[2] or 0) if row else 0,
+        "last_seen": float(row[3]) if row and row[3] else None,
+    }
+
+
+def _recorded_use_windows(billing_keys: Iterable[str]) -> List[Dict[str, Any]]:
+    """Trailing-window token windows (kind ``local``) from Hermes' own records."""
+    keys = tuple(billing_keys)
+    now = time.time()
+    windows: List[Dict[str, Any]] = []
+    for seconds, label in _LOCAL_WINDOWS:
+        use = _recorded_use(keys, now - seconds)
+        detail = f"{use['sessions']} session{'s' if use['sessions'] != 1 else ''}"
+        if use["cost_usd"] > 0:
+            detail += f" · ${use['cost_usd']:,.2f} at API prices"
+        window = _usage_window(label, kind="local", used=use["tokens"], unit="tokens", detail=detail)
+        window["trailing_seconds"] = seconds
+        windows.append(window)
+    return windows
+
+
+def _recorded_recently(billing_keys: Iterable[str], days: float = 30.0) -> bool:
+    try:
+        return _recorded_use(tuple(billing_keys), time.time() - days * 86400)["tokens"] > 0
+    except Exception:
+        return False
 
 
 def _usage_field(values: Mapping[str, Any], *keys: str) -> Optional[float]:

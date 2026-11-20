@@ -9,7 +9,7 @@ from .shared import *
 
 
 register_service(
-    "herenow", "here.now", "Hermes .env key",
+    "herenow", "here.now", "Hermes secret",
     env_keys=("HERE_NOW_API_KEY", "HERENOW_API_KEY"),
     note="here.now's API publishes sites but reports no plan, quota, or usage figure.",
     order=80, module=__name__,

@@ -12,14 +12,14 @@ from .._providers.shared import *
 from .shared import *
 
 register_service(
-    "typesafe", "TypeSafe", "Hermes .env key",
+    "typesafe", "TypeSafe", "Hermes secret",
     env_keys=("TYPESAFE_API_KEY",),
     note="TypeSafe publishes no balance or usage API; each response reports only its own token use.",
     order=85, module=__name__,
 )
 
 register_service(
-    "reef", "Reef", "Hermes .env key",
+    "reef", "Reef", "Hermes secret",
     env_keys=("REEF_API_KEY",),
     note="Reef publishes no balance API; calls report only the credits each one charged.",
     order=86, module=__name__,

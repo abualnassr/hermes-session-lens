@@ -53,7 +53,7 @@ def _collect_agentmail() -> Dict[str, Any]:
 
 
 register_service(
-    "agentmail", "AgentMail", "Hermes .env key", collect=_collect_agentmail,
+    "agentmail", "AgentMail", "Hermes secret", collect=_collect_agentmail,
     env_keys=("AGENTMAIL_API_KEY",), mcp_hints=("agentmail",),
     hosts=("api.agentmail.to",), order=30, module=__name__,
 )

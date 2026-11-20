@@ -1,7 +1,7 @@
 """Non-LLM service discovery and balance adapters.
 
-Discovery reads only what Hermes already knows about: key NAMES in the
-profile's .env, `mcp_servers` in config.yaml, and known CLIs on PATH. It
+Discovery reads only what Hermes already knows about: the NAMES of the
+profile's secrets (through Hermes' secret scope, never the .env file), `mcp_servers` in config.yaml, and known CLIs on PATH. It
 never opens skill folders or credential files kept elsewhere — a service
 the user did not hand to Hermes is the user's to declare.
 
@@ -45,7 +45,7 @@ _SECRET_NAME_RE = re.compile(r"^[A-Z][A-Z0-9_]*(_API_KEY|_TOKEN|_SECRET|_API_TOK
 
 SERVICES_CACHE_TTL_SECONDS = AI_USAGE_CACHE_TTL_SECONDS
 # Keyed by Hermes home: one backend serves every local profile, and a
-# balance belongs to the profile whose .env key produced it.
+# balance belongs to the profile whose secret produced it.
 _services_caches: Dict[str, Tuple[float, Dict[str, Any]]] = {}
 _services_cache_lock = threading.Lock()
 _services_last_success_by_home: Dict[str, Dict[str, Dict[str, Any]]] = {}
@@ -273,7 +273,7 @@ def _services_inventory() -> Dict[str, Dict[str, Any]]:
             },
         )
 
-    for name in _dotenv_key_names(_hermes_home() / ".env"):
+    for name in _secret_names():
         upper = name.upper()
         if upper in _LLM_ENV_KEYS:
             continue
@@ -423,7 +423,7 @@ def _services_sync(fresh: bool = False, only_service: Optional[str] = None) -> D
             "cached": False,
             "cache_ttl_seconds": SERVICES_CACHE_TTL_SECONDS,
             "definition": (
-                "Discovered from key names in the Hermes .env, mcp_servers in config.yaml, and known CLIs on PATH. "
+                "Discovered from the names of the profile's Hermes secrets, mcp_servers in config.yaml, and known CLIs on PATH. "
                 "Balances come from each vendor's own usage endpoint with the configured key; services without a "
                 "readable usage API are listed, not guessed."
             ),

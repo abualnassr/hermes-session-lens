@@ -1,4 +1,13 @@
-"""grok quota provider adapter."""
+"""Grok (xAI) quota provider adapter.
+
+Hermes has no published route for an xAI sign-in's billing, and catalog
+rule 11 forbids a plugin from holding or refreshing that login itself, so
+Session Lens asks Hermes' account-usage API first (it answers as soon as
+Hermes or a provider plugin ships an xAI reader) and otherwise shows what
+Hermes recorded on Grok: tokens and API-price cost over the trailing 5 hours
+and 7 days. The desktop adds Hermes' own rate-limit state from its model
+picker.
+"""
 
 from __future__ import annotations
 
@@ -6,222 +15,41 @@ from .._common import *
 from .._hermes_compat import *
 from .shared import *
 
-def _grok_windows_from_payloads(
-    weekly_payload: Optional[Mapping[str, Any]],
-    monthly_payload: Optional[Mapping[str, Any]],
-) -> List[Dict[str, Any]]:
-    windows: List[Dict[str, Any]] = []
-    weekly_config = weekly_payload.get("config") if isinstance(weekly_payload, Mapping) else None
-    if isinstance(weekly_config, Mapping):
-        used_pct = _usage_percent(weekly_config.get("creditUsagePercent"))
-        period = weekly_config.get("currentPeriod")
-        period_type = str(period.get("type") or "") if isinstance(period, Mapping) else ""
-        reset_at = period.get("end") if isinstance(period, Mapping) else None
-        reset_at = reset_at or weekly_config.get("billingPeriodEnd")
-        detail = "Shared across Grok products"
-        if used_pct is None and period_type == "USAGE_PERIOD_TYPE_WEEKLY" and reset_at:
-            # xAI serialises this config from protobuf, which omits zero-valued
-            # fields: no creditUsagePercent inside a confirmed weekly period means
-            # 0% used, not unknown. xAI's own Grok Build client reads it the same
-            # way (credit_usage_percent None -> 0.0), verified against the live
-            # API on 2026-09-04 for a unified-billing account.
-            used_pct = 0.0
-            detail = "No usage recorded in this period yet · shared across Grok products"
-        if used_pct is not None:
-            windows.append(
-                _usage_window(
-                    "Weekly allowance",
-                    used_percent=used_pct,
-                    reset_at=reset_at,
-                    detail=detail,
-                )
-            )
-        prepaid = weekly_config.get("prepaidBalance")
-        prepaid_value = _usage_number(prepaid.get("val")) if isinstance(prepaid, Mapping) else None
-        if prepaid_value is not None and prepaid_value > 0:
-            windows.append(
-                _usage_window(
-                    "Prepaid credits",
-                    kind="balance",
-                    remaining=prepaid_value / 100.0,
-                    unit="credits",
-                    detail="Purchased credits beyond the allowance",
-                )
-            )
-
-    monthly_config = monthly_payload.get("config") if isinstance(monthly_payload, Mapping) else None
-    if isinstance(monthly_config, Mapping):
-        raw_limit = monthly_config.get("monthlyLimit")
-        raw_used = monthly_config.get("used")
-        limit_value = _usage_number(raw_limit.get("val")) if isinstance(raw_limit, Mapping) else None
-        used_value = _usage_number(raw_used.get("val")) if isinstance(raw_used, Mapping) else None
-        if limit_value is not None and limit_value > 0 and used_value is not None:
-            limit = limit_value / 100.0
-            used = max(0.0, used_value / 100.0)
-            remaining = max(0.0, limit - used)
-            windows.append(
-                _usage_window(
-                    "Extra usage credits",
-                    kind="balance",
-                    used_percent=(used / limit) * 100.0,
-                    reset_at=monthly_config.get("billingPeriodEnd"),
-                    limit=limit,
-                    used=used,
-                    remaining=remaining,
-                    unit="credits",
-                )
-            )
-    return windows
-
-
-def _grok_card_extras(
-    weekly_payload: Optional[Mapping[str, Any]],
-    topup_payload: Optional[Mapping[str, Any]],
-) -> Tuple[Optional[str], List[str], List[Dict[str, str]]]:
-    """(plan, details, links) for the Grok card beyond its usage windows.
-
-    xAI's CLI proxy reports the plan tier only for some accounts, so the
-    tier is shown when present and never guessed. The auto-top-up rule is
-    its own endpoint: an empty response means none is set up. Weekly limit
-    resets exist only on grok.com (xAI's own CLI opens the browser for
-    them) and are deliberately not mentioned on the card.
-    """
-    plan = None
-    if isinstance(weekly_payload, Mapping):
-        tier = str(weekly_payload.get("subscription_tier") or "").strip()
-        plan = tier or None
-    details = ["Private xAI billing surface; response compatibility may change."]
-    rule = topup_payload.get("rule") if isinstance(topup_payload, Mapping) else None
-    if isinstance(rule, Mapping) and rule.get("enabled"):
-        def cents(key: str) -> Optional[float]:
-            raw = rule.get(key)
-            value = _usage_number(raw.get("val")) if isinstance(raw, Mapping) else _usage_number(raw)
-            return value / 100.0 if value is not None else None
-
-        amount, floor, cap = cents("topupAmount"), cents("minBeforeHittingSl"), cents("maxAmountPerMonth")
-        text = "Auto top-up: on"
-        if amount is not None:
-            text += f" — adds ${amount:,.2f}"
-            if floor is not None:
-                text += f" when the balance falls below ${floor:,.2f}"
-        if cap is not None:
-            text += f" (at most ${cap:,.2f} per month)"
-        details.append(text)
-    elif topup_payload is not None:
-        details.append("Auto top-up: not set up.")
-    return plan, details, []
+_GROK_BILLING_KEYS = ("xai-oauth", "xai")
+_GROK_NO_ROUTE = (
+    "Hermes has no reader for an xAI sign-in's allowance yet, and a plugin may not read the login itself. "
+    "Shown instead: what Hermes recorded on Grok."
+)
 
 
 def _collect_grok_usage() -> Dict[str, Any]:
-    # Billing response mapping is informed by the MIT-licensed
-    # bnogalski/hermes-llm-quota project; see UPSTREAM.md.
-    try:
-        from hermes_cli.auth import resolve_xai_oauth_runtime_credentials
-
-        credentials = resolve_xai_oauth_runtime_credentials(refresh_if_expiring=True) or {}
-        token = str(credentials.get("api_key") or "").strip()
-    except Exception as error:
-        return _provider_payload("grok", status="unavailable", message=_provider_message(error))
-    if not token:
-        return _provider_payload("grok", status="not_configured", message="No Hermes xAI OAuth login was found.")
-
-    try:
-        import httpx
-    except ImportError:
-        return _provider_payload("grok", status="unavailable", message="Hermes HTTP client is unavailable.")
-
-    base_url = "https://cli-chat-proxy.grok.com/v1"
-    headers = {
-        "Authorization": f"Bearer {token}",
-        "Accept": "application/json",
-        "User-Agent": "xai-grok-cli",
-        "X-Xai-Token-Auth": "xai-grok-cli",
-        "x-grok-client-identifier": "grok-cli",
-        "x-grok-client-version": "0.2.103",
-    }
-    payloads: Dict[str, Mapping[str, Any]] = {}
-    errors: List[str] = []
-    statuses: List[int] = []
-    # The auto-top-up rule is a courtesy line: its failure never marks the
-    # card partial, so it keeps its own error list and stays out of statuses.
-    requests = (
-        ("weekly", "/billing", {"format": "credits"}, True),
-        ("monthly", "/billing", None, True),
-        ("topup", "/auto-topup-rule", None, False),
-    )
-    try:
-        with httpx.Client(timeout=AI_USAGE_PROVIDER_TIMEOUT_SECONDS) as client:
-            for name, path, params, essential in requests:
-                try:
-                    response = client.get(base_url + path, params=params, headers=headers)
-                    if essential:
-                        statuses.append(response.status_code)
-                    if response.status_code == 200:
-                        payload = response.json()
-                        if isinstance(payload, Mapping):
-                            payloads[name] = payload
-                        elif essential:
-                            errors.append(f"{name}: invalid response")
-                    elif essential:
-                        errors.append(f"{name}: HTTP {response.status_code}")
-                except Exception as error:
-                    if essential:
-                        errors.append(f"{name}: {_provider_message(error)}")
-    finally:
-        token = ""
-        headers.clear()
-
-    if not payloads:
-        if statuses and all(code == 401 for code in statuses):
-            return _provider_payload("grok", status="expired", message="The xAI OAuth login has expired.")
-        if statuses and all(code == 403 for code in statuses):
-            return _provider_payload("grok", status="forbidden", message="xAI rejected access to account usage.")
-        return _provider_payload(
-            "grok",
-            status="unavailable",
-            message="; ".join(errors) or "Grok usage is temporarily unavailable.",
-        )
-
-    windows = _grok_windows_from_payloads(payloads.get("weekly"), payloads.get("monthly"))
-    if not windows:
-        return _provider_payload(
-            "grok",
-            status="unavailable",
-            message="Grok returned neither a usage percentage nor a weekly billing period; the billing response shape may have changed.",
-            partial=bool(errors),
-        )
-    plan, details, links = _grok_card_extras(payloads.get("weekly"), payloads.get("topup"))
-    return _provider_payload(
+    for route in ("xai-oauth", "xai"):
+        snapshot = _hermes_account_usage(route)
+        if snapshot is not None and (getattr(snapshot, "windows", None) or getattr(snapshot, "details", None)):
+            card = _account_usage_payload("grok", snapshot)
+            card["usage_route"] = route
+            return card
+    if not _recorded_recently(_GROK_BILLING_KEYS):
+        return _provider_payload("grok", status="not_configured", message=_provider_not_configured_message("grok"))
+    card = _provider_payload(
         "grok",
         status="ok",
-        plan=plan,
-        windows=windows,
-        details=details,
-        links=links,
-        message="; ".join(errors) if errors else None,
-        partial=bool(errors),
+        plan="Recorded by Hermes",
+        message=_GROK_NO_ROUTE,
+        partial=True,
     )
-
-
-def _probe_grok() -> bool:
-    try:
-        from hermes_cli.auth import AuthError, resolve_xai_oauth_runtime_credentials
-    except ImportError:
-        return True
-    try:
-        credentials = resolve_xai_oauth_runtime_credentials(refresh_if_expiring=False) or {}
-    except AuthError:
-        return False
-    return bool(str(credentials.get("api_key") or "").strip())
+    # Filled per response from the profiles in scope (see _attach_local_usage_records).
+    card["local_windows"] = True
+    return card
 
 
 register_provider(
-    "grok", "Grok", "Hermes xAI OAuth", _collect_grok_usage,
-    probe=_probe_grok,
-    not_configured_message="No Hermes xAI OAuth login was found.",
-    billing_keys=("xai-oauth",),
+    "grok", "Grok", "Hermes", _collect_grok_usage,
+    probe=lambda: True,
+    not_configured_message="Hermes recorded no Grok use in this profile in the last 30 days.",
+    billing_keys=_GROK_BILLING_KEYS,
     registry_ids=("xai", "xai-oauth", "grok"),
-    hosts=("cli-chat-proxy.grok.com",), order=60, module=__name__,
+    hosts=(), via="hermes", order=60, module=__name__,
 )
 
 __all__ = [name for name in globals() if not name.startswith("__")]

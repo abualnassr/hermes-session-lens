@@ -1,4 +1,4 @@
-"""Hive (thehive.ai): no balance API, so the card shows the figure kept in .env."""
+"""Hive (thehive.ai): no balance API, so the card shows the figure kept as a Hermes secret."""
 
 from __future__ import annotations
 
@@ -23,16 +23,16 @@ def _collect_hive() -> Dict[str, Any]:
             "hive",
             status="not_configured" if not key else "ok",
             message=(
-                "Hive has no balance API. Set HIVE_CREDIT_REMAINING in the Hermes .env to track it here."
+                "Hive has no balance API. Set HIVE_CREDIT_REMAINING as a Hermes secret to track it here."
                 if key else "No HIVE_API_KEY is set in Hermes."
             ),
         )
-    window = _usage_window("Credit (kept in .env)", kind="balance", remaining=figure, unit="USD")
+    window = _usage_window("Credit (kept as a Hermes setting)", kind="balance", remaining=figure, unit="USD")
     return _service_payload("hive", status="ok", windows=[window])
 
 
 register_service(
-    "hive", "Hive", "Hermes .env key", collect=_collect_hive,
+    "hive", "Hive", "Hermes secret", collect=_collect_hive,
     env_keys=("HIVE_API_KEY", HIVE_MANUAL_KEY),
     mcp_hints=("thehive",),
     hosts=(), via="none", order=69, module=__name__,

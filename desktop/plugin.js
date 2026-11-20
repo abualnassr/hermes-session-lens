@@ -3409,13 +3409,13 @@ function RuntimeHealth({ ctx, period }) {
       }),
       jsxs('section', {
         children: [
-          jsx(SectionHeading, { title: 'Gateway and platforms', description: 'Current local gateway state for the default and named Hermes profiles.' }),
+          jsx(SectionHeading, { title: 'Gateway and platforms', description: gateways.some(row => row.served_by) ? 'One multiplexed Hermes gateway serves these profiles; each row shows its state and the platform adapters of that profile.' : 'Current local gateway state for the default and named Hermes profiles.' }),
           jsx(SimpleTable, {
             columns: [
               { key: 'profile', label: 'Profile' },
               { key: 'state', label: 'Gateway', render: row => jsx(Pill, { tone: row.state === 'running' ? 'accent' : 'neutral', children: row.state }) },
               { key: 'platforms', label: 'Platforms', sortValue: row => row.platforms?.length ? row.platforms.map(item => `${item.name}: ${item.state}`).join(' · ') : 'None recorded', render: row => row.platforms?.length ? row.platforms.map(item => `${item.name}: ${item.state}`).join(' · ') : 'None recorded' },
-              { key: 'active_agents', label: 'Agents', align: 'right', render: row => formatCount(row.active_agents) },
+              { key: 'active_agents', label: 'Agents', align: 'right', render: row => row.active_agents === null || row.active_agents === undefined ? '—' : formatCount(row.active_agents) },
               { key: 'updated_at', label: 'Updated', render: row => formatShortDate(row.updated_at), muted: true }
             ],
             rows: gateways,
@@ -3707,16 +3707,416 @@ function FleetView({ ctx, onOpenProfile }) {
   })
 }
 
-function OperationsView({ ctx, period, onDrill }) {
-  const [section, setSection] = useState('health')
+// ============================================================================
+// INSIGHTS: turns, prompt weight, prompt cache, cron history, gateway restarts
+// Views over records Hermes 0.23 started keeping. All read-only.
+// ============================================================================
+
+function useInsight(ctx, path, period, refetchInterval = 120_000) {
+  return useQuery({
+    queryKey: [PLUGIN_ID, path, activeProfilesParam, period.days, period.start_at, period.end_at],
+    queryFn: () => pluginRest(ctx, apiPath(path, period)),
+    refetchInterval
+  })
+}
+
+function insightNote(text) {
+  return jsx('p', { style: { color: color.quaternary, fontSize: '0.6875rem', lineHeight: 1.5, margin: 0 }, children: text })
+}
+
+function metricStrip(items) {
+  return jsx('div', {
+    style: { borderBottom: border, display: 'grid', gridTemplateColumns: `repeat(${items.length}, minmax(7rem, 1fr))`, overflowX: 'auto' },
+    children: items.map((item, index) => jsx(Metric, item, `metric-${index}`))
+  })
+}
+
+function sessionCell(row, onOpenSession, idKey = 'session_id') {
+  const id = row[idKey]
+  const label = row.title || id || '—'
+  if (!id || !onOpenSession) return label
+  return jsx('button', {
+    type: 'button',
+    onClick: () => onOpenSession(id),
+    title: `Open session ${id}`,
+    style: { background: 'transparent', border: 'none', color: color.accent, cursor: 'pointer', fontSize: 'inherit', padding: 0, textAlign: 'left' },
+    children: label
+  })
+}
+
+function turnCost(row) {
+  if (row.cost_usd > 0) return formatCost(row.cost_usd, 'estimated')
+  if (row.cost_status === 'included') return 'Included'
+  return row.cost_status === 'unknown' ? 'Unpriced' : formatCost(row.cost_usd, 'estimated')
+}
+
+function flagPills(flags) {
+  return jsx('span', {
+    style: { display: 'inline-flex', flexWrap: 'wrap', gap: '0.25rem' },
+    children: (flags || []).map(flag => jsx(Pill, { tone: flag === 'compacted' ? 'neutral' : 'danger', children: flag }, flag))
+  })
+}
+
+function shareBar(percent) {
+  const value = Math.max(0, Math.min(100, Number(percent) || 0))
+  return jsxs('span', {
+    style: { alignItems: 'center', display: 'inline-flex', gap: '0.4rem', minWidth: '7rem' },
+    children: [
+      jsx('span', {
+        style: { background: color.surfaceRaised, borderRadius: '999px', display: 'inline-block', height: '0.35rem', overflow: 'hidden', width: '4.5rem' },
+        children: jsx('span', { style: { background: color.accent, display: 'block', height: '100%', width: `${value}%` } })
+      }),
+      jsx('span', { style: tabular, children: `${value.toFixed(value < 10 ? 1 : 0)}%` })
+    ]
+  })
+}
+
+function TurnsView({ ctx, period, onOpenSession }) {
+  const query = useInsight(ctx, '/turns', period)
+  if (queryPending(query)) return jsx(LoadingBlock, { rows: 8 })
+  if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'Turn history unavailable' })
+  const data = query.data
+  if (!data.available) {
+    return jsx(EmptyState, { title: 'No gateway turns in this period', description: 'Hermes 0.23 and later record one ledger row per gateway turn. Turns run outside the gateway are not in the ledger.' })
+  }
+  const summary = data.summary
+  const problems = summary.failed + summary.interrupted + summary.partial + (data.problems || []).filter(row => (row.flags || []).includes('iteration cap')).length
+  const when = row => formatShortDate(row.at)
+  return jsxs('div', {
+    style: { display: 'grid', gap: '1.5rem' },
+    children: [
+      metricStrip([
+        { label: 'Gateway turns', value: formatCount(summary.turns), detail: `${summary.avg_api_calls} API calls each on average` },
+        { label: 'Median turn cost', value: summary.median_cost_usd === null ? '—' : formatCost(summary.median_cost_usd, 'estimated'), detail: `${formatCost(summary.cost_usd, 'estimated')} in the period` },
+        { label: 'Turn duration', value: formatDuration(summary.duration_p50_seconds), detail: `p95 ${formatDuration(summary.duration_p95_seconds)}` },
+        { label: 'Turns with a problem', value: formatCount(problems), detail: `${summary.interrupted} interrupted · ${summary.failed} failed`, danger: summary.failed > 0 }
+      ]),
+      jsxs('section', {
+        children: [
+          jsx(SectionHeading, { title: 'Costliest turns', description: 'Single turns that cost the most, priced the way Hermes recorded them. Subscription turns show their API-price equivalent.' }),
+          jsx(SimpleTable, {
+            columns: [
+              { key: 'at', label: 'When', render: when, sortValue: row => row.at || 0, muted: true },
+              { key: 'title', label: 'Session', render: row => sessionCell(row, onOpenSession) },
+              { key: 'model', label: 'Model' },
+              { key: 'cost_usd', label: 'Cost', align: 'right', render: turnCost, sortValue: row => row.cost_usd || 0 },
+              { key: 'api_calls', label: 'Calls', align: 'right', render: row => formatCount(row.api_calls) },
+              { key: 'tokens', label: 'Tokens', align: 'right', render: row => formatCount(row.tokens) },
+              { key: 'duration_seconds', label: 'Took', align: 'right', render: row => formatDuration(row.duration_seconds) }
+            ],
+            rows: data.costliest
+          })
+        ]
+      }),
+      jsxs('section', {
+        children: [
+          jsx(SectionHeading, { title: 'Turns by model', description: 'How long a turn takes and what it costs on each model. A problem is a turn that failed, was interrupted, ended partial, ran out of context, or hit the iteration cap.' }),
+          jsx(SimpleTable, {
+            columns: [
+              { key: 'model', label: 'Model' },
+              { key: 'turns', label: 'Turns', align: 'right', render: row => formatCount(row.turns) },
+              { key: 'avg_cost_usd', label: 'Avg cost', align: 'right', render: row => row.avg_cost_usd > 0 ? formatCost(row.avg_cost_usd, 'estimated') : 'Included or unpriced', sortValue: row => row.avg_cost_usd },
+              { key: 'avg_api_calls', label: 'Avg calls', align: 'right' },
+              { key: 'duration_p50_seconds', label: 'p50', align: 'right', render: row => formatDuration(row.duration_p50_seconds) },
+              { key: 'duration_p95_seconds', label: 'p95', align: 'right', render: row => formatDuration(row.duration_p95_seconds) },
+              { key: 'problem_rate', label: 'Problems', align: 'right', render: row => row.problems ? `${row.problems} (${formatPercent(row.problem_rate)})` : '0' }
+            ],
+            rows: data.models
+          })
+        ]
+      }),
+      (data.problems || []).length
+        ? jsxs('section', {
+            children: [
+              jsx(SectionHeading, { title: 'Turns that went wrong', description: 'Most recent first, with the reason Hermes recorded.' }),
+              jsx(SimpleTable, {
+                columns: [
+                  { key: 'at', label: 'When', render: when, sortValue: row => row.at || 0, muted: true },
+                  { key: 'title', label: 'Session', render: row => sessionCell(row, onOpenSession) },
+                  { key: 'flags', label: 'What happened', render: row => flagPills(row.flags), sortValue: row => (row.flags || []).join(',') },
+                  { key: 'exit_reason', label: 'Exit reason', muted: true },
+                  { key: 'error', label: 'Detail', render: row => row.failure_reason || row.error || '—', muted: true }
+                ],
+                rows: data.problems
+              })
+            ]
+          })
+        : null,
+      insightNote(`Exit reasons: ${(data.exit_reasons || []).map(item => `${item.reason} ${formatCount(item.turns)}`).join(' · ')}. ${data.definition}`)
+    ]
+  })
+}
+
+function PromptCacheView({ ctx, period, onOpenSession }) {
+  const weightQuery = useInsight(ctx, '/prompt-weight', period)
+  const cacheQuery = useInsight(ctx, '/prompt-cache', period)
+  if (queryPending(weightQuery)) return jsx(LoadingBlock, { rows: 8 })
+  if (weightQuery.isError) return jsx(ErrorBlock, { error: weightQuery.error, onRetry: weightQuery.refetch, title: 'Prompt weight unavailable' })
+  const weight = weightQuery.data
+  const cache = cacheQuery.data
+  const latest = weight.latest
+  const summary = weight.summary
+  const skills = latest?.skills
+  return jsxs('div', {
+    style: { display: 'grid', gap: '1.5rem' },
+    children: [
+      metricStrip([
+        { label: 'System prompt', value: `${formatCount(summary.avg_system_tokens)} tok`, detail: `largest ${formatCount(summary.max_system_tokens)} · ${formatCount(summary.distinct_prompts)} versions` },
+        { label: 'Tool schemas', value: latest ? `${formatCount(latest.tools.tokens)} tok` : '—', detail: latest ? `${latest.tools.count} tools in the latest session` : 'not recorded' },
+        { label: 'Re-sent prompt share', value: summary.resent_share_percent === null ? '—' : `${summary.resent_share_percent}%`, detail: `of ${formatCount(summary.prompt_side_tokens)} prompt-side tokens` },
+        { label: 'Cache hit ratio', value: cache ? formatPercent(cache.summary.hit_ratio) : '—', detail: cache ? `${cache.summary.warm_sessions} session cache${cache.summary.warm_sessions === 1 ? '' : 's'} warm now` : 'loading' }
+      ]),
+      latest
+        ? jsxs('section', {
+            children: [
+              jsx(SectionHeading, { title: 'What the system prompt is made of', description: `The prompt of the most recent session (${latest.title || latest.session_id}), split into its parts. Every API call sends all of it.` }),
+              jsx(SimpleTable, {
+                columns: [
+                  { key: 'label', label: 'Part' },
+                  { key: 'tokens', label: 'Tokens', align: 'right', render: row => formatCount(row.tokens) },
+                  { key: 'share_percent', label: 'Share', render: row => shareBar(row.share_percent), sortValue: row => row.share_percent }
+                ],
+                rows: latest.segments
+              })
+            ]
+          })
+        : null,
+      skills && skills.listed
+        ? jsxs('section', {
+            children: [
+              jsx(SectionHeading, {
+                title: 'Skills listed in every prompt but rarely used',
+                description: `${skills.listed} skills are listed (${formatCount(skills.tokens)} tokens per call). ${skills.rarely_used} of them, ${formatCount(skills.rarely_used_tokens)} tokens per call, show no use in ${skills.stale_days} days and are not pinned. Archiving or disabling them in Hermes takes them out of the prompt.`
+              }),
+              skills.usage_file_found
+                ? jsx(SimpleTable, {
+                    columns: [
+                      { key: 'name', label: 'Skill' },
+                      { key: 'tokens', label: 'Tokens per call', align: 'right' },
+                      { key: 'use_count', label: 'Uses ever', align: 'right', render: row => formatCount(row.use_count) },
+                      { key: 'last_used_at', label: 'Last used', render: row => row.last_used_at ? formatShortDate(row.last_used_at) : 'never', sortValue: row => row.last_used_at || 0, muted: true }
+                    ],
+                    rows: skills.rows
+                  })
+                : insightNote('Hermes has not written skills/.usage.json for this profile, so use counts are unknown.')
+            ]
+          })
+        : null,
+      latest && latest.tools.largest.length
+        ? jsxs('section', {
+            children: [
+              jsx(SectionHeading, { title: 'Largest tool schemas', description: 'Tool definitions ride along with every call, like the prompt.' }),
+              jsx(SimpleTable, {
+                columns: [
+                  { key: 'name', label: 'Tool' },
+                  { key: 'tokens', label: 'Tokens per call', align: 'right', render: row => formatCount(row.tokens) }
+                ],
+                rows: latest.tools.largest
+              })
+            ]
+          })
+        : null,
+      (weight.heaviest || []).length
+        ? jsxs('section', {
+            children: [
+              jsx(SectionHeading, { title: 'Sessions that re-sent the most prompt', description: 'Prompt plus tool schemas times API calls. Long bot sessions dominate; most of it is billed at the cache-read rate.' }),
+              jsx(SimpleTable, {
+                columns: [
+                  { key: 'title', label: 'Session', render: row => sessionCell(row, onOpenSession, 'id') },
+                  { key: 'model', label: 'Model', muted: true },
+                  { key: 'calls', label: 'Calls', align: 'right', render: row => formatCount(row.calls) },
+                  { key: 'system_tokens', label: 'Prompt', align: 'right', render: row => formatCount(row.system_tokens) },
+                  { key: 'tool_tokens', label: 'Tools', align: 'right', render: row => formatCount(row.tool_tokens) },
+                  { key: 'resent_tokens', label: 'Re-sent', align: 'right', render: row => formatCount(row.resent_tokens) }
+                ],
+                rows: weight.heaviest
+              })
+            ]
+          })
+        : null,
+      (weight.auxiliary || []).length
+        ? jsxs('section', {
+            children: [
+              jsx(SectionHeading, { title: 'Background work Hermes did for you', description: 'Calls Hermes makes besides your turns: reviews, titles, vision, compression, cache keep-alive.' }),
+              jsx(SimpleTable, {
+                columns: [
+                  { key: 'task', label: 'Task' },
+                  { key: 'calls', label: 'Calls', align: 'right', render: row => formatCount(row.calls) },
+                  { key: 'tokens', label: 'Tokens', align: 'right', render: row => formatCount(row.tokens) },
+                  { key: 'cost_usd', label: 'Cost', align: 'right', render: row => formatCost(row.cost_usd, 'estimated') }
+                ],
+                rows: weight.auxiliary
+              })
+            ]
+          })
+        : null,
+      insightNote(weight.definition),
+      cache && cache.available
+        ? jsxs('section', {
+            style: { display: 'grid', gap: '1rem' },
+            children: [
+              jsx(SectionHeading, {
+                title: 'Prompt cache',
+                description: `Keep-alive calls in the last ${period.days || 7} days: ${formatCount(cache.summary.keepalive_calls)}, ${formatCost(cache.summary.keepalive_cost_usd, 'estimated')}. ${cache.definition}`
+              }),
+              jsx(SimpleTable, {
+                columns: [
+                  { key: 'model', label: 'Model' },
+                  { key: 'provider', label: 'Route', muted: true },
+                  { key: 'hit_ratio', label: 'Hit ratio', align: 'right', render: row => formatPercent(row.hit_ratio) },
+                  { key: 'write_ratio', label: 'Writes', align: 'right', render: row => formatPercent(row.write_ratio) },
+                  { key: 'prompt_tokens', label: 'Prompt tokens', align: 'right', render: row => formatCount(row.prompt_tokens) }
+                ],
+                rows: cache.models
+              }),
+              (cache.sessions || []).length
+                ? jsx(SimpleTable, {
+                    columns: [
+                      { key: 'title', label: 'Session', render: row => sessionCell(row, onOpenSession) },
+                      { key: 'model', label: 'Model', muted: true },
+                      { key: 'tier', label: 'Tier' },
+                      { key: 'warm', label: 'State', render: row => jsx(Pill, { tone: row.warm ? 'accent' : 'neutral', children: row.warm ? `warm ${formatCountdown(row.warm_until) || ''}`.trim() : 'expired' }), sortValue: row => (row.warm ? 1 : 0) },
+                      { key: 'read_tokens', label: 'Cached prefix', align: 'right', render: row => formatCount(row.read_tokens) },
+                      { key: 'sent_at', label: 'Last call', render: row => formatShortDate(row.sent_at), sortValue: row => row.sent_at || 0, muted: true }
+                    ],
+                    rows: cache.sessions
+                  })
+                : null,
+              (cache.routes || []).length
+                ? jsx(SimpleTable, {
+                    columns: [
+                      { key: 'model', label: 'Route model' },
+                      { key: 'provider', label: 'Provider', muted: true },
+                      { key: 'samples', label: 'Samples', align: 'right' },
+                      { key: 'median_hit_gap_seconds', label: 'Typical gap between hits', align: 'right', render: row => formatDuration(row.median_hit_gap_seconds) },
+                      { key: 'longest_hit_seconds', label: 'Longest hit', align: 'right', render: row => formatDuration(row.longest_hit_seconds) }
+                    ],
+                    rows: cache.routes
+                  })
+                : null
+            ]
+          })
+        : null
+    ]
+  })
+}
+
+function CronHistory({ ctx, period }) {
+  const query = useInsight(ctx, '/cron-history', period)
+  if (queryPending(query)) return jsx(LoadingBlock, { rows: 4 })
+  if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'Cron run history unavailable' })
+  const data = query.data
+  if (!data.available) return null
+  const statusText = statuses => Object.entries(statuses || {}).map(([status, count]) => `${count} ${status}`).join(' · ') || '—'
+  return jsxs('section', {
+    style: { display: 'grid', gap: '1rem' },
+    children: [
+      jsx(SectionHeading, {
+        title: 'Run history',
+        description: `${formatCount(data.summary.runs)} fires in the period (${statusText(data.summary.statuses)}), ${data.summary.open_incidents} open incident${data.summary.open_incidents === 1 ? '' : 's'}, ${formatCount(data.summary.tokens)} tokens. ${data.definition}`
+      }),
+      jsx(SimpleTable, {
+        columns: [
+          { key: 'name', label: 'Job' },
+          { key: 'runs', label: 'Runs', align: 'right' },
+          { key: 'problems', label: 'Not completed', align: 'right', render: row => row.problems ? jsx('span', { style: { color: color.danger, fontWeight: 600 }, children: row.problems }) : '0' },
+          { key: 'statuses', label: 'Outcomes', render: row => statusText(row.statuses), sortValue: row => row.problems, muted: true },
+          { key: 'duration_p50_seconds', label: 'Typical run', align: 'right', render: row => formatDuration(row.duration_p50_seconds) },
+          { key: 'avg_tokens_per_fire', label: 'Tokens per fire', align: 'right', render: row => row.avg_tokens_per_fire ? formatCount(row.avg_tokens_per_fire) : '—' },
+          { key: 'last_at', label: 'Last fire', render: row => formatShortDate(row.last_at), sortValue: row => row.last_at || 0, muted: true }
+        ],
+        rows: data.jobs
+      }),
+      (data.incidents || []).length
+        ? jsx(SimpleTable, {
+            columns: [
+              { key: 'name', label: 'Incident job' },
+              { key: 'state', label: 'State', render: row => jsx(Pill, { tone: row.open ? 'danger' : 'neutral', children: row.state || 'open' }) },
+              { key: 'failure_type', label: 'Type', muted: true },
+              { key: 'last_seen_at', label: 'Last seen', render: row => formatShortDate(row.last_seen_at), sortValue: row => row.last_seen_at || 0, muted: true },
+              { key: 'error', label: 'Error', muted: true }
+            ],
+            rows: data.incidents
+          })
+        : null,
+      jsx(SimpleTable, {
+        columns: [
+          { key: 'at', label: 'Fired', render: row => formatShortDate(row.at), sortValue: row => row.at || 0, muted: true },
+          { key: 'name', label: 'Job' },
+          { key: 'status', label: 'Outcome', render: row => jsx(Pill, { tone: row.status === 'completed' ? 'accent' : 'danger', children: row.status }) },
+          { key: 'duration_seconds', label: 'Took', align: 'right', render: row => formatDuration(row.duration_seconds) },
+          { key: 'delivery', label: 'Delivery', muted: true },
+          { key: 'error', label: 'Error', render: row => row.error || '—', muted: true }
+        ],
+        rows: data.recent,
+        emptyTitle: 'No fires in this period'
+      })
+    ]
+  })
+}
+
+function GatewayHistory({ ctx, period }) {
+  const query = useInsight(ctx, '/gateway-history', period)
+  if (queryPending(query)) return jsx(LoadingBlock, { rows: 3 })
+  if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'Gateway history unavailable' })
+  const data = query.data
+  if (!data.available) return null
+  const days = data.starts_per_day || []
+  const peak = Math.max(1, ...days.map(item => item.starts))
+  return jsxs('section', {
+    style: { display: 'grid', gap: '1rem' },
+    children: [
+      jsx(SectionHeading, { title: 'Gateway restarts', description: data.definition }),
+      days.length
+        ? jsx('div', {
+            'aria-label': 'Gateway starts per day',
+            style: { alignItems: 'flex-end', display: 'flex', gap: '2px', height: '3rem' },
+            children: days.map(item => jsx('div', {
+              title: `${item.day}: ${item.starts} start${item.starts === 1 ? '' : 's'}`,
+              style: { background: item.starts > 3 ? color.warning : color.accent, borderRadius: '2px 2px 0 0', flex: 1, height: `${Math.max(8, (item.starts / peak) * 100)}%`, minWidth: '4px' }
+            }, item.day))
+          })
+        : null,
+      jsx(SimpleTable, {
+        columns: [
+          { key: 'profile', label: 'Profile' },
+          { key: 'running', label: 'Now', render: row => jsx(Pill, { tone: row.running ? 'accent' : 'neutral', children: row.running ? `up ${formatDuration(row.current_uptime_seconds)}` : 'not running' }), sortValue: row => (row.running ? 1 : 0) },
+          { key: 'starts', label: 'Starts', align: 'right', render: row => `${formatCount(row.starts)} (${formatCount(row.starts_all_time)} all time)`, sortValue: row => row.starts },
+          { key: 'median_uptime_seconds', label: 'Typical run', align: 'right', render: row => formatDuration(row.median_uptime_seconds) },
+          { key: 'downtime_seconds', label: 'Down between runs', align: 'right', render: row => formatDuration(row.downtime_seconds) },
+          { key: 'longest_gap_seconds', label: 'Longest gap', align: 'right', render: row => formatDuration(row.longest_gap_seconds) }
+        ],
+        rows: data.profiles
+      }),
+      jsx(SimpleTable, {
+        columns: [
+          { key: 'started_at', label: 'Started', render: row => formatShortDate(row.started_at), sortValue: row => row.started_at, muted: true },
+          { key: 'profile', label: 'Profile' },
+          { key: 'pid', label: 'PID', align: 'right', muted: true },
+          { key: 'uptime_seconds', label: 'Ran for', align: 'right', render: row => row.alive ? `${formatDuration(row.uptime_seconds)} (running)` : formatDuration(row.uptime_seconds) },
+          { key: 'gap_after_seconds', label: 'Down after', align: 'right', render: row => formatDuration(row.gap_after_seconds) }
+        ],
+        rows: data.timeline
+      })
+    ]
+  })
+}
+
+function OperationsView({ ctx, period, onDrill, onOpenSession }) {
+  const [section, setSection] = useState(() => ctx.storage.get('operationsSection', 'health'))
+  useEffect(() => { ctx.storage.set('operationsSection', section) }, [ctx, section])
   const options = [
     { id: 'health', label: 'Health' },
+    { id: 'turns', label: 'Turns' },
+    { id: 'prompt', label: 'Prompt & cache' },
     { id: 'profiles', label: 'Profiles' },
     { id: 'schedules', label: 'Schedules' }
   ]
-  let content = jsx(RuntimeHealth, { ctx, period })
+  let content = jsxs(Fragment, { children: [jsx(RuntimeHealth, { ctx, period }), jsx(GatewayHistory, { ctx, period })] })
+  if (section === 'turns') content = jsx(TurnsView, { ctx, period, onOpenSession })
+  if (section === 'prompt') content = jsx(PromptCacheView, { ctx, period, onOpenSession })
   if (section === 'profiles') content = jsx(ProfilesView, { ctx, period })
-  if (section === 'schedules') content = jsx(SchedulesView, { ctx, period, onSelectJob: label => onDrill && onDrill({ search: label }) })
+  if (section === 'schedules') content = jsxs(Fragment, { children: [jsx(SchedulesView, { ctx, period, onSelectJob: label => onDrill && onDrill({ search: label }) }), jsx(CronHistory, { ctx, period })] })
   return jsx('div', {
     style: { flex: 1, minHeight: 0, overflow: 'auto', padding: '1rem' },
     children: jsxs('div', {
@@ -3725,7 +4125,7 @@ function OperationsView({ ctx, period, onDrill }) {
         jsxs('div', {
           style: { alignItems: 'center', display: 'flex', flexWrap: 'wrap', gap: '0.75rem', justifyContent: 'space-between' },
           children: [
-            jsx(SectionHeading, { title: 'Operations', description: 'Runtime health, profiles, and schedules for the Hermes agent.' }),
+            jsx(SectionHeading, { title: 'Operations', description: 'Runtime health and restarts, turn costs, prompt weight and cache, profiles, and schedules for the Hermes agent.' }),
             jsx(SegmentedControl, { options, value: section, onChange: setSection })
           ]
         }),
@@ -3879,9 +4279,11 @@ function UsageAttribution({ window, onDrill }) {
   const attribution = window.attribution
   if (!attribution) return null
   const trailing = attribution.basis === 'trailing_7d'
-  const scope = trailing ? 'the last 7 days' : 'this window'
+  const recordedSpan = attribution.basis === 'trailing'
+  const scope = trailing ? 'the last 7 days' : recordedSpan ? 'this span' : 'this window'
   const sessions = Number(attribution.sessions) || 0
   if (!sessions) {
+    if (recordedSpan) return null
     return jsx('div', {
       style: { color: color.quaternary, fontSize: '0.625rem', lineHeight: 1.45 },
       children: trailing
@@ -3957,7 +4359,9 @@ function UsageWindow({ window, series, ledgerEntry, onDrill }) {
   const remainingAmount = formatUsageAmount(window.remaining, window.unit)
   const usedAmount = formatUsageAmount(window.used, window.unit)
   const limitAmount = formatUsageAmount(window.limit, window.unit)
-  const value = remainingAmount || (remainingPercent !== null ? `${Math.round(remainingPercent)}% remaining` : 'Recorded balance')
+  const value = window.kind === 'local'
+    ? `${formatCount(window.used || 0)} tokens`
+    : remainingAmount || (remainingPercent !== null ? `${Math.round(remainingPercent)}% remaining` : 'Recorded balance')
   // The backend computes the one forecast every surface shows (card line,
   // attention strip, header counter, AI Models cell, digest), with its rules
   // and its basis; the desktop only renders it.
@@ -3966,6 +4370,7 @@ function UsageWindow({ window, series, ledgerEntry, onDrill }) {
   const detailParts = []
   if (usedAmount && limitAmount) detailParts.push(`${usedAmount} used of ${limitAmount}`)
   if (window.detail) detailParts.push(window.detail)
+  if (window.kind === 'local') detailParts.push('recorded by Hermes on this install')
   if (window.reset_at) {
     const countdown = formatCountdown(window.reset_at)
     detailParts.push(`Resets ${formatDate(window.reset_at)}${countdown ? ` · ${countdown}` : ''}`)
@@ -4061,7 +4466,78 @@ function ProviderWindows({ provider, history, ledger, onDrill }) {
   })
 }
 
-function UsageProvider({ ctx, provider, history, ledger, onRefresh, onDrill }) {
+// model.options rows keyed by Hermes provider slug.
+function pickerRowsBySlug(picker) {
+  const rows = Array.isArray(picker?.providers) ? picker.providers : []
+  const bySlug = {}
+  for (const row of rows) {
+    const slug = String(row?.slug || '').toLowerCase()
+    if (slug) bySlug[slug] = row
+  }
+  return bySlug
+}
+
+function pickerRowsFor(bySlug, provider) {
+  if (!bySlug) return []
+  const ids = provider.hermes_ids || []
+  const seen = new Set()
+  return ids
+    .map(id => bySlug[String(id).toLowerCase()])
+    .filter(row => row && !seen.has(row.slug) && seen.add(row.slug))
+}
+
+function pickerWindowText(window) {
+  const used = Number(window?.used_percent)
+  const parts = [`${window?.label || 'Usage'} ${Number.isFinite(used) ? `${Math.round(used)}% used` : 'unknown'}`]
+  const countdown = window?.resets_at ? formatCountdown(window.resets_at) : ''
+  if (countdown) parts.push(`resets ${countdown}`)
+  return parts.join(', ')
+}
+
+const pickerAccountStates = { ready: 'ready', limited: 'rate-limited', unknown: 'no reading yet', unavailable: 'sign-in no longer works' }
+
+// What Hermes itself reports for this provider in its model picker: a
+// rate-limit hold, per-account usage of a pooled login, and usage windows
+// the card could not read on its own. Nothing here is fetched by Session Lens.
+function HermesPickerNotes({ provider, rows }) {
+  const lines = []
+  const cardHasPercent = (provider.windows || []).some(window => Number.isFinite(Number(window.percentage_used)))
+  for (const row of rows) {
+    const name = rows.length > 1 ? `${row.name || row.slug}: ` : ''
+    const limit = row.limit
+    if (limit?.scope === 'account') {
+      const when = limit.resets_at ? `until ${formatDate(limit.resets_at)}${formatCountdown(limit.resets_at) ? ` (${formatCountdown(limit.resets_at)})` : ''}` : 'for now'
+      lines.push({ tone: 'warning', text: `${name}Hermes has this account rate-limited ${when}.` })
+    } else if (limit?.scope === 'models' && limit.models && Object.keys(limit.models).length) {
+      lines.push({ tone: 'warning', text: `${name}Rate-limited models: ${Object.entries(limit.models).map(([model, at]) => `${model} until ${formatDate(at)}`).join(' · ')}.` })
+    }
+    const accounts = Array.isArray(row.usage?.accounts) ? row.usage.accounts : []
+    accounts.forEach((account, index) => {
+      const label = account.label || `Account ${index + 1}`
+      const state = pickerAccountStates[account.state] || account.state || 'unknown'
+      const windows = (account.windows || []).map(pickerWindowText).join(' · ')
+      lines.push({ tone: account.state === 'limited' || account.state === 'unavailable' ? 'warning' : 'neutral', text: `${name}${label}: ${state}${windows ? ` · ${windows}` : ''}` })
+    })
+    const windows = Array.isArray(row.usage?.windows) ? row.usage.windows : []
+    if (!accounts.length && windows.length && !cardHasPercent) {
+      lines.push({ tone: 'neutral', text: `${name}Hermes reads: ${windows.map(pickerWindowText).join(' · ')}` })
+    }
+  }
+  if (!lines.length) return null
+  return jsxs('div', {
+    title: 'Reported by Hermes itself (its model picker): Hermes holds these credentials and reads their usage; Session Lens only shows what it says.',
+    style: { borderTop: border, display: 'grid', gap: '0.25rem', marginTop: '0.65rem', paddingTop: '0.6rem' },
+    children: [
+      jsx('div', { style: { color: color.quaternary, fontSize: '0.625rem', fontWeight: 600, letterSpacing: '0.02em', textTransform: 'uppercase' }, children: 'From Hermes' }),
+      ...lines.map((line, index) => jsx('div', {
+        style: { color: line.tone === 'warning' ? color.warning : color.tertiary, fontSize: '0.6875rem', lineHeight: 1.45 },
+        children: line.text
+      }, `picker-${index}`))
+    ]
+  })
+}
+
+function UsageProvider({ ctx, provider, history, ledger, onRefresh, onDrill, pickerRows }) {
   const status = usageStatus(provider)
   const messageDanger = ['expired', 'forbidden', 'unavailable'].includes(provider.status)
   const [busy, setBusy] = useState(false)
@@ -4146,6 +4622,7 @@ function UsageProvider({ ctx, provider, history, ledger, onRefresh, onDrill }) {
               ? 'Sign in or configure this provider in Hermes to expose account usage.'
               : 'No quota windows are available right now.'
           }),
+      jsx(HermesPickerNotes, { provider, rows: pickerRows || [] }),
       provider.details?.length
         ? jsx('ul', {
             style: { color: color.tertiary, display: 'grid', fontSize: '0.6875rem', gap: '0.25rem', lineHeight: 1.45, margin: '0.65rem 0 0', paddingLeft: '1rem' },
@@ -4188,7 +4665,7 @@ function UsageProvider({ ctx, provider, history, ledger, onRefresh, onDrill }) {
   })
 }
 
-function UsageProviderGroup({ ctx, title, description, providers, narrow, id, history, ledger, onRefresh, onDrill }) {
+function UsageProviderGroup({ ctx, title, description, providers, narrow, id, history, ledger, onRefresh, onDrill, picker }) {
   if (!providers.length) return null
   return jsxs('section', {
     'aria-labelledby': id,
@@ -4209,7 +4686,7 @@ function UsageProviderGroup({ ctx, title, description, providers, narrow, id, hi
       }),
       jsx('div', {
         style: { display: 'grid', gap: '0.85rem', gridTemplateColumns: narrow ? 'minmax(0, 1fr)' : 'repeat(2, minmax(0, 1fr))' },
-        children: providers.map(provider => jsx(UsageProvider, { ctx, provider, history, ledger, onRefresh, onDrill }, provider.provider))
+        children: providers.map(provider => jsx(UsageProvider, { ctx, provider, history, ledger, onRefresh, onDrill, pickerRows: provider.account_extra ? [] : pickerRowsFor(picker, provider) }, provider.provider))
       })
     ]
   })
@@ -4625,7 +5102,7 @@ function ServicesSection({ ctx, query, narrow, history, ledger, onRefresh }) {
   })
 }
 
-function AIUsageView({ ctx, query, servicesQuery, narrow, refreshError, history, ledger, onRefreshProvider, onRefreshService, onDrill, budgets, onBudgetsChange, period }) {
+function AIUsageView({ ctx, query, servicesQuery, narrow, refreshError, history, ledger, onRefreshProvider, onRefreshService, onDrill, budgets, onBudgetsChange, period, picker }) {
   if (queryPending(query)) return jsx(LoadingBlock, { rows: 8 })
   if (query.isError) return jsx(ErrorBlock, { error: query.error, onRetry: query.refetch, title: 'AI usage is unavailable' })
   const data = query.data
@@ -4665,6 +5142,7 @@ function AIUsageView({ ctx, query, servicesQuery, narrow, refreshError, history,
               title: 'Your providers',
               description: 'Account limits and balances for the providers Hermes holds credentials for.',
               providers: orderedProviders,
+              picker: pickerRowsBySlug(picker),
               narrow,
               history,
               ledger,
@@ -5631,6 +6109,19 @@ function SessionLensPage({ ctx }) {
     enabled: tab === 'ai-usage' || tab === 'ai-models',
     refetchInterval: tab === 'ai-usage' || tab === 'ai-models' ? 300_000 : false
   })
+  // Hermes' own model picker data (gateway JSON-RPC, cached-only: refresh is
+  // false). Hermes holds every credential and reads every usage API itself;
+  // Session Lens only overlays what Hermes reports: rate-limit holds and
+  // per-account usage of pooled logins. It describes the gateway's active
+  // profile, so it is applied only when the page reads that profile.
+  const hermesPickerQuery = useQuery({
+    queryKey: [PLUGIN_ID, 'hermes-model-options'],
+    queryFn: () => host.request('model.options', { refresh: false }),
+    enabled: tab === 'ai-usage',
+    refetchInterval: tab === 'ai-usage' ? 300_000 : false,
+    retry: false,
+    staleTime: 60_000
+  })
   const servicesQuery = useQuery({
     queryKey: [PLUGIN_ID, 'services'],
     queryFn: () => pluginRest(ctx, '/services'),
@@ -5954,7 +6445,7 @@ function SessionLensPage({ ctx }) {
       watch: { rates: watchRates, onRatesChange: setWatchRates, notify: watchNotify, onNotifyChange: setWatchNotify, onOpenSession: openSessionById }
     })
   }
-  if (tab === 'operations') content = jsx(OperationsView, { ctx, period, onDrill: drillToSessions })
+  if (tab === 'operations') content = jsx(OperationsView, { ctx, period, onDrill: drillToSessions, onOpenSession: openSessionById })
   if (tab === 'tools') content = jsx(ToolsView, { ctx, period, onOpenSession: openSessionById })
   if (tab === 'rules') content = jsx(RulesView, { ctx, period, onDrill: drillToSessions, rules, onRulesChange: setRules, availableProfiles })
   if (tab === 'system') content = jsx(SystemView, { ctx })
@@ -5987,6 +6478,7 @@ function SessionLensPage({ ctx }) {
   if (tab === 'ai-usage') content = jsx(AIUsageView, {
     period,
     ctx,
+    picker: activeProfilesParam ? null : hermesPickerQuery.data,
     budgets,
     onBudgetsChange: updateBudget,
     query: aiUsageQuery,

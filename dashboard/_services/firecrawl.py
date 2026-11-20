@@ -70,7 +70,7 @@ def _collect_firecrawl() -> Dict[str, Any]:
     result = fetch(primary, None)
     extras: List[Dict[str, Any]] = []
     seen = {primary}
-    for name in _dotenv_key_names(_hermes_home() / ".env"):
+    for name in _secret_names():
         service_id, suffix = _service_for_env_key(name)
         if service_id != "firecrawl" or not suffix:
             continue
@@ -87,7 +87,7 @@ def _collect_firecrawl() -> Dict[str, Any]:
 
 
 register_service(
-    "firecrawl", "Firecrawl", "Hermes .env key", collect=_collect_firecrawl,
+    "firecrawl", "Firecrawl", "Hermes secret", collect=_collect_firecrawl,
     env_keys=("FIRECRAWL_API_KEY",), mcp_hints=("firecrawl",),
     hosts=("api.firecrawl.dev",), order=10, module=__name__,
 )

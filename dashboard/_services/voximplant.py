@@ -72,7 +72,7 @@ def _collect_voximplant() -> Dict[str, Any]:
 
 
 register_service(
-    "voximplant", "Voximplant", "Hermes .env service-account key", collect=_collect_voximplant,
+    "voximplant", "Voximplant", "Hermes service-account secret", collect=_collect_voximplant,
     env_keys=("VOXIMPLANT_ACCOUNT_ID", "VOXIMPLANT_KEY_ID", "VOXIMPLANT_PRIVATE_KEY"),
     mcp_hints=("voximplant",),
     hosts=("api.voximplant.com",), order=65, module=__name__,

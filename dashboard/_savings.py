@@ -33,7 +33,7 @@ def _mix_rates(model: str, provider: str) -> Optional[Tuple[float, float, float,
         return cached[1]
     rates = None
     try:
-        from agent.usage_pricing import get_pricing_entry
+        from ._pricing import _recorded_pricing_entry as get_pricing_entry
 
         entry = get_pricing_entry(key[0], key[1], None)
     except Exception:

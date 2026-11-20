@@ -7,7 +7,7 @@ Two kinds of adapter exist, and both are declared the same way:
   local credential probe, a collector, the Hermes registry ids it covers, and
   the ``billing_provider`` keys that join local records to its windows.
 * **service** — a non-model service (Firecrawl, Monid, ...) discovered from
-  key names in the Hermes ``.env``, ``mcp_servers`` in ``config.yaml``, or a
+  secret names in Hermes' secret scope, ``mcp_servers`` in ``config.yaml``, or a
   CLI on PATH. A service may have no collector at all; it is then listed as
   configured-but-unreadable with the reason spelled out.
 

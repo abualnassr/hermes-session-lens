@@ -40,13 +40,13 @@ def _collect_brightdata() -> Dict[str, Any]:
         return _service_payload(
             "brightdata",
             status="forbidden",
-            message="This Bright Data key has User permission; the balance endpoint needs an Admin key. Create one under Account Settings → Users and API keys and set it as BRIGHTDATA_API_KEY in the Hermes .env (keep the MCP key as it is).",
+            message="This Bright Data key has User permission; the balance endpoint needs an Admin key. Create one under Account Settings → Users and API keys and set it as BRIGHTDATA_API_KEY as a Hermes secret (keep the MCP key as it is).",
         )
     return _credential_status("brightdata", code, error) or _brightdata_payload(body)
 
 
 register_service(
-    "brightdata", "Bright Data", "Hermes .env key", collect=_collect_brightdata,
+    "brightdata", "Bright Data", "Hermes secret", collect=_collect_brightdata,
     env_keys=("MCP_BRIGHTDATA_API_KEY", "BRIGHTDATA_API_KEY", "BRIGHT_DATA_API_KEY"), mcp_hints=("bright",),
     hosts=("api.brightdata.com",), order=40, module=__name__,
 )

@@ -22,25 +22,6 @@ def _service_label_from_id(service_id: str) -> str:
     return " ".join(word.capitalize() for word in words if word) or "Service"
 
 
-def _dotenv_key_names(path: Path) -> List[str]:
-    """KEY names assigned in a dotenv file, in file order. Values are never read here."""
-    names: List[str] = []
-    try:
-        text = path.read_text(encoding="utf-8", errors="replace")
-    except Exception:
-        return names
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        if line.startswith("export "):
-            line = line[7:]
-        key = line.split("=", 1)[0].strip()
-        if key and re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", key) and key not in names:
-            names.append(key)
-    return names
-
-
 def _service_for_env_key(name: str) -> Tuple[Optional[str], Optional[str]]:
     """(service id, account suffix) for an env key name; (None, None) when unknown."""
     upper = str(name or "").upper()
@@ -67,7 +48,7 @@ def _service_payload(
 ) -> Dict[str, Any]:
     adapter = _service_adapters().get(service)
     label = adapter.label if adapter else _service_label_from_id(service)
-    auth_source = adapter.auth_source if adapter else "Hermes .env key"
+    auth_source = adapter.auth_source if adapter else "Hermes secret"
     kept_details, muted_details = _split_noise_details(
         [_clean_text(item, 320) for item in (details or []) if _clean_text(item, 320)]
     )
@@ -94,32 +75,15 @@ def _service_payload(
 def _service_secret(*names: str) -> Tuple[str, str]:
     """(value, env name) for the first configured key among `names`.
 
-    Hermes' profile-scoped secret lookup is the source of truth (one backend
-    serves every profile, so the process environment is only the launch
-    profile's); the profile's .env file is read as a fallback for callers
-    outside a Hermes process.
+    Only Hermes' profile-scoped secret reader (agent.secret_scope.get_secret)
+    is consulted: one backend serves every profile, so the process
+    environment alone would be the launch profile's, and catalog rule 11
+    forbids reading .env directly.
     """
     for name in names:
         value = _scoped_secret(name)
         if value:
             return value, name
-    try:
-        text = (_hermes_home() / ".env").read_text(encoding="utf-8", errors="replace")
-    except Exception:
-        return "", ""
-    wanted = set(names)
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        if line.startswith("export "):
-            line = line[7:]
-        key, _, value = line.partition("=")
-        key = key.strip()
-        if key in wanted:
-            value = value.strip().strip("'\"")
-            if value:
-                return value, key
     return "", ""
 
 

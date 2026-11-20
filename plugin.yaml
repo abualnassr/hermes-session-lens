@@ -2,17 +2,68 @@ manifest_version: 2
 api_version: 1
 name: session-lens
 label: Hermes Session Lens
-version: 0.54.1
+version: 0.55.0
 description: "Native Hermes Desktop observability: session trace, cost, provider usage, runtime health, profiles, and schedules."
 author: "Hermes Session Lens contributors"
 kind: standalone
 license: MIT
-requires_hermes: ">=0.21.5"
+requires_hermes: ">=0.23.3"
 tags:
   - desktop
   - analytics
   - observability
   - sessions
+optional_env:
+  - name: DEEPSEEK_API_KEY
+    description: "DeepSeek balance card"
+  - name: KIMI_API_KEY
+    description: "Kimi Code Plan usage card"
+  - name: KIMI_CODING_API_KEY
+    description: "Kimi Code Plan usage card (alternative name)"
+  - name: GLM_API_KEY
+    description: "Z.AI Coding Plan usage card"
+  - name: ZAI_API_KEY
+    description: "Z.AI Coding Plan usage card (alternative name)"
+  - name: OPENROUTER_API_KEY
+    description: "OpenRouter credits card"
+  - name: CLAUDE_CODE_OAUTH_TOKEN
+    description: "Presence only: names the Claude credential Hermes holds; never sent anywhere"
+  - name: ANTHROPIC_TOKEN
+    description: "Presence only: names the Claude credential Hermes holds; never sent anywhere"
+  - name: ANTHROPIC_API_KEY
+    description: "Presence only: names the Anthropic credential Hermes holds; never sent anywhere"
+  - name: FIRECRAWL_API_KEY
+    description: "Firecrawl credit card (FIRECRAWL_API_KEY_<NAME> adds an account)"
+  - name: FIRECRAWL_API_URL
+    description: "Firecrawl endpoint (self-hosted endpoints are skipped)"
+  - name: SCRAPECREATORS_API_KEY
+    description: "ScrapeCreators credit card"
+  - name: AGENTMAIL_API_KEY
+    description: "AgentMail usage card"
+  - name: BRIGHTDATA_API_KEY
+    description: "Bright Data balance card (Admin key)"
+  - name: MCP_BRIGHTDATA_API_KEY
+    description: "Bright Data MCP key"
+  - name: CONTEXT_DEV_API_KEY
+    description: "Context.dev credit card"
+  - name: TWILIO_ACCOUNT_SID
+    description: "Twilio balance card"
+  - name: TWILIO_AUTH_TOKEN
+    description: "Twilio balance card"
+  - name: VOXIMPLANT_ACCOUNT_ID
+    description: "Voximplant balance card"
+  - name: VOXIMPLANT_KEY_ID
+    description: "Voximplant balance card"
+  - name: VOXIMPLANT_PRIVATE_KEY
+    description: "Voximplant balance card"
+  - name: VAPI_API_KEY
+    description: "Vapi usage card"
+  - name: REALITY_DEFENDER_API_KEY
+    description: "Reality Defender credit card"
+  - name: HIVE_API_KEY
+    description: "Hive card"
+  - name: HIVE_CREDIT_REMAINING
+    description: "Hive balance you keep by hand (Hive has no balance API)"
 config_schema:
   rate_sample_threshold:
     type: int
@@ -26,7 +77,3 @@ config_schema:
     type: int
     default: 25
     description: "Seconds one Session Lens view may spend building its data before the backend stops it and the view shows why. Keeps Hermes responsive when a scope is too heavy. 0 disables the budget."
-  anthropic_usage_probe:
-    type: bool
-    default: false
-    description: "Off by default. Set true to read Anthropic allowances from the rate-limit headers of a one-token Claude Haiku message per credential (cached 15 minutes). While off, setup tokens and API keys show Not configured; full OAuth logins are still read from the usage endpoint."

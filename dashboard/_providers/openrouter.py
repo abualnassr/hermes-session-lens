@@ -86,15 +86,7 @@ def _openrouter_payload(
 
 def _collect_openrouter_usage() -> Dict[str, Any]:
     try:
-        from hermes_cli.runtime_provider import resolve_runtime_provider
-
-        runtime = resolve_runtime_provider(
-            requested="openrouter",
-            explicit_base_url=None,
-            explicit_api_key=None,
-        )
-        token = str(runtime.get("api_key") or "").strip()
-        base_url = str(runtime.get("base_url") or "https://openrouter.ai/api/v1").strip().rstrip("/")
+        token, base_url = _resolve_hermes_api_key("openrouter")
     except Exception as error:
         return _provider_payload("openrouter", status="unavailable", message=_provider_message(error))
     if not token:

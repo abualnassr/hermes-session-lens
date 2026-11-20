@@ -31,7 +31,7 @@ def _collect_scrapecreators() -> Dict[str, Any]:
 
 
 register_service(
-    "scrapecreators", "ScrapeCreators", "Hermes .env key", collect=_collect_scrapecreators,
+    "scrapecreators", "ScrapeCreators", "Hermes secret", collect=_collect_scrapecreators,
     env_keys=("SCRAPECREATORS_API_KEY", "SCRAPE_CREATORS_API_KEY"),
     mcp_hints=("scrape-creators", "scrapecreators", "scrape_creators"),
     hosts=("api.scrapecreators.com",), order=20, module=__name__,

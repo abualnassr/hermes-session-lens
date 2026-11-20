@@ -9,7 +9,7 @@ from .shared import *
 
 
 register_service(
-    "brave", "Brave Search", "Hermes .env key",
+    "brave", "Brave Search", "Hermes secret",
     env_keys=("BRAVE_SEARCH_API_KEY", "BRAVE_API_KEY"), mcp_hints=("brave",),
     note="Brave exposes no balance endpoint; its rate-limit headers appear only on a paid query, which Session Lens will not spend.",
     order=60, module=__name__,

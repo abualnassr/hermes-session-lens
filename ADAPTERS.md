@@ -7,11 +7,12 @@ Session Lens reads account allowances and balances through **adapters**. Each ve
 ## Ground rules
 
 1. **Verify the endpoint against the live API first.** An adapter exists only for a vendor whose usage or balance endpoint was called with a real key and whose response shape was read. Do not add an adapter from documentation alone; if the endpoint cannot be verified, register the service *without* a collector and say why in `note` (see `dashboard/_services/brave.py`).
-2. **One request kind: the vendor's own usage or balance endpoint**, with the credential Hermes already holds. Never read browser cookies or files outside `$HERMES_HOME`. Calling an inference endpoint to read rate-limit headers is the exception, not a pattern: it is allowed only when the vendor offers no usage endpoint for that credential (Anthropic setup tokens and API keys are the one verified case), and an adapter that does it must register with `request_kind="inference_probe"`, say in `note` exactly what it sends and how often, send the smallest possible request, cache every outcome per credential fingerprint (`_collect_is_fresh()` tells you when a manual refresh should bypass the cache), honour an opt-out setting, and be described in the README Trust section. `GET /adapters` and the System tab list such adapters by name.
-3. **Declare every host** you contact in `hosts=`. The tests fail if a direct adapter declares none, and the README table must list each one.
-4. **Return normalized payloads only.** Credentials must not appear in any returned dict, message, or detail. Clear header dicts after the request (`headers.clear()`), as the existing adapters do.
-5. **Never write.** No cache files, no token refresh of your own, no config edits. Ask Hermes' resolvers for credentials; do not store them.
-6. **Fail honestly.** `not_configured` when nothing is set, `expired` on 401, `forbidden` on 403, `unavailable` on anything else with the reason in `message`. A definitive credential failure clears the last-good reading; a transient one re-serves it marked stale (the dispatcher does this for you).
+2. **Credentials come through Hermes, never from files (catalog rule 11).** Read an API key with `_service_secret(...)` / `_resolve_hermes_api_key(...)`, which call Hermes' `agent.secret_scope.get_secret`, and declare the env name under `optional_env` in `plugin.yaml`. Never open `.env`, `auth.json`, a vendor CLI's login, a browser profile or a keychain, and never hold, refresh or rotate a subscription sign-in: for Codex, Claude, Nous or any OAuth provider, ask Hermes with `_hermes_account_usage(<hermes provider id>)` (Hermes' published `agent.account_usage.fetch_account_usage`) and render the snapshot with `_account_usage_payload`. If Hermes has no route for a credential, the card shows what Hermes recorded (`local_windows = True`) and says so; the fix belongs in Hermes, not in the adapter. Only Hermes' published plugin API may be imported (`hermes_cli/data/plugin_api.json`); the test suite checks it.
+3. **One request kind: the vendor's own usage or balance endpoint.** No inference requests: `request_kind="inference_probe"` remains in the registry only so the System tab can state that no adapter uses it.
+4. **Declare every host** you contact in `hosts=`. The tests fail if a direct adapter declares none, and the README table must list each one.
+5. **Return normalized payloads only.** Credentials must not appear in any returned dict, message, or detail. Clear header dicts after the request (`headers.clear()`), as the existing adapters do.
+6. **Never write.** No cache files, no token refresh, no config edits. Ask Hermes for credentials; do not store them.
+7. **Fail honestly.** `not_configured` when nothing is set, `expired` on 401, `forbidden` on 403, `unavailable` on anything else with the reason in `message`. A definitive credential failure clears the last-good reading; a transient one re-serves it marked stale (the dispatcher does this for you).
 
 ## A model provider (AI Usage card)
 
@@ -113,8 +114,8 @@ def _collect_vendor() -> Dict[str, Any]:
 
 
 register_service(
-    "vendor", "<Vendor>", "Hermes .env key", collect=_collect_vendor,
-    env_keys=("VENDOR_API_KEY",),     # exact key NAMES in the Hermes .env that mean "configured"
+    "vendor", "<Vendor>", "Hermes secret", collect=_collect_vendor,
+    env_keys=("VENDOR_API_KEY",),     # secret NAMES (declared under optional_env) that mean "configured"
     mcp_hints=("vendor",),            # substrings of an mcp_servers entry name
     hosts=("api.vendor.example",),
     module=__name__,
@@ -128,7 +129,7 @@ __all__ = [name for name in globals() if not name.startswith("__")]
 - `account_spend={"daily":, "weekly":, "monthly":, "unit": "USD"}` on the payload feeds the monthly budgets.
 - No readable endpoint? Register with no `collect=` and a `note=` explaining why; the service is inventoried, shown as unreadable, and never contacted.
 
-Helpers in `_services/shared.py`: `_service_payload`, `_service_secret` (environment first, `.env` fallback), `_service_get` (status, JSON, error), `_credential_status` (401/402/403/non-200 outcomes), `_dotenv_key_names`, `_service_for_env_key`.
+Helpers in `_services/shared.py`: `_service_payload`, `_service_secret` (Hermes' `get_secret` only), `_service_get` (status, JSON, error), `_credential_status` (401/402/403/non-200 outcomes), `_dotenv_key_names`, `_service_for_env_key`.
 
 ## Tests
 

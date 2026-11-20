@@ -39,7 +39,7 @@ def _collect_contextdev() -> Dict[str, Any]:
 
 
 register_service(
-    "contextdev", "Context.dev", "Hermes .env key", collect=_collect_contextdev,
+    "contextdev", "Context.dev", "Hermes secret", collect=_collect_contextdev,
     env_keys=("CONTEXT_DEV_API_KEY",),
     mcp_hints=("context-dev", "context_dev", "contextdev"),
     hosts=("api.context.dev",), order=66, module=__name__,

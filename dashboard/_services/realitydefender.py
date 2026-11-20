@@ -40,7 +40,7 @@ def _collect_realitydefender() -> Dict[str, Any]:
 
 
 register_service(
-    "realitydefender", "Reality Defender", "Hermes .env key", collect=_collect_realitydefender,
+    "realitydefender", "Reality Defender", "Hermes secret", collect=_collect_realitydefender,
     env_keys=("RealityDefender_API_KEY".upper(), "REALITY_DEFENDER_API_KEY"),
     mcp_hints=("realitydefender", "reality-defender"),
     hosts=("api.prd.realitydefender.xyz",), order=68, module=__name__,

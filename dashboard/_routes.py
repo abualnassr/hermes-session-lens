@@ -18,6 +18,7 @@ from ._chains import *
 from ._savings import *
 from ._compare import *
 from ._activity import *
+from ._insights import *
 
 router = APIRouter()
 
@@ -3711,7 +3712,7 @@ def _context_pricing(
         return cached[1]
     result: Dict[str, Any] = {"kind": "unpriced", "input_per_token": None, "cache_read_per_token": None, "source": None}
     try:
-        from agent.usage_pricing import get_pricing_entry
+        from ._pricing import _recorded_pricing_entry as get_pricing_entry
 
         entry = get_pricing_entry(key[0], key[1] or None, key[2] or None)
     except Exception:
@@ -4890,42 +4891,105 @@ def _profile_file_paths(home: Path, relative: Path) -> List[Tuple[str, Path]]:
     return [(name, path) for name, path in paths if path.exists()]
 
 
+def _gateway_platforms(raw_platforms: Any, profile: Optional[str] = None, launch_profile: str = "default") -> List[Dict[str, Any]]:
+    """Platform rows from a gateway state's ``platforms`` map.
+
+    A multiplexed gateway keys a served profile's adapters ``<profile>:<platform>``
+    and the launch profile's own adapters by bare name. With ``profile`` set,
+    only that profile's adapters are returned, under their bare names.
+    """
+    platforms: List[Dict[str, Any]] = []
+    if not isinstance(raw_platforms, dict):
+        return platforms
+    for key, value in raw_platforms.items():
+        name = str(key)
+        owner, sep, bare = name.partition(":")
+        if profile is not None:
+            if sep and owner != profile:
+                continue
+            if not sep and profile != launch_profile:
+                continue
+            name = bare if sep else name
+        value = value if isinstance(value, dict) else {"state": value}
+        platforms.append(
+            {
+                "name": name,
+                "state": _clean_text(value.get("state"), 80),
+                "needs_attention": bool(value.get("needs_attention")),
+                "error_code": _clean_text(value.get("error_code"), 120) or None,
+                "error_message": _clean_text(value.get("error_message"), 320) or None,
+                "updated_at": value.get("updated_at"),
+            }
+        )
+    return platforms
+
+
+def _gateway_entry(profile: str, raw: Mapping[str, Any], path: Path, platforms: List[Dict[str, Any]], **extra: Any) -> Dict[str, Any]:
+    entry = {
+        "profile": profile,
+        "state": _clean_text(raw.get("gateway_state") or raw.get("state"), 80) or "unknown",
+        "kind": _clean_text(raw.get("kind"), 80) or None,
+        "pid": _integer(raw.get("pid")) or None,
+        "start_time": raw.get("start_time"),
+        "updated_at": raw.get("updated_at") or path.stat().st_mtime,
+        "exit_reason": _clean_text(raw.get("exit_reason"), 240) or None,
+        "restart_requested": bool(raw.get("restart_requested")),
+        "active_agents": _integer(raw.get("active_agents")),
+        "code_version": _clean_text(raw.get("code_version"), 80) or None,
+        "platforms": platforms,
+        "served_by": None,
+    }
+    entry.update(extra)
+    return entry
+
+
 def _gateway_sync() -> Dict[str, Any]:
-    gateways = []
-    for profile, path in _profile_file_paths(_hermes_root(), Path("gateway_state.json")):
+    """One gateway entry per profile.
+
+    Since Hermes 0.23 one multiplexed gateway serves every profile: the root
+    ``gateway_state.json`` lists ``served_profiles`` and ``parked_profiles``
+    and keys each served profile's adapters ``<profile>:<platform>``, while
+    the per-profile files stop updating. A profile the multiplexed gateway
+    serves (or parks) is reported from the root file; only a profile it does
+    not cover falls back to its own file, which then describes a standalone
+    gateway of that profile (or one that has stopped).
+    """
+    gateways: List[Dict[str, Any]] = []
+    root = _hermes_root()
+    root_path = root / "gateway_state.json"
+    root_state = _read_json_file(root_path) if root_path.exists() else None
+    covered: set = set()
+    if isinstance(root_state, dict) and isinstance(root_state.get("served_profiles"), list):
+        served = [str(name) for name in root_state.get("served_profiles") or [] if str(name or "").strip()]
+        parked = root_state.get("parked_profiles") if isinstance(root_state.get("parked_profiles"), dict) else {}
+        launch = "default"
+        for name in served:
+            gateways.append(_gateway_entry(
+                name, root_state, root_path,
+                _gateway_platforms(root_state.get("platforms"), name, launch),
+                served_by="multiplexed gateway",
+                active_agents=_integer(root_state.get("active_agents")) if name == launch else None,
+            ))
+            covered.add(name)
+        for name, reason in parked.items():
+            name = str(name)
+            if name in covered:
+                continue
+            gateways.append(_gateway_entry(
+                name, root_state, root_path, [],
+                state="parked",
+                exit_reason=_clean_text(reason if not isinstance(reason, dict) else (reason.get("reason") or reason.get("message")), 240) or None,
+                served_by="multiplexed gateway",
+                active_agents=None,
+            ))
+            covered.add(name)
+    for profile, path in _profile_file_paths(root, Path("gateway_state.json")):
+        if profile in covered:
+            continue
         state = _read_json_file(path)
         if not isinstance(state, dict):
             continue
-        platforms = []
-        raw_platforms = state.get("platforms")
-        if isinstance(raw_platforms, dict):
-            for name, value in raw_platforms.items():
-                value = value if isinstance(value, dict) else {"state": value}
-                platforms.append(
-                    {
-                        "name": str(name),
-                        "state": _clean_text(value.get("state"), 80),
-                        "needs_attention": bool(value.get("needs_attention")),
-                        "error_code": _clean_text(value.get("error_code"), 120) or None,
-                        "error_message": _clean_text(value.get("error_message"), 320) or None,
-                        "updated_at": value.get("updated_at"),
-                    }
-                )
-        gateways.append(
-            {
-                "profile": profile,
-                "state": _clean_text(state.get("gateway_state") or state.get("state"), 80) or "unknown",
-                "kind": _clean_text(state.get("kind"), 80) or None,
-                "pid": _integer(state.get("pid")) or None,
-                "start_time": state.get("start_time"),
-                "updated_at": state.get("updated_at") or path.stat().st_mtime,
-                "exit_reason": _clean_text(state.get("exit_reason"), 240) or None,
-                "restart_requested": bool(state.get("restart_requested")),
-                "active_agents": _integer(state.get("active_agents")),
-                "code_version": _clean_text(state.get("code_version"), 80) or None,
-                "platforms": platforms,
-            }
-        )
+        gateways.append(_gateway_entry(profile, state, path, _gateway_platforms(state.get("platforms"))))
     return {"gateways": gateways, "generated_at": time.time()}
 
 
@@ -5040,7 +5104,7 @@ def _fleet_sync(now: Optional[float] = None) -> Dict[str, Any]:
         gateway = gateways.get(name)
         state = _fleet_state(_number(db_figures["last_activity_at"], 0), _number(log_figures["last_call_at"], 0), now)
         flags: List[str] = []
-        if gateway and str(gateway.get("state") or "").lower() not in {"running", "connected", "ready", "ok", "unknown"}:
+        if gateway and str(gateway.get("state") or "").lower() not in {"running", "connected", "ready", "ok", "unknown", "parked"}:
             flags.append(f"gateway {gateway.get('state')}")
         if gateway and any(platform.get("needs_attention") for platform in gateway.get("platforms") or []):
             flags.append("a platform needs attention")
@@ -5073,6 +5137,7 @@ def _fleet_sync(now: Optional[float] = None) -> Dict[str, Any]:
                 "logs_cover_day": bool(log_figures["log_since"] and log_figures["log_since"] <= now - 86400),
                 "gateway": (
                     {"state": gateway.get("state"), "active_agents": gateway.get("active_agents"),
+                     "served_by": gateway.get("served_by"),
                      "platforms": [platform.get("name") for platform in gateway.get("platforms") or []]}
                     if gateway else None
                 ),
@@ -5156,6 +5221,25 @@ def _schedules_sync() -> Dict[str, Any]:
     }
 
 
+def _period_route(builder: Any, default_days: int = 30) -> Any:
+    async def handler(
+        days: int = Query(default_days, ge=0, le=3650),
+        start_at: Optional[float] = Query(None, ge=0),
+        end_at: Optional[float] = Query(None, ge=0),
+        profiles: str = Query(""),
+    ) -> Dict[str, Any]:
+        return await asyncio.to_thread(_scoped_call, profiles, builder, days, start_at, end_at)
+
+    return handler
+
+
+router.get("/turns")(_period_route(_turns_sync))
+router.get("/prompt-weight")(_period_route(_prompt_weight_sync))
+router.get("/prompt-cache")(_period_route(_prompt_cache_sync, 7))
+router.get("/cron-history")(_period_route(_cron_history_sync))
+router.get("/gateway-history")(_period_route(_gateway_history_sync))
+
+
 @router.get("/schedules")
 async def schedules() -> Dict[str, Any]:
     return await asyncio.to_thread(_schedules_sync)
@@ -5216,6 +5300,22 @@ def _ai_usage_sync(
         finally:
             _set_collect_fresh(False)
 
+    hermes_reported: List[Dict[str, Any]] = []
+    candidates = _hermes_reported_candidates()
+    if candidates:
+        try:
+            with ThreadPoolExecutor(max_workers=len(candidates), thread_name_prefix="session-lens-hermes-usage") as pool:
+                futures = [_submit_in_context(pool, _hermes_reported_card, slug) for slug in candidates]
+                for future in futures:
+                    try:
+                        card = future.result()
+                    except (Exception, SystemExit):
+                        card = None
+                    if card is not None:
+                        hermes_reported.append(card)
+        except Exception:
+            hermes_reported = []
+
     with _ai_usage_cache_lock:
         account_cards: Dict[str, List[Dict[str, Any]]] = {}
         for provider in _provider_ids():
@@ -5238,9 +5338,14 @@ def _ai_usage_sync(
         for provider in _provider_ids():
             providers.append(results[provider])
             providers.extend(account_cards.get(provider) or [])
+        providers.extend(hermes_reported)
+        reported_ids = {str(card.get("provider") or "").split(":", 1)[-1] for card in hermes_reported}
         payload = {
             "providers": providers,
-            "hermes_configured_unsupported": _usage_unsupported_configured(),
+            "hermes_configured_unsupported": [
+                item for item in _usage_unsupported_configured()
+                if not reported_ids.intersection(item.get("ids") or [item.get("id")])
+            ],
             "summary": _ai_usage_summary(providers),
             "generated_at": time.time(),
             "cached": False,
@@ -5248,7 +5353,10 @@ def _ai_usage_sync(
             "privacy": {
                 "credentials_returned_to_desktop": False,
                 "browser_cookies_read": False,
-                "external_requests": "Direct authenticated quota requests to the configured providers only",
+                "external_requests": (
+                    "Balance requests to the configured API-key providers with the key Hermes holds; "
+                    "subscription sign-ins are read by Hermes' own account-usage code, never by Session Lens"
+                ),
                 "external_hosts": sorted({host for adapter in _provider_adapters().values() for host in adapter.hosts}),
             },
         }
@@ -5310,6 +5418,7 @@ def _attach_local_usage_records(
         if card.get("account_extra"):
             continue
         provider = str(card.get("provider") or "")
+        card["hermes_ids"] = _card_hermes_ids(card)
         entry = recorded.get(provider)
         card["recorded_local"] = {**entry, "label": span_label, "days": days} if entry else None
         # A provider that reports its own month-to-date spend gets the local
@@ -5325,8 +5434,80 @@ def _attach_local_usage_records(
                 "local_usd": round(_number(month.get("month_cost")), 2),
                 "local_sessions": _integer(month.get("sessions")),
             }
+        if card.get("local_windows"):
+            try:
+                card["windows"] = _recorded_use_windows(_card_billing_keys(card))
+            except Exception:
+                card["windows"] = []
         _attach_usage_attribution(provider, card)
     return payload
+
+
+def _card_hermes_ids(card: Mapping[str, Any]) -> List[str]:
+    """Hermes provider slugs this card stands for, so the desktop can match Hermes' own picker rows."""
+    provider = str(card.get("provider") or "")
+    adapter = _provider_adapters().get(provider)
+    ids: List[str] = []
+    for value in (list(adapter.registry_ids) if adapter else []) + list(_card_billing_keys(card)):
+        key = str(value or "").strip().lower()
+        if key and key not in ids:
+            ids.append(key)
+    return ids
+
+
+def _card_billing_keys(card: Mapping[str, Any]) -> Tuple[str, ...]:
+    provider = str(card.get("provider") or "")
+    return tuple(card.get("billing_keys") or _USAGE_BILLING_KEYS.get(provider) or ())
+
+
+# ── Cards Hermes itself can read ──────────────────────────────────────────
+# Any provider Hermes knows a usage reader for (a model-provider plugin's
+# fetch_account_usage hook, or a built-in Hermes reader) gets a card even
+# when Session Lens has no adapter for it. Candidates: the API-key providers
+# Hermes resolves a key for, plus every billing provider Hermes recorded in
+# the last 30 days. Hermes holds the credential and makes the request.
+
+_HERMES_REPORTED_LOOKBACK_SECONDS = 30 * 86_400.0
+_HERMES_REPORTED_MAX = 8
+
+
+def _recorded_billing_providers(since: float) -> List[str]:
+    try:
+        with _database() as db:
+            rows = _db_connection(db).execute(
+                "SELECT DISTINCT LOWER(billing_provider) FROM session_model_usage "
+                "WHERE billing_provider IS NOT NULL AND billing_provider != '' "
+                "AND COALESCE(last_seen, first_seen, 0) >= ?",
+                (since,),
+            ).fetchall()
+    except Exception:
+        return []
+    return [str(row[0]) for row in rows if row and row[0]]
+
+
+def _hermes_reported_candidates() -> List[str]:
+    candidates: List[str] = []
+    recorded = _recorded_billing_providers(time.time() - _HERMES_REPORTED_LOOKBACK_SECONDS)
+    for slug in recorded + _hermes_configured_provider_ids():
+        key = str(slug or "").strip().lower()
+        if key and key not in candidates and key not in _USAGE_COVERED_PROVIDER_IDS and key not in {"auto", "custom", "local"}:
+            candidates.append(key)
+    return candidates[:_HERMES_REPORTED_MAX]
+
+
+def _hermes_reported_card(slug: str) -> Optional[Dict[str, Any]]:
+    snapshot = _hermes_account_usage(slug)
+    if snapshot is None:
+        return None
+    meta = _MODEL_ROUTE_META.get(slug) or {}
+    label = str(meta.get("provider") or "").strip()
+    title = str(getattr(snapshot, "title", "") or "").strip()
+    if not label:
+        label = title if title and title != "Account limits" else _humanize_identifier(slug)
+    card = _account_usage_payload(f"hermes:{slug}", snapshot, label=label, auth_source="Hermes usage reader")
+    card["billing_keys"] = [slug]
+    card["hermes_reported"] = True
+    return card
 
 
 def _fold_usage_last_success(provider: str, result: Dict[str, Any]) -> Dict[str, Any]:
@@ -5457,9 +5638,12 @@ def _usage_window_bounds(window: Mapping[str, Any]) -> Tuple[float, Optional[flo
     without a readable span falls back to the trailing seven days and says
     so, because a silent fallback would make the share numbers lie.
     """
+    now = time.time()
+    trailing = _number(window.get("trailing_seconds"), 0.0)
+    if trailing > 0:
+        return now - trailing, None, "trailing"
     reset = _usage_reset_epoch(window.get("reset_at"))
     duration = _quota_window_duration_seconds(window.get("label"))
-    now = time.time()
     if reset and duration and reset > now and reset - duration < now:
         return reset - duration, reset, "window"
     return now - _USAGE_ATTRIBUTION_FALLBACK_SECONDS, None, "trailing_7d"
@@ -5482,8 +5666,8 @@ def _usage_project_key(row: Mapping[str, Any]) -> Tuple[str, str, str, str]:
     return "source", source, source, "source:%s" % source
 
 
-def _usage_attribution_rows(provider: str, since: float) -> List[Dict[str, Any]]:
-    billing_keys = _USAGE_BILLING_KEYS.get(provider) or ()
+def _usage_attribution_rows(provider: str, since: float, billing_keys: Tuple[str, ...] = ()) -> List[Dict[str, Any]]:
+    billing_keys = tuple(billing_keys) or _USAGE_BILLING_KEYS.get(provider) or ()
     if not billing_keys:
         return []
     placeholders = ",".join("?" for _ in billing_keys)
@@ -5647,7 +5831,7 @@ def _attach_usage_attribution(provider: str, result: Dict[str, Any]) -> None:
         return
     try:
         since = min(_usage_window_bounds(window)[0] for window in windows)
-        rows = _usage_attribution_rows(provider, since)
+        rows = _usage_attribution_rows(provider, since, _card_billing_keys(result))
     except Exception:
         return
     for window in windows:

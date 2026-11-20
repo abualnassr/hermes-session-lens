@@ -1,4 +1,8 @@
-"""codex quota provider adapter."""
+"""codex quota provider adapter.
+
+Hermes' own account-usage code reads the Codex sign-in (published plugin API
+agent.account_usage); Session Lens never sees the token.
+"""
 
 from __future__ import annotations
 
@@ -6,32 +10,21 @@ from .._common import *
 from .._hermes_compat import *
 from .shared import *
 
+
 def _collect_codex_usage() -> Dict[str, Any]:
-    try:
-        from agent.account_usage import fetch_account_usage
-
-        return _account_usage_payload("codex", fetch_account_usage("openai-codex"))
-    except Exception as error:
-        return _provider_payload("codex", status="unavailable", message=_provider_message(error))
-
-
-def _probe_codex() -> bool:
-    try:
-        from hermes_cli.auth import AuthError, _read_codex_tokens
-    except ImportError:
-        return True
-    try:
-        data = _read_codex_tokens()
-    except AuthError:
-        return False
-    tokens = (data or {}).get("tokens") or {}
-    return bool(tokens.get("access_token") or tokens.get("refresh_token"))
+    snapshot = _hermes_account_usage("openai-codex")
+    if snapshot is None:
+        return _provider_payload(
+            "codex", status="not_configured",
+            message="Hermes has no OpenAI Codex sign-in it can read usage for in this profile.",
+        )
+    return _account_usage_payload("codex", snapshot)
 
 
 register_provider(
-    "codex", "OpenAI Codex", "Hermes OAuth", _collect_codex_usage,
-    probe=_probe_codex,
-    not_configured_message="No Hermes OpenAI Codex OAuth login was found.",
+    "codex", "OpenAI Codex", "Hermes sign-in", _collect_codex_usage,
+    probe=lambda: True,
+    not_configured_message="No Hermes OpenAI Codex sign-in was found.",
     billing_keys=("openai-codex",),
     registry_ids=("openai-codex", "codex"),
     hosts=("chatgpt.com",), via="hermes", order=10, module=__name__,

@@ -58,7 +58,7 @@ def _collect_twilio() -> Dict[str, Any]:
 
 
 register_service(
-    "twilio", "Twilio", "Hermes .env key", collect=_collect_twilio,
+    "twilio", "Twilio", "Hermes secret", collect=_collect_twilio,
     env_keys=("TWILIO_ACCOUNT_SID", "TWILIO_AUTH_TOKEN", "TWILIO_PHONE_NUMBER", "TWILIO_PHONE_NUMBER_SID"),
     mcp_hints=("twilio",),
     hosts=("api.twilio.com",), order=60, module=__name__,

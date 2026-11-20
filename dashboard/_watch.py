@@ -58,7 +58,7 @@ def _call_rates(model: str, provider: str) -> Optional[Tuple[float, float, float
         return cached[1]
     rates: Optional[Tuple[float, float, float]] = None
     try:
-        from agent.usage_pricing import get_pricing_entry
+        from ._pricing import _recorded_pricing_entry as get_pricing_entry
     except Exception:
         get_pricing_entry = None
     if get_pricing_entry is not None:

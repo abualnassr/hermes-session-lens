@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import sqlite3
 import threading
 import time
@@ -134,6 +135,31 @@ def _scoped_secret(name: str) -> str:
         return str(get_secret(name, "") or "").strip()
     except Exception:
         return ""
+
+
+def _secret_names() -> List[str]:
+    """Env-var NAMES that hold a secret for the profile this request serves.
+
+    Discovery only. Candidates come from Hermes' published secret scope
+    (agent.secret_scope.current_secret_scope: the profile's secrets as Hermes
+    loaded them) plus the process environment, and a name is kept only when
+    Hermes' own get_secret resolves it for this profile, so another profile's
+    launch-time variables never leak in under multiplexing. Session Lens never
+    opens .env itself (catalog rule 11).
+    """
+    candidates: set = set()
+    try:
+        from agent.secret_scope import current_secret_scope
+
+        scope = current_secret_scope()
+        if scope:
+            candidates.update(str(name) for name in scope.keys())
+    except Exception:
+        pass
+    candidates.update(str(name) for name in os.environ.keys())
+    return sorted(
+        name for name in candidates if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", name) and _scoped_secret(name)
+    )
 
 
 def _quote_identifier(name: str) -> str:
@@ -626,43 +652,88 @@ def _db_connection(db: Any) -> Any:
     return connection
 
 
+# ── Credentials: only through Hermes' published routes (catalog rule 11) ──
+# Every value is read with agent.secret_scope.get_secret (via _scoped_secret),
+# which honours the profile a request serves. Subscription sign-ins (Codex,
+# Claude, Nous, xAI) are never held here: Hermes' own account-usage code
+# (agent.account_usage) or Hermes' gateway (model.options, called by the
+# desktop) reads them. Session Lens never opens .env, auth.json or another
+# tool's login, and never refreshes, rotates or writes a credential.
+
+# Hermes' API-key providers: id -> the env names Hermes reads for it. Mirrors
+# Hermes' provider table (hermes_cli.auth is not a published API) so the
+# "configured in Hermes, not monitorable" line can name them. The names a
+# Session Lens adapter actually reads are declared under optional_env.
+_HERMES_KEY_PROVIDERS: Dict[str, Tuple[str, ...]] = {
+    "openai-api": ('OPENAI_API_KEY',),
+    "lmstudio": ('LM_API_KEY',),
+    "gemini": ('GOOGLE_API_KEY', 'GEMINI_API_KEY'),
+    "zai": ('GLM_API_KEY', 'ZAI_API_KEY', 'Z_AI_API_KEY'),
+    "kimi-coding": ('KIMI_API_KEY', 'KIMI_CODING_API_KEY'),
+    "kimi-coding-cn": ('KIMI_CN_API_KEY',),
+    "stepfun": ('STEPFUN_API_KEY',),
+    "arcee": ('ARCEEAI_API_KEY',),
+    "gmi": ('GMI_API_KEY',),
+    "actual": ('ACTUAL_API_KEY',),
+    "minimax": ('MINIMAX_API_KEY',),
+    "anthropic": ('ANTHROPIC_API_KEY', 'ANTHROPIC_TOKEN', 'CLAUDE_CODE_OAUTH_TOKEN'),
+    "alibaba": ('DASHSCOPE_API_KEY',),
+    "alibaba-coding-plan": ('ALIBABA_CODING_PLAN_API_KEY', 'DASHSCOPE_API_KEY'),
+    "minimax-cn": ('MINIMAX_CN_API_KEY',),
+    "deepseek": ('DEEPSEEK_API_KEY',),
+    "xai": ('XAI_API_KEY',),
+    "nvidia": ('NVIDIA_API_KEY',),
+    "ai-gateway": ('AI_GATEWAY_API_KEY',),
+    "opencode-zen": ('OPENCODE_ZEN_API_KEY',),
+    "opencode-go": ('OPENCODE_GO_API_KEY',),
+    "kilocode": ('KILOCODE_API_KEY',),
+    "huggingface": ('HF_TOKEN',),
+    "xiaomi": ('XIAOMI_API_KEY',),
+    "tencent-tokenhub": ('TOKENHUB_API_KEY',),
+    "tencent-tokenplan": ('TOKENPLAN_API_KEY',),
+    "ollama-cloud": ('OLLAMA_API_KEY',),
+    "azure-foundry": ('AZURE_FOUNDRY_API_KEY',),
+    "alibaba-token-plan": ('ALIBABA_TOKEN_PLAN_API_KEY',),
+    "alibaba-token-plan-cn": ('ALIBABA_TOKEN_PLAN_CN_API_KEY', 'ALIBABA_TOKEN_PLAN_API_KEY'),
+    "alibaba-coding-plan-cn": ('ALIBABA_CODING_PLAN_CN_API_KEY', 'ALIBABA_CODING_PLAN_API_KEY', 'DASHSCOPE_API_KEY'),
+    "commandcode": ('COMMANDCODE_API_KEY',),
+    "deepinfra": ('DEEPINFRA_API_KEY',),
+    "fireworks": ('FIREWORKS_API_KEY',),
+    "meta-ai": ('MODEL_API_KEY', 'META_API_KEY', 'META_MODEL_API_KEY'),
+    "nebius": ('NEBIUS_API_KEY', 'NEBIUS_TOKEN_FACTORY_API_KEY'),
+    "novita": ('NOVITA_API_KEY',),
+    "ramp-router": ('RAMP_ROUTER_API_KEY', 'ROUTER_API_KEY'),
+    "upstage": ('UPSTAGE_API_KEY',),
+    "openrouter": ('OPENROUTER_API_KEY',),
+}
+
+# The API-key providers Session Lens reads a balance for: (base-URL override
+# env name, default base URL), as Hermes resolves them.
+_API_KEY_PROVIDER_BASES: Dict[str, Tuple[str, str]] = {
+    "deepseek": ("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1"),
+    "kimi-coding": ("KIMI_BASE_URL", "https://api.moonshot.ai/v1"),
+    "zai": ("GLM_BASE_URL", "https://api.z.ai/api/paas/v4"),
+    "openrouter": ("OPENROUTER_BASE_URL", "https://openrouter.ai/api/v1"),
+}
+_KIMI_CODE_BASE_URL = "https://api.kimi.com/coding/v1"
+
+
 def _resolve_hermes_api_key(provider_id: str) -> Tuple[str, str]:
-    """Resolve a configured provider key without triggering inference probes."""
-    try:
-        from hermes_cli import auth as hermes_auth
-
-        pconfig = hermes_auth.PROVIDER_REGISTRY.get(provider_id)
-        secret_resolver = getattr(hermes_auth, "_resolve_api_key_provider_secret", None)
-        if pconfig is None or not callable(secret_resolver):
-            _CAPABILITIES["key_resolution"] = "unavailable"
-            raise RuntimeError("This Hermes version does not expose safe API-key resolution.")
-        token, _source = secret_resolver(provider_id, pconfig)
-        status = hermes_auth.get_api_key_provider_status(provider_id)
-        base_url = str(status.get("base_url") or pconfig.inference_base_url or "").strip().rstrip("/")
-        _CAPABILITIES["key_resolution"] = "available"
-
-        if provider_id == "zai" and token:
-            try:
-                load_auth_store = getattr(hermes_auth, "_load_auth_store", None)
-                load_provider_state = getattr(hermes_auth, "_load_provider_state", None)
-                if not callable(load_auth_store) or not callable(load_provider_state):
-                    _CAPABILITIES["provider_state"] = "unavailable"
-                else:
-                    auth_store = load_auth_store()
-                    state = load_provider_state(auth_store, "zai") or {}
-                    detected = state.get("detected_endpoint") or {}
-                    expected_hash = hashlib.sha256(str(token).encode()).hexdigest()[:16]
-                    if detected.get("key_hash") == expected_hash and detected.get("base_url"):
-                        base_url = str(detected["base_url"]).strip().rstrip("/")
-                    _CAPABILITIES["provider_state"] = "available"
-            except Exception:
-                _CAPABILITIES["provider_state"] = "degraded"
-        return str(token or "").strip(), base_url
-    except RuntimeError:
-        raise
-    except Exception as error:
+    """(key, base URL) for an API-key provider, through Hermes' secret scope only."""
+    names = _HERMES_KEY_PROVIDERS.get(provider_id)
+    base_spec = _API_KEY_PROVIDER_BASES.get(provider_id)
+    if not names or base_spec is None:
         _CAPABILITIES["key_resolution"] = "unavailable"
-        raise RuntimeError("Hermes API-key resolution is unavailable") from error
+        raise RuntimeError(f"Session Lens does not read a key for provider {provider_id!r}.")
+    token = next((value for value in (_scoped_secret(name) for name in names) if value), "")
+    override_env, default_url = base_spec
+    override = _scoped_secret(override_env)
+    base_url = override or default_url
+    # Hermes routes sk-kimi- (Kimi Code) keys to api.kimi.com unless KIMI_BASE_URL says otherwise.
+    if provider_id == "kimi-coding" and not override and token.startswith("sk-kimi-"):
+        base_url = _KIMI_CODE_BASE_URL
+    _CAPABILITIES["key_resolution"] = "available"
+    return token, base_url.strip().rstrip("/")
 
 
 def _plugin_settings() -> Dict[str, Any]:
@@ -685,197 +756,47 @@ def _plugin_settings() -> Dict[str, Any]:
     return dict(legacy) if isinstance(legacy, Mapping) else {}
 
 
-_ANTHROPIC_ENV_KEYS = ("ANTHROPIC_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY")
-
-
-def _anthropic_env_credentials() -> List[Tuple[str, str]]:
-    """(env name, value) for every Anthropic credential set in the environment.
-
-    Reads through Hermes' profile-scoped secret reader — the same one its
-    Anthropic resolver uses — so a multiplexed profile sees exactly what
-    Hermes sees; plain os.environ outside Hermes. Read-only.
-    """
-    getenv = None
-    try:
-        from agent import anthropic_credentials
-
-        getenv = anthropic_credentials._getenv
-    except Exception:
-        getenv = None
+def _secret_kind_present(*names: str) -> List[Tuple[str, str]]:
+    """(env name, value) for each of `names` Hermes resolves for this profile."""
     found: List[Tuple[str, str]] = []
-    for name in _ANTHROPIC_ENV_KEYS:
-        try:
-            value = str(getenv(name) or "") if getenv is not None else str(os.environ.get(name) or "")
-        except Exception:
-            value = ""
-        value = value.strip()
+    for name in names:
+        value = _scoped_secret(name)
         if value:
             found.append((name, value))
     return found
 
 
-def _hermes_anthropic_credentials() -> Any:
-    """Hermes' Anthropic credential helpers, wherever this Hermes keeps them.
-
-    Hermes moved resolve_anthropic_token, _resolve_anthropic_pool_token and
-    _is_oauth_token out of agent.anthropic_adapter into
-    agent.anthropic_credentials; the adapter re-exports the public name with
-    a deprecation warning until 2026-09-14 and the private ones not at all.
-    Prefer the new module and fall back to the adapter for older builds.
-    """
-    try:
-        from agent import anthropic_credentials
-
-        if hasattr(anthropic_credentials, "resolve_anthropic_token"):
-            return anthropic_credentials
-    except ImportError:
-        pass
-    from agent import anthropic_adapter
-
-    return anthropic_adapter
-
-
-def _resolve_anthropic_oauth() -> Tuple[str, bool]:
-    try:
-        credentials = _hermes_anthropic_credentials()
-
-        token = str(credentials.resolve_anthropic_token() or "").strip()
-        token_check = getattr(credentials, "_is_oauth_token", None)
-        if not callable(token_check):
-            return token, False
-        return token, bool(token_check(token))
-    except Exception:
-        return "", False
-
-
-def _resolve_anthropic_pool_oauth() -> str:
-    """OAuth token from Hermes' Anthropic credential pool, read directly.
-
-    Hermes' resolver lets an explicit ANTHROPIC_API_KEY shadow saved OAuth
-    logins, but the account-usage endpoint only accepts OAuth — so the
-    collector needs the pool login even when the resolver returns an API key.
-    Empty string when no OAuth login is stored.
-    """
-    try:
-        credentials = _hermes_anthropic_credentials()
-
-        token = str(credentials._resolve_anthropic_pool_token() or "").strip()
-        if token and credentials._is_oauth_token(token):
-            return token
-    except Exception:
-        pass
-    return ""
-
-
-def _anthropic_pool_oauth_accounts() -> List[Dict[str, str]]:
-    """All Anthropic OAuth logins in Hermes' credential pool, read-only.
-
-    One dict per stored account: {"label", "token"}. Enumerates with
-    clear_expired=False, refresh=False — the same contract as
-    _resolve_anthropic_pool_oauth — so listing accounts never mutates
-    auth.json or triggers a network refresh. Returns [] outside Hermes.
-    """
-    accounts: List[Dict[str, str]] = []
-    try:
-        credentials = _hermes_anthropic_credentials()
-        from agent.credential_pool import AUTH_TYPE_OAUTH, load_pool
-
-        pool = load_pool("anthropic")
-        entries, _pending = pool._available_entries(clear_expired=False, refresh=False)
-        for entry in entries:
-            if getattr(entry, "auth_type", None) != AUTH_TYPE_OAUTH:
-                continue
-            token = str(getattr(entry, "access_token", "") or "").strip()
-            if not token or not credentials._is_oauth_token(token):
-                continue
-            label = str(getattr(entry, "label", "") or "").strip() or str(getattr(entry, "id", "") or "")[:8]
-            accounts.append({"label": label[:60], "token": token})
-    except Exception:
-        return accounts
-    return accounts
-
-
-# Providers whose Hermes secret resolver can shell out or reach the network
-# (Copilot runs `gh auth token`, which may contact api.github.com). Session
-# Lens only asks whether their key is set.
-_ENV_PRESENCE_ONLY_PROVIDERS = frozenset({"copilot"})
-
-
-def _hermes_env_present(name: str) -> bool:
-    """True when ``name`` is set for the active profile (its .env or the process), value unread here."""
-    try:
-        from agent.secret_scope import get_secret_str
-
-        if str(get_secret_str(name, "") or "").strip():
-            return True
-    except Exception:
-        pass
-    return bool(str(os.environ.get(name) or "").strip())
-
-
 def _hermes_configured_provider_ids() -> List[str]:
-    """Provider ids Hermes holds credentials for, from the live PROVIDER_REGISTRY.
-
-    Model-provider plugins register ProviderProfiles into this registry (see
-    the Hermes developer guide), so a third-party provider the user installs
-    shows up here without Session Lens code changes. Local-only: API keys via
-    the same safe resolver `_resolve_hermes_api_key` uses, OAuth-style
-    providers via stored auth state. Returns [] outside Hermes.
-    """
-    configured: List[str] = []
-    try:
-        from hermes_cli import auth as hermes_auth
-
-        registry = getattr(hermes_auth, "PROVIDER_REGISTRY", None) or {}
-        secret_resolver = getattr(hermes_auth, "_resolve_api_key_provider_secret", None)
-        load_auth_store = getattr(hermes_auth, "_load_auth_store", None)
-        load_provider_state = getattr(hermes_auth, "_load_provider_state", None)
-        auth_store = None
-        if callable(load_auth_store):
-            try:
-                auth_store = load_auth_store()
-            except Exception:
-                auth_store = None
-        for provider_id, pconfig in registry.items():
-            try:
-                if str(getattr(pconfig, "auth_type", "") or "") == "api_key":
-                    if str(provider_id) in _ENV_PRESENCE_ONLY_PROVIDERS:
-                        if any(_hermes_env_present(name) for name in getattr(pconfig, "api_key_env_vars", ()) or ()):
-                            configured.append(str(provider_id))
-                        continue
-                    if not callable(secret_resolver):
-                        continue
-                    token, _source = secret_resolver(provider_id, pconfig)
-                    if str(token or "").strip():
-                        configured.append(str(provider_id))
-                elif auth_store is not None and callable(load_provider_state):
-                    if load_provider_state(auth_store, provider_id):
-                        configured.append(str(provider_id))
-            except Exception:
-                continue
-    except Exception:
-        return []
-    return configured
+    """API-key provider ids whose key Hermes resolves for this profile."""
+    return [provider_id for provider_id, names in _HERMES_KEY_PROVIDERS.items() if any(_scoped_secret(name) for name in names)]
 
 
 def _hermes_provider_credential_keys() -> Dict[str, str]:
-    """provider id -> the credential it reads (its env-var names, or its own id).
+    """provider id -> the credential it reads, so several endpoints on one key count once."""
+    return {provider_id: ",".join(sorted(names)) for provider_id, names in _HERMES_KEY_PROVIDERS.items()}
 
-    Several registry entries can read one key — Hermes lists six Alibaba
-    and Dashscope endpoints on one DASHSCOPE key — and a list of providers
-    "configured in Hermes" should count that once. Returns {} outside Hermes.
+
+def _hermes_account_usage(provider: str) -> Any:
+    """Hermes' own account-usage snapshot for `provider`, or None.
+
+    agent.account_usage is a published plugin API: Hermes resolves and holds
+    the credential, makes the request, and caches the result for its own
+    model picker. read_only=True keeps a failed read from rotating or
+    repairing a pooled credential. None when Hermes cannot read the provider.
     """
-    keys: Dict[str, str] = {}
     try:
-        from hermes_cli import auth as hermes_auth
-
-        registry = getattr(hermes_auth, "PROVIDER_REGISTRY", None) or {}
-        for provider_id, pconfig in registry.items():
-            env_vars = tuple(str(name) for name in (getattr(pconfig, "api_key_env_vars", None) or ()))
-            keys[str(provider_id)] = ",".join(sorted(env_vars)) if env_vars else str(provider_id)
+        from agent.account_usage import fetch_account_usage
     except Exception:
-        return {}
-    return keys
+        return None
+    try:
+        return fetch_account_usage(provider, read_only=True)
+    except TypeError:
+        try:
+            return fetch_account_usage(provider)
+        except Exception:
+            return None
+    except Exception:
+        return None
 
 
 def _compat_capabilities() -> Dict[str, str]:
