@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import re
@@ -583,6 +584,23 @@ class SessionLensApiTests(unittest.TestCase):
             connection.execute(f"DROP TABLE {table}_old")
         connection.commit()
         connection.close()
+
+    def test_database_opens_read_only_without_legacy_session_db(self):
+        # Hermes 0.23 made hermes_state.SessionDB a stand-in with no SQL
+        # connection; every route 500'd. The plugin opens state.db itself.
+        class NoConnectionSessionDB:
+            def __init__(self, *args, **kwargs):
+                raise AssertionError("the SQL path must not construct SessionDB")
+
+        hermes_compat.SessionDB = NoConnectionSessionDB
+        with api._database() as db:
+            connection = api._db_connection(db)
+            self.assertTrue(db.read_only)
+            self.assertEqual(Path(db.db_path), self.db_path)
+            self.assertGreater(connection.execute("SELECT COUNT(*) FROM sessions").fetchone()[0], 0)
+            with self.assertRaises(sqlite3.OperationalError):
+                connection.execute("CREATE TABLE should_not_exist (x INTEGER)")
+        self.assertTrue(asyncio.run(api.health())["ok"])
 
     def test_union_joins_stay_inside_one_profile(self):
         # SQLite flattens a join of two UNION ALL views into one arm per

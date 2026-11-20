@@ -6147,7 +6147,7 @@ def _system_sync() -> Dict[str, Any]:
                 "route_budget_seconds": _route_budget_seconds(_plugin_settings()),
                 "snippets_redacted_and_bounded": True,
                 "failure_signatures_language": "english",
-                "database_connection": "Hermes SessionDB(read_only=True)",
+                "database_connection": "sqlite3 mode=ro on the profile state.db",
             },
             "capabilities": _compat_capabilities(),
             "limits": {

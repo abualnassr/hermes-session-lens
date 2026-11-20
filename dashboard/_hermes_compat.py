@@ -13,13 +13,26 @@ from typing import Any, Dict, Iterable, Iterator, List, Mapping, Optional, Tuple
 
 try:
     from hermes_constants import get_hermes_home
-    from hermes_state import SessionDB
 except ImportError:  # pragma: no cover
     get_hermes_home = None  # type: ignore[assignment]
-    SessionDB = None  # type: ignore[assignment,misc]
+
+# Hermes before 0.23 searched through hermes_state.SessionDB; 0.23 made it a
+# deprecated stand-in and v0.27 removes it. Resolved lazily, only when the
+# published reader is missing, so a current Hermes never sees the import.
+SessionDB: Any = None
+
+
+def _legacy_session_db() -> Any:
+    if SessionDB is not None:
+        return SessionDB
+    try:
+        from hermes_state import SessionDB as legacy
+    except Exception:
+        return None
+    return legacy
 
 _CAPABILITIES: Dict[str, str] = {
-    "database": "available" if SessionDB is not None else "unavailable",
+    "database": "available",
     "hermes_home": "available" if get_hermes_home is not None else "fallback",
     "key_resolution": "unknown",
     "provider_state": "unknown",
@@ -233,7 +246,112 @@ def _install_accounting_views(connection: Any) -> None:
             continue
 
 
-class _UnionDB:
+def _read_only_uri(path: Path) -> str:
+    """`file:` URI for a mode=ro open. Hermes publishes this helper; the local
+    fallback matches it (as_uri() percent-encodes '?'/'#' in a home path, which
+    a raw f"file:{path}?mode=ro" would truncate at)."""
+    try:
+        from sqlite_support import read_only_db_uri
+
+        return str(read_only_db_uri(path))
+    except Exception:
+        return Path(path).resolve().as_uri() + "?mode=ro"
+
+
+def _default_db_path() -> Path:
+    """The serving profile's state.db, located the way Hermes itself does."""
+    try:
+        from persistence_assembly import profile_scope, store_location
+
+        located = store_location(profile_scope())
+        if located:
+            return Path(located)
+    except Exception:
+        pass
+    return _hermes_home() / "state.db"
+
+
+def _search_one_store(path: Path, query: str, limit: int, fields: Tuple[str, ...]) -> List[Dict[str, Any]]:
+    """Full-text hits from one state.db through Hermes' own search, which owns
+    the FTS schema. Hermes 0.23+ publishes a read-only store handle; older
+    builds expose the same search on SessionDB."""
+    try:
+        from persistence_assembly import open_persistence_reader
+    except ImportError:
+        open_persistence_reader = None  # type: ignore[assignment]
+    if open_persistence_reader is not None:
+        with open_persistence_reader(Path(path)) as store:
+            hits = store.search.search_messages(query, limit=limit, fields=fields or None)
+            rows: List[Dict[str, Any]] = []
+            for hit in hits or []:
+                rows.append({
+                    name: (getattr(hit, "message_id", None) if name == "id" else getattr(hit, name, None))
+                    for name in (fields or ("session_id", "snippet", "role"))
+                })
+            return rows
+    legacy = _legacy_session_db()
+    if legacy is None:
+        return []
+    db = legacy(db_path=path, read_only=True)
+    try:
+        return list(db.search_messages(query=query, limit=limit, fields=fields) or [])
+    finally:
+        try:
+            db.close()
+        except Exception:
+            pass
+
+
+class _DirectDB:
+    """Read-only connection of this plugin's own to one profile's state.db.
+
+    Hermes 0.23 turned `hermes_state.SessionDB` into a deprecated stand-in over
+    its storage interface with no SQL connection behind it (removed in v0.27).
+    Every reader here is SQL, so the plugin opens the file itself with mode=ro,
+    as the multi-profile union always has. It never writes.
+    """
+
+    read_only = True
+
+    def __init__(self, path: Path):
+        self.db_path = Path(path)
+        self._named_paths: List[Tuple[str, Path]] = [("", self.db_path)]
+        self._conn = sqlite3.connect(_read_only_uri(self.db_path), uri=True)
+        self._conn.row_factory = sqlite3.Row
+
+    def resolve_session_id(self, session_id: Any) -> Optional[str]:
+        sid = str(session_id or "").strip()
+        if not sid:
+            return None
+        row = self._conn.execute("SELECT id FROM sessions WHERE id = ?", (sid,)).fetchone()
+        if row:
+            return str(row["id"])
+        rows = self._conn.execute(
+            "SELECT DISTINCT id FROM sessions WHERE id LIKE ? LIMIT 2", (sid + "%",)
+        ).fetchall()
+        return str(rows[0]["id"]) if len(rows) == 1 else None
+
+    def search_messages(self, *, query: str, limit: int = 20, fields: Tuple[str, ...] = ()) -> List[Any]:
+        results: List[Any] = []
+        for _name, path in self._named_paths:
+            try:
+                hits = _search_one_store(path, query, limit, tuple(fields))
+            except Exception:
+                continue
+            for row in hits:
+                results.append(row)
+                if len(results) >= limit:
+                    return results
+        return results
+
+    def close(self) -> None:
+        try:
+            self._conn.close()
+        except Exception:
+            pass
+
+
+class _UnionDB(_DirectDB):
     """Read-only view over several profiles' state.db files.
 
     Attaches every database with mode=ro and shadows the shared tables with
@@ -249,12 +367,12 @@ class _UnionDB:
         self._named_paths = list(named_paths)
         self.union_profiles = [name for name, _path in named_paths]
         self.db_path = named_paths[0][1]
-        self._conn = sqlite3.connect(f"file:{named_paths[0][1].as_posix()}?mode=ro", uri=True)
+        self._conn = sqlite3.connect(_read_only_uri(named_paths[0][1]), uri=True)
         self._conn.row_factory = sqlite3.Row
         aliases = ["main"]
         for index, (_name, path) in enumerate(named_paths[1:], start=1):
             alias = f"p{index}"
-            self._conn.execute(f"ATTACH DATABASE ? AS {alias}", (f"file:{path.as_posix()}?mode=ro",))
+            self._conn.execute(f"ATTACH DATABASE ? AS {alias}", (_read_only_uri(path),))
             aliases.append(alias)
         for table in self._UNION_TABLES:
             # UNION ALL matches columns by position, and two state.db files
@@ -299,47 +417,6 @@ class _UnionDB:
         except sqlite3.Error:
             return []
         return [str(row[1]) for row in rows]
-
-    def resolve_session_id(self, session_id: Any) -> Optional[str]:
-        sid = str(session_id or "").strip()
-        if not sid:
-            return None
-        row = self._conn.execute("SELECT id FROM sessions WHERE id = ?", (sid,)).fetchone()
-        if row:
-            return str(row["id"])
-        rows = self._conn.execute(
-            "SELECT DISTINCT id FROM sessions WHERE id LIKE ? LIMIT 2", (sid + "%",)
-        ).fetchall()
-        return str(rows[0]["id"]) if len(rows) == 1 else None
-
-    def search_messages(self, *, query: str, limit: int = 20, fields: Tuple[str, ...] = ()) -> List[Any]:
-        results: List[Any] = []
-        if SessionDB is None:
-            return results
-        for _name, path in self._named_paths:
-            try:
-                db = SessionDB(db_path=path, read_only=True)
-            except Exception:
-                continue
-            try:
-                for row in db.search_messages(query=query, limit=limit, fields=fields) or []:
-                    results.append(row)
-                    if len(results) >= limit:
-                        return results
-            except Exception:
-                pass
-            finally:
-                try:
-                    db.close()
-                except Exception:
-                    pass
-        return results
-
-    def close(self) -> None:
-        try:
-            self._conn.close()
-        except Exception:
-            pass
 
 
 # ── Route time budget ─────────────────────────────────────────────────────
@@ -449,9 +526,6 @@ def _disarm_route_budget(connection: Any) -> None:
 
 @contextmanager
 def _database(db_path: Optional[Path] = None) -> Iterator[Any]:
-    if SessionDB is None:
-        _CAPABILITIES["database"] = "unavailable"
-        raise RuntimeError("Hermes SessionDB is unavailable in this process")
     if db_path is None:
         scoped = _scope_db_paths()
         if len(scoped) > 1:
@@ -464,12 +538,16 @@ def _database(db_path: Optional[Path] = None) -> Iterator[Any]:
                     _disarm_route_budget(union._conn)
                 union.close()
             return
-        if scoped:
-            db_path = scoped[0][1]
-    db = SessionDB(db_path=db_path, read_only=True) if db_path else SessionDB(read_only=True)
-    connection = getattr(db, "_conn", None)
-    if connection is not None:
-        _install_accounting_views(connection)
+        db_path = scoped[0][1] if scoped else _default_db_path()
+    if not Path(db_path).exists():
+        # mode=ro never creates a database; say so plainly instead of
+        # surfacing sqlite's "unable to open database file".
+        _CAPABILITIES["database"] = "unavailable"
+        raise RuntimeError(f"No Hermes session database at {db_path}")
+    db = _DirectDB(Path(db_path))
+    _CAPABILITIES["database"] = "available"
+    connection = db._conn
+    _install_accounting_views(connection)
     armed = _arm_route_budget(connection)
     try:
         yield db
@@ -544,7 +622,7 @@ def _db_connection(db: Any) -> Any:
     connection = getattr(db, "_conn", None)
     if connection is None:
         _CAPABILITIES["database"] = "degraded"
-        raise RuntimeError("This Hermes version does not expose the session connection")
+        raise RuntimeError("This database handle has no SQL connection")
     return connection
 
 

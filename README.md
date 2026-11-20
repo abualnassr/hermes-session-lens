@@ -6,7 +6,7 @@
 
 It installs as one Hermes plugin: a native Desktop page plus its namespaced Python API. No iframe, no separate server, no telemetry service, and no write path — the backend defines zero mutation routes and never touches a credential store.
 
-This documentation describes Hermes Session Lens `0.54.0`, verified on Hermes Agent `0.21.5` (2026-10-02 build). MIT licensed. A community plugin, not affiliated with or endorsed by Nous Research.
+This documentation describes Hermes Session Lens `0.54.1`, verified on Hermes Agent `0.23.3` (2026-11-19 build). MIT licensed. A community plugin, not affiliated with or endorsed by Nous Research.
 
 ![How Session Lens works: what it reads, what it answers, and what it never does](docs/how-it-works.svg)
 
@@ -183,7 +183,7 @@ plugins:
 
 Session Lens is meant to be inspected, not trusted on its word. This is what the backend can and cannot do, and how to check each claim from the code.
 
-**What it reads.** Hermes' session store through `SessionDB(read_only=True)` (dormant profile stores in SQLite immutable mode when no WAL exists), the profile's agent logs, key *names* from the profile's `.env` (never values, except inside an adapter that needs the key for its own request), `mcp_servers` from `config.yaml`, Hermes' own credential resolvers for the provider adapters, and Hermes' tool registry for the tool-name directory. Session Lens itself never opens skill folders, browser profiles or cookies, or credential files outside `$HERMES_HOME`, and it does not read another client's login (such as Claude Code's own credential store); the credentials it uses are the ones Hermes' resolvers return for Hermes' own use.
+**What it reads.** Hermes' session store (`state.db`) over its own `mode=ro` SQLite connection, with full-text search through Hermes' published read-only store handle (dormant profile stores in SQLite immutable mode when no WAL exists), the profile's agent logs, key *names* from the profile's `.env` (never values, except inside an adapter that needs the key for its own request), `mcp_servers` from `config.yaml`, Hermes' own credential resolvers for the provider adapters, and Hermes' tool registry for the tool-name directory. Session Lens itself never opens skill folders, browser profiles or cookies, or credential files outside `$HERMES_HOME`, and it does not read another client's login (such as Claude Code's own credential store); the credentials it uses are the ones Hermes' resolvers return for Hermes' own use.
 
 **What it writes.** Nothing. There is no mutation route (`/system` reports `mutation_endpoints: 0`), no cache file, no export file — CSV, JSON, and Markdown exports are assembled in the desktop from the read-only routes, and rules, budgets, alert rates, and dismissals live in the desktop's plugin storage and travel as query parameters. The runaway watch can show a desktop notification through Hermes' plugin notification API, which Hermes gates under Settings ▸ Notifications. The only things Session Lens places outside its own storage are clipboard copies you ask for — an export, or an Ask Hermes prompt — and Ask Hermes opens a new chat for you to paste into without ever submitting a prompt or creating a session itself. Runtime logs and AI Models classification use bounded in-memory caching only. Session Lens itself never rotates or rewrites a login. Three adapters read through Hermes' own login code — OpenAI Codex through Hermes' account-usage module, Grok through Hermes' xAI resolver, and the Nous Portal through Hermes' portal client — and that code may renew an expiring Hermes OAuth login through Hermes' normal path, under Hermes' own lock, exactly as Hermes does when it runs a model. The Anthropic adapter deliberately does not, and an expired Anthropic login is reported as expired.
 
@@ -231,7 +231,7 @@ Verified on 2026-10-03 with:
 
 Hermes Desktop now serves every local profile from one backend and scopes each request to the active profile. Session Lens follows that scope: the header chip, local records, provider quotas and service balances all belong to the profile the desktop is on, and cached account readings are kept per profile. Enabling the plugin once covers every profile.
 
-The first release was verified on Hermes Agent `0.20.5` with state schema `26`, and every release since has been checked against the Hermes build installed at the time. The plugin uses Hermes' public Desktop SDK and `SessionDB(read_only=True)`; the System view shows the active schema and data source so compatibility is visible after an update.
+The first release was verified on Hermes Agent `0.20.5` with state schema `26`, and every release since has been checked against the Hermes build installed at the time. The plugin uses Hermes' public Desktop SDK and reads `state.db` read-only (Hermes 0.23 retired `hermes_state.SessionDB`'s connection, so since 0.54.1 the plugin opens the file with `mode=ro` itself); the System view shows the active schema and data source so compatibility is visible after an update.
 
 ## Development
 
